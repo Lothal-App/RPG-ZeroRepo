@@ -6,7 +6,7 @@ Usage:
     uvx rpgkit-cli init --here
 
 Or install globally:
-    uv tool install rpgkit-cli --from git+https://github.com/<owner>/RPG-Kit.git
+    uv tool install rpgkit-cli --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-Kit"
     rpgkit init <project-name>
     rpgkit init .
     rpgkit init --here
@@ -58,8 +58,9 @@ ssl_context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 client = httpx.Client(verify=ssl_context)
 
 # Default fallback values — only used when git remote and pyproject.toml are unavailable
-_FALLBACK_REPO_OWNER = "Bonytu"
-_FALLBACK_REPO_NAME = "RPG-Kit"
+_FALLBACK_REPO_OWNER = "microsoft"
+_FALLBACK_REPO_NAME = "RPG-ZeroRepo"
+_RPGKIT_RELEASE_TAG_PREFIX = "rpgkit-v"
 
 
 def _parse_github_owner_repo(url: str) -> Tuple[str, str] | None:
@@ -2470,6 +2471,74 @@ def _get_asset_download_url(
         return asset["browser_download_url"]
 
 
+def _release_sort_key(release: dict) -> str:
+    return release.get("published_at") or release.get("created_at") or ""
+
+
+def _select_latest_rpgkit_release(releases: List[dict], *, pre: bool) -> dict | None:
+    candidates = [
+        release
+        for release in releases
+        if not release.get("draft")
+        and release.get("prerelease", False) is pre
+        and release.get("tag_name", "").startswith(_RPGKIT_RELEASE_TAG_PREFIX)
+    ]
+    candidates.sort(key=_release_sort_key, reverse=True)
+    return candidates[0] if candidates else None
+
+
+def _format_rpgkit_version(tag_name: str) -> str:
+    if tag_name.startswith(_RPGKIT_RELEASE_TAG_PREFIX):
+        return tag_name[len(_RPGKIT_RELEASE_TAG_PREFIX) :]
+    if tag_name.startswith("v"):
+        return tag_name[1:]
+    return tag_name
+
+
+def _fetch_latest_rpgkit_release(
+    repo_owner: str,
+    repo_name: str,
+    client: httpx.Client,
+    *,
+    github_token: str = None,
+    pre: bool = False,
+    timeout: int = 30,
+    debug: bool = False,
+) -> dict:
+    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases?per_page=100"
+    response = client.get(
+        api_url,
+        timeout=timeout,
+        follow_redirects=True,
+        headers=_github_auth_headers(github_token, accept_asset=False),
+    )
+    status = response.status_code
+    if status != 200:
+        error_msg = _format_rate_limit_error(status, response.headers, api_url)
+        if debug:
+            error_msg += f"\n\n[dim]Response body (truncated 500):[/dim]\n{response.text[:500]}"
+        raise RuntimeError(error_msg)
+
+    try:
+        releases = response.json()
+    except ValueError as je:
+        raise RuntimeError(
+            f"Failed to parse release JSON: {je}\nRaw (truncated 400): {response.text[:400]}"
+        )
+
+    if not isinstance(releases, list):
+        raise RuntimeError("Unexpected response format when fetching releases list.")
+
+    release_data = _select_latest_rpgkit_release(releases, pre=pre)
+    if release_data is None:
+        release_type = "pre-release" if pre else "release"
+        raise RuntimeError(
+            f"No RPG-Kit {release_type} found in {repo_owner}/{repo_name}. "
+            f"Expected tags to start with {_RPGKIT_RELEASE_TAG_PREFIX}."
+        )
+    return release_data
+
+
 def download_template_from_github(
     ai_assistant: str,
     download_dir: Path,
@@ -2499,55 +2568,16 @@ def download_template_from_github(
         else:
             console.print("[cyan]Fetching latest release information...[/cyan]")
 
-    if pre:
-        api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases?per_page=20"
-    else:
-        api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest"
-
     try:
-        response = client.get(
-            api_url,
+        release_data = _fetch_latest_rpgkit_release(
+            repo_owner,
+            repo_name,
+            client,
+            github_token=github_token,
+            pre=pre,
             timeout=30,
-            follow_redirects=True,
-            headers=_github_auth_headers(github_token, accept_asset=False),
+            debug=debug,
         )
-        status = response.status_code
-        if status != 200:
-            # Format detailed error message with rate-limit info
-            error_msg = _format_rate_limit_error(status, response.headers, api_url)
-            if debug:
-                error_msg += f"\n\n[dim]Response body (truncated 500):[/dim]\n{response.text[:500]}"
-            raise RuntimeError(error_msg)
-        try:
-            release_data = response.json()
-        except ValueError as je:
-            raise RuntimeError(
-                f"Failed to parse release JSON: {je}\nRaw (truncated 400): {response.text[:400]}"
-            )
-
-        # When --pre, response is a list — find the latest pre-release by published_at
-        if pre:
-            if not isinstance(release_data, list):
-                raise RuntimeError("Unexpected response format when fetching releases list.")
-            pre_releases = [rel for rel in release_data if rel.get("prerelease")]
-            if pre_releases:
-                # Sort by published_at descending to get the most recent
-                pre_releases.sort(
-                    key=lambda r: r.get("published_at", ""), reverse=True
-                )
-                pre_release = pre_releases[0]
-            else:
-                console.print(
-                    "[yellow]No pre-release found. Falling back to latest stable release.[/yellow]"
-                )
-                # Fallback: pick the first non-draft release, or fail
-                for rel in release_data:
-                    if not rel.get("draft"):
-                        pre_release = rel
-                        break
-            if pre_release is None:
-                raise RuntimeError("No releases found in the repository.")
-            release_data = pre_release
     except Exception as e:
         console.print("[red]Error fetching release information[/red]")
         console.print(Panel(str(e), title="Fetch Error", border_style="red"))
@@ -3775,32 +3805,26 @@ def version():
 
     # Fetch latest template release version
     repo_owner, repo_name = _get_repo_info()
-    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest"
 
     template_version = "unknown"
     release_date = "unknown"
 
     try:
-        response = client.get(
-            api_url,
+        release_data = _fetch_latest_rpgkit_release(
+            repo_owner,
+            repo_name,
+            client,
             timeout=10,
-            follow_redirects=True,
-            headers=_github_auth_headers(),
         )
-        if response.status_code == 200:
-            release_data = response.json()
-            template_version = release_data.get("tag_name", "unknown")
-            # Remove 'v' prefix if present
-            if template_version.startswith("v"):
-                template_version = template_version[1:]
-            release_date = release_data.get("published_at", "unknown")
-            if release_date != "unknown":
-                # Format the date nicely
-                try:
-                    dt = datetime.fromisoformat(release_date.replace("Z", "+00:00"))
-                    release_date = dt.strftime("%Y-%m-%d")
-                except Exception:
-                    pass
+        template_version = _format_rpgkit_version(release_data.get("tag_name", "unknown"))
+        release_date = release_data.get("published_at", "unknown")
+        if release_date != "unknown":
+            # Format the date nicely
+            try:
+                dt = datetime.fromisoformat(release_date.replace("Z", "+00:00"))
+                release_date = dt.strftime("%Y-%m-%d")
+            except Exception:
+                pass
     except Exception:
         pass
 

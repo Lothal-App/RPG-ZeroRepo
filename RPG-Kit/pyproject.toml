@@ -31,7 +31,7 @@ dependencies = [
 rpgkit = "rpgkit_cli:main"
 
 [project.urls]
-Repository = "https://github.com/Bonytu/RPG-Kit"
+Repository = "https://github.com/microsoft/RPG-ZeroRepo"
 
 [build-system]
 requires = ["hatchling"]

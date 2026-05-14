@@ -22,13 +22,13 @@ Use `rpgkit check` after installation to verify local tool availability.
 ### Option 1: Persistent Installation (Recommended)
 
 ```bash
-uv tool install rpgkit-cli --from git+https://github.com/Bonytu/RPG-Kit.git
+uv tool install rpgkit-cli --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-Kit"
 ```
 
 ### Option 2: One-time Usage
 
 ```bash
-uvx --from git+https://github.com/Bonytu/RPG-Kit.git rpgkit init <project-name>
+uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-Kit" rpgkit init <project-name>
 ```
 
 ## Quick Start
