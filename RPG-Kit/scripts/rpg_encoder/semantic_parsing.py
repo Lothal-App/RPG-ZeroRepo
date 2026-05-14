@@ -796,6 +796,10 @@ class ParseFeatures:
                     "messages": memory.to_messages(),
                 }
             )
+            self.logger.info(
+                "[SUMMARY] finished batch with %d files",
+                len(batch_items),
+            )
             return summaries, local_trajs
 
         file_feature_items = [

@@ -1396,6 +1396,9 @@ _ENCODE_RE_EXCLUDE_VOTE = re.compile(r"LLM vote #(\d+)")
 _ENCODE_RE_TOTAL_FILES = re.compile(r"Total valid Python files to parse:\s*(\d+)")
 _ENCODE_RE_CLASS_BATCHES = re.compile(r"\[GLOBAL\] kind=class,\s*groups=\d+,\s*batches=(\d+)")
 _ENCODE_RE_FUNC_BATCHES = re.compile(r"\[GLOBAL\] kind=function,\s*groups=\d+,\s*batches=(\d+)")
+_ENCODE_RE_SUMMARY_BATCHES = re.compile(r"\[SUMMARY\] total files=(\d+),\s*batches=(\d+)")
+_ENCODE_RE_SUMMARY_PROCESS = re.compile(r"\[SUMMARY\] processing batch with (\d+) files")
+_ENCODE_RE_SUMMARY_FINISHED = re.compile(r"\[SUMMARY\] finished batch with (\d+) files")
 
 
 def _parse_encoder_line(line: str, state: Dict[str, Any]) -> None:
@@ -1411,6 +1414,8 @@ def _parse_encoder_line(line: str, state: Dict[str, Any]) -> None:
       * ``[GLOBAL] process_class_batch:``        → +1 class batch done
       * ``[GLOBAL] kind=function, ..., batches=N`` → function batch total
       * ``[GLOBAL] process_func_batch:``         → +1 function batch done
+      * ``[SUMMARY] total files=N, batches=M``   → file summary batch total
+      * ``[SUMMARY] processing batch with N files`` / ``finished batch``
       * ``Refactoring to RPG`` / ``RPG refactoring done``
     """
     if "Skeleton loaded" in line:
@@ -1461,7 +1466,30 @@ def _parse_encoder_line(line: str, state: Dict[str, Any]) -> None:
         state["func_done"] += 1
         state["kind"] = "function"
         return
+    m = _ENCODE_RE_SUMMARY_BATCHES.search(line)
+    if m:
+        state["summary_total_files"] = int(m.group(1))
+        state["summary_total"] = int(m.group(2))
+        state["summary_done"] = 0
+        state["kind"] = "summary"
+        state["phase"] = "Summarizing file batches"
+        return
+    m = _ENCODE_RE_SUMMARY_PROCESS.search(line)
+    if m:
+        state["summary_current_files"] = int(m.group(1))
+        state["kind"] = "summary"
+        state["phase"] = f"Processing summary batch with {m.group(1)} files"
+        return
+    m = _ENCODE_RE_SUMMARY_FINISHED.search(line)
+    if m:
+        state["summary_done"] += 1
+        state["summary_current_files"] = int(m.group(1))
+        state["kind"] = "summary"
+        state["phase"] = f"Finished summary batch with {m.group(1)} files"
+        return
     if "Refactoring to RPG" in line:
+        if state.get("summary_total"):
+            state["summary_done"] = max(state["summary_done"], state["summary_total"])
         state["phase"] = "Refactoring to RPG"
         state["kind"] = None
         return
@@ -1530,6 +1558,10 @@ def _run_initial_encode(project_path: Path) -> bool:
         "class_done": 0,
         "func_total": 0,
         "func_done": 0,
+        "summary_total": 0,
+        "summary_done": 0,
+        "summary_total_files": 0,
+        "summary_current_files": 0,
         "total_files": 0,
     }
 
@@ -1607,6 +1639,13 @@ def _run_initial_encode(project_path: Path) -> bool:
                         total=state["func_total"],
                         completed=state["func_done"],
                     )
+                elif kind == "summary" and state["summary_total"]:
+                    progress.update(
+                        task_id,
+                        description=state["phase"],
+                        total=state["summary_total"],
+                        completed=state["summary_done"],
+                    )
                 else:
                     # Indeterminate phase (e.g. "Refactoring to RPG",
                     # "Finalising").  Update the description, but also
@@ -1648,7 +1687,14 @@ def _run_initial_encode(project_path: Path) -> bool:
             # the encoder zipped through function batches between two
             # 0.2-second polls and is now in "Finalising", we still want
             # the bar to read "3/3" rather than "1/3".
-            if state["func_total"]:
+            if state["summary_total"]:
+                progress.update(
+                    task_id,
+                    description=state["phase"],
+                    total=state["summary_total"],
+                    completed=state["summary_done"],
+                )
+            elif state["func_total"]:
                 progress.update(
                     task_id,
                     description=state["phase"],
