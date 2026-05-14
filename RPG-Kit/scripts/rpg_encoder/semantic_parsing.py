@@ -501,6 +501,11 @@ class ParseFeatures:
                     "[GLOBAL] process_class_batch error: %s", e, exc_info=True
                 )
                 return {}, {}
+            finally:
+                self.logger.info(
+                    "[GLOBAL] finished class batch with %d units",
+                    len(batch_units),
+                )
 
         def process_func_batch(
             batch_units: List[CodeUnit],
@@ -540,6 +545,11 @@ class ParseFeatures:
                     "[GLOBAL] process_func_batch error: %s", e, exc_info=True
                 )
                 return {}, {}
+            finally:
+                self.logger.info(
+                    "[GLOBAL] finished function batch with %d units",
+                    len(batch_units),
+                )
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []

@@ -1396,6 +1396,9 @@ _ENCODE_RE_EXCLUDE_VOTE = re.compile(r"LLM vote #(\d+)")
 _ENCODE_RE_TOTAL_FILES = re.compile(r"Total valid Python files to parse:\s*(\d+)")
 _ENCODE_RE_CLASS_BATCHES = re.compile(r"\[GLOBAL\] kind=class,\s*groups=\d+,\s*batches=(\d+)")
 _ENCODE_RE_FUNC_BATCHES = re.compile(r"\[GLOBAL\] kind=function,\s*groups=\d+,\s*batches=(\d+)")
+_ENCODE_RE_CLASS_FINISHED = re.compile(r"\[GLOBAL\] finished class batch with \d+ units")
+_ENCODE_RE_FUNC_FINISHED = re.compile(r"\[GLOBAL\] finished function batch with \d+ units")
+_ENCODE_RE_FILE_REMAP = re.compile(r"\[GLOBAL\] file=")
 _ENCODE_RE_SUMMARY_BATCHES = re.compile(r"\[SUMMARY\] total files=(\d+),\s*batches=(\d+)")
 _ENCODE_RE_SUMMARY_PROCESS = re.compile(r"\[SUMMARY\] processing batch with (\d+) files")
 _ENCODE_RE_SUMMARY_FINISHED = re.compile(r"\[SUMMARY\] finished batch with (\d+) files")
@@ -1411,9 +1414,10 @@ def _parse_encoder_line(line: str, state: Dict[str, Any]) -> None:
       * ``Excluded paths decided`` / ``Parsing features`` /
         ``Total valid Python files to parse: N``
       * ``[GLOBAL] kind=class, ..., batches=N``  → class batch total
-      * ``[GLOBAL] process_class_batch:``        → +1 class batch done
+      * ``[GLOBAL] finished class batch``        → +1 class batch done
       * ``[GLOBAL] kind=function, ..., batches=N`` → function batch total
-      * ``[GLOBAL] process_func_batch:``         → +1 function batch done
+      * ``[GLOBAL] finished function batch``     → +1 function batch done
+      * ``[GLOBAL] file=...``                    → feature-to-file mapping
       * ``[SUMMARY] total files=N, batches=M``   → file summary batch total
       * ``[SUMMARY] processing batch with N files`` / ``finished batch``
       * ``Refactoring to RPG`` / ``RPG refactoring done``
@@ -1459,12 +1463,34 @@ def _parse_encoder_line(line: str, state: Dict[str, Any]) -> None:
         state["phase"] = "Parsing function batches"
         return
     if "process_class_batch:" in line:
-        state["class_done"] += 1
         state["kind"] = "class"
+        state["phase"] = "Parsing class batches"
+        return
+    if _ENCODE_RE_CLASS_FINISHED.search(line):
+        state["class_done"] += 1
+        if state.get("class_total"):
+            state["class_done"] = min(state["class_done"], state["class_total"])
+        state["kind"] = "class"
+        state["phase"] = "Parsing class batches"
         return
     if "process_func_batch:" in line:
-        state["func_done"] += 1
         state["kind"] = "function"
+        state["phase"] = "Parsing function batches"
+        return
+    if _ENCODE_RE_FUNC_FINISHED.search(line):
+        state["func_done"] += 1
+        if state.get("func_total"):
+            state["func_done"] = min(state["func_done"], state["func_total"])
+        state["kind"] = "function"
+        state["phase"] = "Parsing function batches"
+        return
+    if _ENCODE_RE_FILE_REMAP.search(line):
+        if state.get("class_total"):
+            state["class_done"] = max(state["class_done"], state["class_total"])
+        if state.get("func_total"):
+            state["func_done"] = max(state["func_done"], state["func_total"])
+        state["kind"] = None
+        state["phase"] = "Mapping features to files"
         return
     m = _ENCODE_RE_SUMMARY_BATCHES.search(line)
     if m:
