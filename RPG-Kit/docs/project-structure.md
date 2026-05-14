@@ -1,0 +1,154 @@
+# Project Structure
+
+## Workspace == Repo
+
+RPG-Kit installs alongside your project code: the directory you run `rpgkit init` in, also called the workspace root, **is** the project repository root. There is no separate `repo/` subdirectory. This means:
+
+- `rpgkit init my-project` creates `my-project/` containing both your source code (`src/`, `tests/`, `docs/`) and RPG-Kit's runtime files (`.rpgkit/`, `.claude/`, `.github/`, `.vscode/`, depending on the selected agent).
+- `rpgkit init --here` inside an existing git repository adds RPG-Kit on top of the existing code without moving the repository.
+- A single `.git` repository tracks user-owned code and any RPG-Kit files the user chooses to commit. Runtime data under `.rpgkit/data/` is gitignored by default.
+
+## After `rpgkit init`
+
+Running `rpgkit init` downloads a template and creates a structure like this:
+
+```text
+my-project/
+├── docs/                               # Optional requirement docs for /rpgkit.feature_spec
+│   ├── project_charter.md              # Auto-detected when no description is provided
+│   └── ...
+├── .claude/                            # Claude Code configuration when --ai claude
+│   ├── commands/                       # /rpgkit.* command definitions
+│   │   ├── rpgkit.feature_spec.md
+│   │   ├── rpgkit.feature_build.md
+│   │   ├── rpgkit.feature_refactor.md
+│   │   ├── rpgkit.feature_edit.md
+│   │   ├── rpgkit.build_skeleton.md
+│   │   ├── rpgkit.build_data_flow.md
+│   │   ├── rpgkit.design_base_classes.md
+│   │   ├── rpgkit.design_interfaces.md
+│   │   ├── rpgkit.plan_tasks.md
+│   │   ├── rpgkit.code_gen.md
+│   │   ├── rpgkit.rpg_edit.md
+│   │   ├── rpgkit.encode.md
+│   │   └── rpgkit.update_rpg.md
+│   └── settings.json                   # Permissions and MCP auto-approval
+├── .github/                            # Copilot configuration when --ai copilot
+│   ├── agents/                         # rpgkit.* agent definitions
+│   └── prompts/                        # companion prompts
+├── .vscode/                            # Copilot/VS Code configuration when applicable
+│   ├── mcp.json                        # MCP server registration
+│   └── tasks.json                      # Optional workspace tasks
+└── .rpgkit/
+    ├── scripts/                        # Pipeline scripts and support packages
+    │   ├── feature_spec_to_json.py      # Feature specification
+    │   ├── feature_build.py
+    │   ├── feature_build_validation.py
+    │   ├── feature_refactor.py
+    │   ├── feature_refactor_validation.py
+    │   ├── feature_edit.py
+    │   ├── feature_edit_validation.py
+    │   ├── build_skeleton.py            # RPG construction
+    │   ├── check_skeleton.py
+    │   ├── summary_skeleton.py
+    │   ├── build_data_flow.py
+    │   ├── check_data_flow.py
+    │   ├── generate_viz.py
+    │   ├── design_base_classes.py
+    │   ├── check_base_classes.py
+    │   ├── design_interfaces.py
+    │   ├── check_interfaces.py
+    │   ├── plan_tasks.py
+    │   ├── check_tasks.py
+    │   ├── init_codebase.py             # Code generation
+    │   ├── run_batch.py                 # TDD batch executor, final test, global review
+    │   ├── check_code_gen.py
+    │   ├── update_graphs.py             # Incremental RPG and dependency graph updates
+    │   ├── mcp_server.py                # rpg-tools MCP server
+    │   ├── code_gen/                    # Code generation subpackage
+    │   ├── common/                      # Shared utilities and path definitions
+    │   ├── feature/                     # Feature processing
+    │   ├── func_design/                 # Function/interface design agents
+    │   ├── skeleton/                    # Skeleton building
+    │   ├── rpg/                         # RPG models, services, graph query engine
+    │   ├── rpg_edit/                    # Surgical RPG/code edit pipeline
+    │   └── rpg_encoder/                 # Reverse encoder
+    │       ├── check_encode.py          # Pre-check rpg.json state
+    │       ├── run_encode.py            # Full encode
+    │       ├── run_update_rpg.py        # Incremental update implementation
+    │       ├── rpg_encoding.py          # RPG encoding pipeline
+    │       ├── rpg_evolution.py         # Incremental RPG evolution
+    │       ├── semantic_parsing.py      # Semantic feature extraction
+    │       └── refactor_tree.py         # Feature tree refactoring
+    ├── data/                            # Runtime artifacts, populated by commands
+    ├── logs/                            # Per-stage logs
+    └── reports/                         # Review and diagnostic reports when generated
+```
+
+The agent configuration directory varies by the selected AI assistant and release package. For the verified CLI path, `--ai claude` installs `.claude/commands/`, while `--ai copilot` installs `.github/agents/`, `.github/prompts/`, and `.vscode/mcp.json`.
+
+Command definitions are installed into the AI-agent-specific folder. Normal users should not need to edit `.rpgkit/scripts/` or `.rpgkit/data/` manually.
+
+## Generated Data Files
+
+As you run `/rpgkit.*` commands, `.rpgkit/data/` is progressively populated:
+
+| Generated file | Command | Description |
+| -------------- | ------- | ----------- |
+| `feature_spec/` | `feature_spec` | Evidence and feature specification documents |
+| `feature_spec.json` | `feature_spec` | Structured feature specification |
+| `feature_build.json` | `feature_build` | Expanded feature tree |
+| `feature_tree.json` | `feature_refactor` / `feature_edit` | Component architecture |
+| `skeleton.json` | `build_skeleton` | File skeleton |
+| `skeleton_summary.txt` | `build_skeleton` | Human-readable skeleton summary |
+| `rpg.json` | `build_skeleton` / `encode`, then updated by later commands | Repository Planning Graph |
+| `dep_graph.json` | `encode` / `update_rpg` / `rpg_edit` | Code dependency graph used for incremental sync and edits |
+| `data_flow.json` | `build_data_flow` | Inter-component data flow DAG |
+| `data_flow_viz.html` | `build_data_flow` | Data flow visualization |
+| `base_classes.json` | `design_base_classes` | Shared base class definitions |
+| `interfaces.json` | `design_interfaces` | Function/class interface definitions |
+| `tasks.json` | `plan_tasks` | Implementation task batches |
+| `code_gen_state.jsonl` | `code_gen` | Code generation progress state, append-only JSONL |
+| `rpg_edit_impact.json` | `rpg_edit` | Impact analysis for a surgical edit |
+| `rpg_edit_plan.json` | `rpg_edit` | Confirmed surgical edit plan |
+| `rpg_edit_code_result.json` | `rpg_edit` | Code application result for a surgical edit |
+| `trajectory/` | All scripts | Execution trajectory logs |
+
+## `rpg.json` — The Repository Planning Graph
+
+`rpg.json` is the central graph artifact used by the forward pipeline, reverse encoder, MCP tools, incremental update hooks, and `/rpgkit.rpg_edit`.
+
+It can be created in either direction:
+
+1. **Forward pipeline:** `/rpgkit.build_skeleton` creates `rpg.json` from `feature_tree.json`.
+2. **Reverse encoder:** `/rpgkit.encode` creates `rpg.json` from an existing codebase.
+
+Later commands enrich or maintain the same file:
+
+1. **`build_data_flow`** — adds data-flow edges between components.
+2. **`design_base_classes`** — adds base-class relationship edges.
+3. **`design_interfaces`** — adds fine-grained dependency edges such as inheritance, invocation, and references.
+4. **`code_gen`** — updates implementation status as code is generated.
+5. **`update_rpg`** — incrementally updates the RPG after commits when the hook is skipped or needs to be run manually.
+6. **`rpg_edit`** — applies targeted feature graph edits together with code and dependency graph changes.
+
+## `dep_graph.json` — Code Dependency Graph
+
+`dep_graph.json` stores the code-level dependency graph used by the encoder, incremental update path, and surgical edit path. It is maintained alongside `rpg.json` so RPG-Kit can keep feature-level structure and code-level dependencies aligned.
+
+Typical producers and updaters:
+
+- `/rpgkit.encode` creates the initial dependency graph when encoding an existing codebase.
+- The post-commit hook and `/rpgkit.update_rpg` refresh it after code changes.
+- `/rpgkit.rpg_edit` refreshes it after applying targeted code edits.
+
+## Runtime Logs and Reports
+
+Runtime logs are written under `.rpgkit/logs/`, for example:
+
+- `.rpgkit/logs/encode.log`
+- `.rpgkit/logs/update_rpg.log`
+- `.rpgkit/logs/feature_build.log`
+- `.rpgkit/logs/build_data_flow.log`
+
+Execution traces are written under `.rpgkit/data/trajectory/`. Review or diagnostic artifacts may be written under `.rpgkit/reports/` when a command generates them.
