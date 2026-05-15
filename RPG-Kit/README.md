@@ -16,6 +16,9 @@ RPG-Kit helps solve this by maintaining a **Repository Planning Graph (RPG)**: a
 
 Use RPG-Kit when you want AI agents to work with repository-level context instead of isolated prompts!
 
+As an example, this is part of the graph visualization generated for this repository: 
+![RPG-Kit repository graph visualization](../docs/rpgkit_visualized_graph.png)
+
 ### Why RPG-Kit?
 
 | Common problem with AI coding agents | How RPG-Kit helps |
@@ -33,6 +36,9 @@ Use RPG-Kit when you want AI agents to work with repository-level context instea
 | Create a new project from requirements | Forward workflow | [`Quick Start: New Repository`](#quick-start-new-repository) |
 | Understand or update an existing codebase | Reverse workflow | [`Quick Start: Existing Repository`](#quick-start-existing-repository) |
 | Make a precise repository-aware edit | Surgical edit workflow | [`Quick Start: Existing Repository`](#quick-start-existing-repository) |
+
+Below is part of the graph visualization generated for this repository. Run `/rpgkit.encode` and open `rpg.html` to explore the full interactive graph.
+
 
 ## Installation
 

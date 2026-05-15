@@ -9,6 +9,10 @@ The pipeline has three sequential phases:
 
 ![pipeline of zerorepo](docs/pipeline.png)
 
+Below is part of the graph visualization generated for this repository. Run `/rpgkit.encode` and open `rpg.html` to explore the full interactive graph.
+
+![RPG visualization of RPG-ZeroRepo](docs/rpgkit_visualized_graph.png)
+
 ## News and Updates
 ---
 - [2026-05-15] 🔥 We have open-sourced [**RPG-Kit**](RPG-Kit/), an RPG-driven toolkit for Claude Code and GitHub Copilot that guides long-horizon repository-level coding tasks, from planning and multi-file generation to existing-repository understanding and graph-aware updates.
@@ -18,10 +22,6 @@ The pipeline has three sequential phases:
 - [2026.02.02] 🔥 Our paper "[Closing the Loop: Universal Repository Representation with RPG-Encoder](https://arxiv.org/abs/2602.02084)" has been released on arXiv.
 - [2026.01.26] 🔥 [RPG-ZeroRepo](https://arxiv.org/abs/2509.16198) has been accepted as a poster at ICLR 2026.
 - [2025.09.19] 🔥 Our paper "[RPG: A Repository Planning Graph for Unified and Scalable Codebase Generation](https://arxiv.org/abs/2509.16198)" has been released on arXiv.
-
-Below is a snapshot of the graph visualization generated for this repository. Run `/rpgkit.encode` and open `rpg.html` to explore the full interactive graph.
-
-![RPG visualization of RPG-ZeroRepo](docs/rpgkit_visualized_graph.png)
 
 
 ## Table of Contents
