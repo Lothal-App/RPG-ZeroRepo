@@ -34,6 +34,10 @@ RPG-Kit 通过维护一个 **Repository Planning Graph (RPG)** 来帮助解决�
 | 理解或更新现有代码库 | 反向工作流 | [`快速开始：现有仓库`](#quick-start-existing-repository) |
 | 进行精确的仓库感知编辑 | 外科式编辑工作流 | [`快速开始：现有仓库`](#quick-start-existing-repository) |
 
+下面是为此仓库生成的部分图可视化结果。运行 `/rpgkit.encode` 并打开 `rpg.html`，即可探索完整的交互式图。
+
+![RPG-Kit 仓库图可视化](../docs/rpgkit_visualized_graph.png)
+
 ## 安装
 
 ### 先决条件
@@ -55,6 +59,7 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-K
 ```
 
 <a id="quick-start-new-repository"></a>
+
 ## 快速开始：新仓库
 
 当你想让 RPG-Kit 将需求转换为新代码库时，使用此路径。
@@ -100,6 +105,7 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-K
 RPG-Kit 会逐步创建 `.rpgkit/data/rpg.json`，并使用它来保持需求、规划产物、生成的代码和依赖信息一致。
 
 <a id="quick-start-existing-repository"></a>
+
 ## 快速开始：现有仓库
 
 当你已经有一个代码仓库，并希望 AI 智能体借助 RPG 上下文理解或编辑它时，使用此路径。

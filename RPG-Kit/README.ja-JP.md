@@ -34,6 +34,10 @@ RPG-Kit は **Repository Planning Graph (RPG)** を維持することで、こ�
 | 既存のコードベースを理解または更新する | 逆方向ワークフロー | [`クイックスタート：既存リポジトリ`](#quick-start-existing-repository) |
 | 正確なリポジトリ認識型編集を行う | 外科的編集ワークフロー | [`クイックスタート：既存リポジトリ`](#quick-start-existing-repository) |
 
+以下は、このリポジトリ用に生成されたグラフ可視化の一部です。`/rpgkit.encode` を実行し、`rpg.html` を開くと、完全なインタラクティブグラフを探索できます。
+
+![RPG-Kit リポジトリグラフ可視化](../docs/rpgkit_visualized_graph.png)
+
 ## インストール
 
 ### 前提条件
@@ -55,6 +59,7 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-K
 ```
 
 <a id="quick-start-new-repository"></a>
+
 ## クイックスタート：新規リポジトリ
 
 RPG-Kit に要件を新しいコードベースへ変換させたい場合は、この手順を使用します。
@@ -100,6 +105,7 @@ RPG-Kit に要件を新しいコードベースへ変換させたい場合は、
 RPG-Kit は `.rpgkit/data/rpg.json` を段階的に作成し、それを使用して要件、計画成果物、生成されたコード、依存関係情報の整合性を保ちます。
 
 <a id="quick-start-existing-repository"></a>
+
 ## クイックスタート：既存リポジトリ
 
 すでにリポジトリがあり、AI エージェントに RPG コンテキストを使って理解または編集させたい場合は、この手順を使用します。

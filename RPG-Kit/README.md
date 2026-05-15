@@ -16,9 +16,6 @@ RPG-Kit helps solve this by maintaining a **Repository Planning Graph (RPG)**: a
 
 Use RPG-Kit when you want AI agents to work with repository-level context instead of isolated prompts!
 
-As an example, this is part of the graph visualization generated for this repository: 
-![RPG-Kit repository graph visualization](../docs/rpgkit_visualized_graph.png)
-
 ### Why RPG-Kit?
 
 | Common problem with AI coding agents | How RPG-Kit helps |
@@ -39,6 +36,7 @@ As an example, this is part of the graph visualization generated for this reposi
 
 Below is part of the graph visualization generated for this repository. Run `/rpgkit.encode` and open `rpg.html` to explore the full interactive graph.
 
+![RPG-Kit repository graph visualization](../docs/rpgkit_visualized_graph.png)
 
 ## Installation
 

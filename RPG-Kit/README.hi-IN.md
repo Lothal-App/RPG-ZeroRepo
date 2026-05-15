@@ -34,6 +34,10 @@ RPG-Kit इस समस्या को **Repository Planning Graph (RPG)** mai
 | Existing codebase को समझें या update करें | Reverse workflow | [`Quick Start: मौजूदा Repository`](#quick-start-existing-repository) |
 | Precise repository-aware edit करें | Surgical edit workflow | [`Quick Start: मौजूदा Repository`](#quick-start-existing-repository) |
 
+नीचे इस repository के लिए generated graph visualization का एक हिस्सा है। `/rpgkit.encode` चलाएँ और full interactive graph explore करने के लिए `rpg.html` खोलें।
+
+![RPG-Kit repository graph visualization](../docs/rpgkit_visualized_graph.png)
+
 ## Installation
 
 ### पूर्वापेक्षाएँ
@@ -55,6 +59,7 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-K
 ```
 
 <a id="quick-start-new-repository"></a>
+
 ## Quick Start: नया Repository
 
 जब आप चाहते हैं कि RPG-Kit requirements को एक नए codebase में बदले, तो इस path का उपयोग करें।
@@ -100,6 +105,7 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-K
 RPG-Kit क्रमिक रूप से `.rpgkit/data/rpg.json` बनाता है और इसका उपयोग requirements, planning artifacts, generated code, और dependency information को aligned रखने के लिए करता है।
 
 <a id="quick-start-existing-repository"></a>
+
 ## Quick Start: मौजूदा Repository
 
 जब आपके पास पहले से repository हो और आप चाहते हों कि AI agent उसे RPG context के साथ समझे या edit करे, तो इस path का उपयोग करें।
