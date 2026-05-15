@@ -2533,11 +2533,15 @@ class RPG:
 
         Args:
             include_dep_graph: Whether to embed the full dep_graph in the
-                output.  ``None`` (default) auto-detects: embed when no
-                external ``_dep_graph_file`` is configured, skip otherwise.
+                output.  ``None`` (default) always embeds the dep_graph when
+                one is loaded, independent of whether an external
+                ``_dep_graph_file`` is also configured.  This way the
+                serialized RPG carries the full graph inline (under
+                ``dep_graph``) while still preserving the relative path to
+                the standalone file (under ``dep_graph_file``).
         """
         if include_dep_graph is None:
-            include_dep_graph = self._dep_graph_file is None
+            include_dep_graph = True
         # Ensure all nodes have node_type before serialization
         self._backfill_missing_node_types()
 

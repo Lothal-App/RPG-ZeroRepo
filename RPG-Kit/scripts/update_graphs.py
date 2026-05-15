@@ -77,6 +77,39 @@ def _log_hook_call(hook_type: str, result: dict) -> None:
         pass
 
 
+def _refresh_rpg_html(rpg_path: Path) -> dict:
+    """Regenerate ``rpg.html`` next to ``rpg.json`` after a hook update.
+
+    The encoder's ``run_encode.py`` already produces ``rpg.html`` via
+    :mod:`rpg_visualize` during the initial full encode, but the
+    pre-/post-commit hooks only re-write ``rpg.json``.  Without this
+    refresh, the interactive visualisation drifts behind the graph
+    until the next full encode.
+
+    Best-effort: any failure (missing rpg.json, parse error, write
+    permission) is swallowed so a slow / broken viz never blocks a
+    commit.  The returned dict surfaces ``viz_path`` on success or
+    ``viz_error`` on failure so callers can include it in the hook
+    output for debugging.
+    """
+    result: dict = {}
+    if not rpg_path.is_file():
+        # Nothing to render — caller should already have surfaced
+        # _RPG_MISSING_MSG, so stay quiet here.
+        return result
+    try:
+        from rpg_visualize import load_rpg, generate_html  # noqa: WPS433
+
+        data = load_rpg(str(rpg_path))
+        html_content = generate_html(data)
+        viz_path = rpg_path.with_suffix(".html")
+        viz_path.write_text(html_content, encoding="utf-8")
+        result["viz_path"] = str(viz_path)
+    except Exception as exc:  # pragma: no cover — defensive
+        result["viz_error"] = str(exc)
+    return result
+
+
 def update_dep_only(code_dir: str, workspace_root: str, dep_graph_path: Path) -> dict:
     """Mode: dep — Only rebuild dep_graph.json from AST, no RPG changes."""
     from rpg.dep_graph import DependencyGraph
@@ -300,6 +333,13 @@ def cmd_sync(
 
     svc.save(str(rpg_path))
 
+    # Keep ``rpg.html`` aligned with the freshly-saved ``rpg.json``.
+    # The encoder produces both files during the initial full encode,
+    # but earlier hook revisions only refreshed the JSON — leaving the
+    # visualisation silently stale.  Best-effort: ``_refresh_rpg_html``
+    # swallows its own errors so a broken viz can never block a commit.
+    viz_result = _refresh_rpg_html(rpg_path)
+
     sync_out = {
         "mode": sync_result.get("mode", "sync"),
         "reason": sync_result.get("reason", ""),
@@ -324,6 +364,8 @@ def cmd_sync(
         "rpg_nodes": len(svc.rpg._node_index),
         "dep_graph_path": str(dep_graph_path),
         "rpg_path": str(rpg_path),
+        "viz_path": viz_result.get("viz_path"),
+        "viz_error": viz_result.get("viz_error"),
         "duration": round(time.time() - t0, 3),
     }
     _log_hook_call("sync", sync_out)
@@ -410,6 +452,18 @@ def cmd_update_rpg(
 
         result["mode"] = "update-rpg"
         result["prev_ref"] = prev_ref
+
+        # Refresh ``rpg.html`` whenever the JSON was actually rewritten.
+        # ``run_update_rpg`` returns ``status="success"`` on a normal
+        # write; skip the regen when it failed so we don't paper over
+        # a broken graph with a stale-but-pretty HTML page.
+        if result.get("status") == "success":
+            viz_result = _refresh_rpg_html(rpg_path)
+            if "viz_path" in viz_result:
+                result["viz_path"] = viz_result["viz_path"]
+            if "viz_error" in viz_result:
+                result["viz_error"] = viz_result["viz_error"]
+
         result["duration"] = round(time.time() - t0, 3)
         _log_hook_call("update-rpg", result)
         return result
