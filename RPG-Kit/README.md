@@ -24,10 +24,6 @@ Use RPG-Kit when you want AI agents to work with repository-level context instea
 | Understand or update an existing codebase | Reverse workflow | [`Quick Start: Existing Repository`](#quick-start-existing-repository) |
 | Make a precise repository-aware edit | Surgical edit workflow | [`Quick Start: New Repository`](#quick-start-new-repository) |
 
-Below is part of the graph visualization generated for this repository. Run `/rpgkit.encode` and open `rpg.html` to explore the full interactive graph.
-
-![RPG-Kit repository graph visualization](../docs/rpgkit_visualized_graph.png)
-
 ### Workflow Details
 
 ```text
@@ -67,6 +63,10 @@ Reverse Direction: Code → RPG
 
 MCP Server: search_rpg / explore_rpg / get_node_detail / list_rpg_tree
 ```
+
+Below is part of the graph visualization generated for this repository. Run `/rpgkit.encode` and open `rpg.html` to explore the full interactive graph.
+
+![RPG-Kit repository graph visualization](../docs/rpgkit_visualized_graph.png)
 
 ## Installation
 
