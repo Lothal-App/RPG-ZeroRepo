@@ -8,73 +8,116 @@
   <a href="README.hi-IN.md">हिन्दी</a>
 </p>
 
-## AI coding agents को पूरे repository को समझने दें
+## कोडिंग एजेंट्स को संपादन से पहले प्लानिंग करने दें
 
-AI coding agents शक्तिशाली होते हैं, लेकिन वे अक्सर file-by-file काम करते हैं। जैसे-जैसे project बढ़ता है, वे requirements, architecture, dependencies, और पिछले design decisions का track खो सकते हैं।
+कोडिंग एजेंट्स लोकल संपादन में मजबूत होते हैं, लेकिन एक स्थिर प्लानिंग संरचना के बिना रिपॉज़िटरी-स्तर के कार्य अक्सर विफल हो जाते हैं। आवश्यकताएँ बहक जाती हैं, आर्किटेक्चर के निर्णय खो जाते हैं, मल्टी-फ़ाइल जनरेशन असंगत हो जाती है, और अपडेट छिपी हुई dependencies को मिस कर सकते हैं।
 
-RPG-Kit इस समस्या को **Repository Planning Graph (RPG)** maintain करके हल करने में मदद करता है: एक structured map जो requirements, features, files, components, और dependencies को जोड़ता है।
+RPG-Kit, Claude Code और GitHub Copilot को रिपॉज़िटरी-स्तर कोडिंग के लिए एक **persistent RPG workspace** देता है। यह वर्कस्पेस एक **Repository Planning Graph (RPG)** के चारों ओर बना है, जो आवश्यकताओं, features, आर्किटेक्चर, फ़ाइलों, कोड entities और dependencies को जोड़ता है।
 
-जब आप चाहते हैं कि AI agents isolated prompts के बजाय repository-level context के साथ काम करें, तब RPG-Kit का उपयोग करें।
+RPG-Kit के साथ, एजेंट्स ग्राफ-संचालित वर्कफ़्लो के माध्यम से काम करते हैं:
 
-### RPG-Kit क्यों?
+- **Build (निर्माण)**: आवश्यकताओं को RPG प्लान में बदलें, फिर एक मल्टी-फ़ाइल रिपॉज़िटरी बनाएँ।
+- **Understand (समझें)**: किसी मौजूदा रिपॉज़िटरी को RPG में मैप करें, फिर खोजें, अन्वेषण करें और समझाएँ।
+- **Update (अपडेट करें)**: प्रभावित RPG नोड्स को पहचानें, संपादन प्लान बनाएँ, और कोड व ग्राफ को एक साथ अपडेट करें।
 
-| AI coding agents की common problem | RPG-Kit कैसे मदद करता है |
-|---|---|
-| Agent कुछ prompts के बाद requirements भूल जाता है | Requirements RPG में encode की जाती हैं |
-| Agent related files को समझे बिना एक file edit करता है | Files, components, और dependencies graph में connected होते हैं |
-| Generated code original plan से drift हो जाता है | Planning artifacts और code aligned रखे जाते हैं |
-| Existing repositories को agents के लिए समझना कठिन होता है | Codebase को RPG में encode किया जा सकता है |
-| Targeted edits hidden dependencies तोड़ सकते हैं | Edits graph-aware context के साथ किए जाते हैं |
+### अपना वर्कफ़्लो चुनें
 
-### अपना workflow चुनें
-
-| Goal | Workflow | Start here |
+| लक्ष्य | वर्कफ़्लो | यहाँ से शुरू करें |
 |---|---|---|
-| Requirements से नया project create करें | Forward workflow | [`Quick Start: नया Repository`](#quick-start-new-repository) |
-| Existing codebase को समझें या update करें | Reverse workflow | [`Quick Start: मौजूदा Repository`](#quick-start-existing-repository) |
-| Precise repository-aware edit करें | Surgical edit workflow | [`Quick Start: मौजूदा Repository`](#quick-start-existing-repository) |
+| आवश्यकताओं से एक नई रिपॉज़िटरी बनाना | Build वर्कफ़्लो (requirements → RPG → code) | [`Quick Start: नई रिपॉज़िटरी`](#quick-start-नई-रिपॉज़िटरी) |
+| किसी मौजूदा रिपॉज़िटरी को समझना | Understand वर्कफ़्लो (repository → RPG → search/explore) | [`Quick Start: मौजूदा रिपॉज़िटरी`](#quick-start-मौजूदा-रिपॉज़िटरी) |
+| किसी मौजूदा रिपॉज़िटरी को अपडेट करना | Update वर्कफ़्लो (change request → affected RPG nodes → edit plan → code/RPG update) | [`Quick Start: मौजूदा रिपॉज़िटरी`](#quick-start-मौजूदा-रिपॉज़िटरी) |
 
-नीचे इस repository के लिए generated graph visualization का एक हिस्सा है। `/rpgkit.encode` चलाएँ और full interactive graph explore करने के लिए `rpg.html` खोलें।
+### विस्तृत पाइपलाइन
+
+नए उपयोगकर्ता इस सेक्शन को छोड़कर सीधे नीचे दिए गए Quick Start से शुरू कर सकते हैं।
+
+<details>
+<summary>कमांड-स्तर का पूर्ण वर्कफ़्लो आरेख</summary>
+
+```text
+Forward Direction: Requirements → RPG → Code
+
+ Phase 1: Feature Specification       Phase 2: RPG Construction & Planning                             Phase 3
+┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+│ feature  │ │ feature  │ │ feature  │ │  build   │ │  build   │ │ design   │ │ design   │ │  plan    │ │          │
+│  _spec   ├─▶  _build  ├─▶_refactor ├─▶ skeleton ├─▶  data    ├─▶  base    ├─▶interfaces├─▶  tasks  ├─▶ code_gen │
+│          │ │          │ │          │ │          │ │  flow    │ │ classes  │ │          │ │          │ │   (TDD)  │
+└──────────┘ └──────────┘ └────┬─────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘ └────┬─────┘
+ feature_     feature_        │        skeleton     data_flow    base_        interfaces   tasks        source
+ spec/        build           │        .json        .json        classes      .json        .json        code
+ feature_     .json           │        skeleton_    data_flow    .json
+ spec.json                    │        summary.txt  _viz.html
+                              │
+                       ┌──────▼──────┐
+                       │ feature_edit│ optional pre-planning edits to feature_tree.json
+                       └─────────────┘
+                                        ╰───── rpg.json (created → progressively enriched) ─────╯
+                                                                            │
+                                                                            ▼
+                                                                     ┌──────────┐
+Surgical edit workflow: Requirements -> RPG update -> Code Update    │ rpg_edit │ optional synchronized RPG + code + dep_graph edits
+                                                                     └──▲────▲──┘
+                                                                        │    │
+Reverse Direction: Code → RPG                                           │    │
+                                                                        │    │
+┌──────────────────┐         ┌──────────┐       ┌──────────┐            │    │
+│ Existing Codebase│────────▶│  encode  │──────▶│update_rpg│────────────┘    │
+│                  │         │  (full)  │       │ (manual  │                 │
+└──────────────────┘         └────┬─────┘       │ fallback)│                 │
+                              rpg.json          └──────────┘                 │
+                              dep_graph.json     rpg.json / dep_graph.json   │
+                                  │                                          │
+                                  └──────────────────────────────────────────┘
+                                                  ▲
+                                                  │ post-commit hook normally runs incremental updates
+
+MCP Server: search_rpg / explore_rpg / get_node_detail / list_rpg_tree
+```
+
+</details>
+
+### RPG-Kit वास्तविक उपयोग में
+
+नीचे दी गई छवि इस रिपॉज़िटरी के लिए जनरेट किए गए ग्राफ़ विज़ुअलाइज़ेशन का एक भाग है। `/rpgkit.encode` चलाएँ और पूर्ण इंटरैक्टिव ग्राफ़ देखने के लिए `.rpgkit/data/rpg.html` खोलें।
 
 ![RPG-Kit repository graph visualization](../docs/rpgkit_visualized_graph.png)
 
-## Installation
+## इंस्टॉलेशन
 
 ### पूर्वापेक्षाएँ
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
 - Git
-- installed और authenticated AI coding agent CLI: [GitHub Copilot](https://docs.github.com/en/copilot) या [Claude Code](https://docs.anthropic.com/en/docs/claude-code/setup)
+- एक इंस्टॉल और प्रमाणित AI कोडिंग एजेंट CLI: [GitHub Copilot](https://docs.github.com/en/copilot) या [Claude Code](https://docs.anthropic.com/en/docs/claude-code/setup)
 
-### RPG-Kit install करें
+### RPG-Kit इंस्टॉल करें
 
 ```bash
-# Persistent installation (Recommended)
+# Persistent इंस्टॉलेशन (अनुशंसित)
 uv tool install rpgkit-cli --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-Kit"
 rpgkit check
 
-# One-time usage
+# एक बार के उपयोग के लिए
 uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-Kit" rpgkit init <project-name>
 ```
 
-<a id="quick-start-new-repository"></a>
+## Quick Start: नई रिपॉज़िटरी
 
-## Quick Start: नया Repository
-
-जब आप चाहते हैं कि RPG-Kit requirements को एक नए codebase में बदले, तो इस path का उपयोग करें।
+जब आप RPG-Kit से आवश्यकताओं को एक नए कोडबेस में बदलवाना चाहते हैं, तब इस मार्ग का उपयोग करें।
 
 > [!WARNING]
-> जिन projects में generated code की मात्रा बड़ी हो, उनमें `/rpgkit.design_interfaces` और `/rpgkit.code_gen` का runtime लंबा हो सकता है। एक typical example: feature count 100 होने पर runtime लगभग 30 minutes होता है।
+> बहुत अधिक जनरेटेड कोड वाली परियोजनाओं के लिए, `/rpgkit.design_interfaces` और `/rpgkit.code_gen` को चलने में काफ़ी समय लग सकता है। उदाहरण: 100 features में लगभग 30 मिनट लगते हैं।
 
-1. नया project initialize करें:
+1. नई परियोजना को आरंभीकृत करें:
 
    ```bash
    rpgkit init my-project
    cd my-project
    ```
 
-   सामान्य variants:
+   सामान्य विकल्प:
 
    ```bash
    rpgkit init my-project --ai claude --script sh
@@ -82,11 +125,11 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-K
    rpgkit init my-project --github-token $GITHUB_TOKEN
    ```
 
-2. **[Optional]** अपनी requirement documents को `my-project/docs/` में रखें।
+2. **[वैकल्पिक]** अपने आवश्यकता दस्तावेज़ `my-project/docs/` में रखें।
 
-3. project directory में अपना AI coding agent launch करें।
+3. परियोजना निर्देशिका में अपना AI कोडिंग एजेंट लॉन्च करें।
 
-4. forward pipeline run करें:
+4. फॉरवर्ड पाइपलाइन चलाएँ:
 
    ```text
    /rpgkit.feature_spec <feature description>
@@ -102,18 +145,16 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-K
    [Optional] /rpgkit.rpg_edit <edit instructions>
    ```
 
-RPG-Kit क्रमिक रूप से `.rpgkit/data/rpg.json` बनाता है और इसका उपयोग requirements, planning artifacts, generated code, और dependency information को aligned रखने के लिए करता है।
+RPG-Kit क्रमिक रूप से `.rpgkit/data/rpg.json` बनाता है और इसका उपयोग आवश्यकताओं, प्लानिंग आउटपुट, जनरेटेड कोड और dependency जानकारी को संरेखित रखने के लिए करता है।
 
-<a id="quick-start-existing-repository"></a>
+## Quick Start: मौजूदा रिपॉज़िटरी
 
-## Quick Start: मौजूदा Repository
-
-जब आपके पास पहले से repository हो और आप चाहते हों कि AI agent उसे RPG context के साथ समझे या edit करे, तो इस path का उपयोग करें।
+जब आपके पास पहले से एक रिपॉज़िटरी है और आप चाहते हैं कि AI एजेंट इसे RPG कॉन्टेक्स्ट के साथ समझे या संपादित करे, तब इस मार्ग का उपयोग करें।
 
 > [!WARNING]
-> बड़े projects के लिए, `rpgkit init . --encode` और `/rpgkit.encode` का runtime लंबा हो सकता है। एक typical example: source code files 200 होने पर runtime 100 minutes होता है।
+> बड़ी परियोजनाओं के लिए, `rpgkit init . --encode` और `/rpgkit.encode` को चलने में काफ़ी समय लग सकता है। उदाहरण: 200 स्रोत फ़ाइलों में लगभग 100 मिनट लगते हैं।
 
-1. repository root में RPG-Kit initialize करें और initial graph build करें:
+1. रिपॉज़िटरी रूट में RPG-Kit को आरंभीकृत करें और प्रारंभिक ग्राफ़ बनाएँ:
 
    ```bash
    mkdir my-project
@@ -122,81 +163,81 @@ RPG-Kit क्रमिक रूप से `.rpgkit/data/rpg.json` बनात
    rpgkit init . --encode
    ```
 
-   अगर आप non-empty directory के confirmation prompt को skip करना चाहते हैं:
+   यदि आप गैर-खाली निर्देशिका के लिए पुष्टि संकेत को छोड़ना चाहते हैं:
 
    ```bash
    rpgkit init . --force --encode
    ```
 
-2. repository में अपना AI coding agent launch करें।
+2. रिपॉज़िटरी में अपना AI कोडिंग एजेंट लॉन्च करें।
 
-3. generated RPG को MCP tools और slash commands के माध्यम से उपयोग करें:
+3. MCP टूल्स और स्लैश कमांड्स के माध्यम से जनरेटेड RPG का उपयोग करें:
 
    ```text
-   /rpgkit.encode                                  # जरूरत पड़ने पर full RPG rebuild करें
-   /rpgkit.update_rpg                              # manual incremental update fallback
-   /rpgkit.rpg_edit <edit instructions>            # graph-aware code edit
+   /rpgkit.encode                                  # आवश्यकता पड़ने पर पूर्ण RPG को पुनर्निर्मित करें
+   /rpgkit.update_rpg                              # मैन्युअल वृद्धिशील अपडेट (fallback)
+   /rpgkit.rpg_edit <edit instructions>            # ग्राफ़-जागरूक कोड संपादन
    ```
 
-4. commits के बाद, RPG-Kit hooks `.rpgkit/data/rpg.json`, `.rpgkit/data/dep_graph.json`, और `.rpgkit/data/rpg.html` को code changes के साथ aligned रखते हैं। अगर hook fail या skip हो जाए, तो `/rpgkit.update_rpg` run करें।
+4. कमिट के बाद, RPG-Kit hooks `.rpgkit/data/rpg.json`, `.rpgkit/data/dep_graph.json` और `.rpgkit/data/rpg.html` को कोड परिवर्तनों के साथ संरेखित रखते हैं। यदि hook विफल हो जाता है या छोड़ दिया जाता है, तो `/rpgkit.update_rpg` चलाएँ।
 
-## क्या जोड़ा जाता है
+## `rpgkit init` के बाद क्या होता है
 
-`rpgkit init` run करने के बाद भी workspace root आपके project repository का root रहता है। RPG-Kit command definitions, runtime scripts, MCP configuration, और generated graph data को आपके code के साथ जोड़ता है।
+`rpgkit init` आपकी स्रोत फ़ाइलों को संशोधित नहीं करता है। यह आपके कोड के साथ-साथ कमांड परिभाषाएँ, रनटाइम स्क्रिप्ट्स, MCP कॉन्फ़िगरेशन और जनरेटेड ग्राफ़ डेटा जोड़ता है।
 
 ```text
 my-project/
-├── docs/                 # /rpgkit.feature_spec के लिए optional requirement docs
-├── .github/ or .claude/  # AI assistant command definitions और settings
-├── .vscode/              # applicable होने पर Copilot/VS Code MCP configuration
-└── .rpgkit/              # RPG-Kit runtime
-    ├── scripts/          # Pipeline scripts और support packages
-    ├── data/             # Generated artifacts, जिनमें rpg.json और dep_graph.json शामिल हैं
-    ├── logs/             # Per-stage execution logs
-    └── reports/          # Generated review और diagnostic reports
+├── docs/                 # /rpgkit.feature_spec के लिए वैकल्पिक आवश्यकता दस्तावेज़
+├── .github/ or .claude/  # AI सहायक कमांड परिभाषाएँ और सेटिंग्स
+├── .vscode/              # लागू होने पर Copilot/VS Code MCP कॉन्फ़िगरेशन
+└── .rpgkit/              # RPG-Kit रनटाइम
+    ├── scripts/          # पाइपलाइन स्क्रिप्ट्स और सहायक पैकेज
+    ├── data/             # जनरेटेड आउटपुट, जिसमें rpg.json और dep_graph.json शामिल हैं
+    ├── logs/             # प्रति-चरण निष्पादन लॉग
+    └── reports/          # जनरेट होने पर समीक्षा और निदान रिपोर्ट
 ```
 
-Full layout और data file reference के लिए [docs/project-structure.md](docs/project-structure.md) देखें।
+पूर्ण लेआउट और डेटा फ़ाइल संदर्भ के लिए [docs/project-structure.md](docs/project-structure.md) देखें।
 
-## Supported Platforms
+## समर्थित प्लेटफ़ॉर्म्स
 
-| प्लेटफ़ॉर्म             | Claude Code | GitHub Copilot | Codex |
-| ----------------------- | ----------- | -------------- | ----- |
-| CLI उपयोग               | ✅          | ✅(MCP नहीं)   | ⌛    |
-| VS Code extension उपयोग | ✅          | ✅             | ⌛    |
+| प्लेटफ़ॉर्म              | Claude Code | GitHub Copilot | Codex |
+| ------------------------ | ----------- | -------------- | ----- |
+| CLI उपयोग                | ✅          | ✅ (No MCP)    | ⌛    |
+| VS Code एक्सटेंशन उपयोग  | ✅          | ✅             | ⌛    |
 
-| Script | Linux | Windows | Mac |
-| ------ | ----- | ------- | --- |
-| sh     | ✅    | ⌛      | ⌛  |
-| ps     | N/A   | ⌛      | ⌛  |
+| स्क्रिप्ट | Linux | Windows | Mac |
+| --------- | ----- | ------- | --- |
+| sh        | ✅    | ⌛      | ⌛  |
+| ps        | N/A   | ⌛      | ⌛  |
 
-## Documentation
+## दस्तावेज़ीकरण
 
-- [Slash command reference](docs/commands.md) — हर `/rpgkit.*` command, inputs, outputs, और examples।
-- [CLI reference](docs/cli-reference.md) — `rpgkit init`, `rpgkit update`, `rpgkit check`, `rpgkit version`, और सभी options।
-- [Configuration](docs/configuration.md) — AI assistant setup, MCP registration, hooks, auto-approval, और troubleshooting।
-- [Project structure](docs/project-structure.md) — RPG-Kit द्वारा बनाए गए files और directories।
+- [स्लैश कमांड संदर्भ](docs/commands.md) — हर `/rpgkit.*` कमांड के लिए इनपुट, आउटपुट और उदाहरण।
+- [CLI संदर्भ](docs/cli-reference.md) — `rpgkit init`, `rpgkit update`, `rpgkit check`, `rpgkit version` और सभी विकल्प।
+- [कॉन्फ़िगरेशन](docs/configuration.md) — AI सहायक सेटअप, MCP पंजीकरण, hooks, ऑटो-अनुमोदन और समस्या-निवारण।
+- [परियोजना संरचना](docs/project-structure.md) — RPG-Kit द्वारा बनाई गई फ़ाइलें और निर्देशिकाएँ।
 
-## आगामी फीचर्स
+## आगामी सुविधाएँ
 
-- **सरल decoder commands:** मौजूदा decoder flow को कम commands में merge करना, जिसमें end-to-end repository generation के लिए `/rpgkit.generate_repo`, और feature generation तथा RPG planning के लिए `/rpgkit.generate_feature` plus `/rpgkit.plan` शामिल हैं।
-- **Multi-language support:** Go, C++, Rust, JavaScript/TypeScript, और अन्य के लिए support जोड़ना।
-- **अधिक platform integrations:** अलग-अलग systems पर अलग-अलग AI coding agents के लिए CLI और VS Code extension workflows में RPG-Kit support करना।
+- **सरल जनरेशन कमांड्स:** वर्तमान बहु-चरण जनरेशन प्रवाह को कम कमांड्स में मर्ज किया जाएगा, जैसे `/rpgkit.generate_repo`, `/rpgkit.generate_feature` और `/rpgkit.plan`।
+- **बहु-भाषा समर्थन:** Go, C++, Rust, JavaScript/TypeScript और अन्य के लिए समर्थन जोड़ा जाएगा।
+- **अधिक प्लेटफ़ॉर्म एकीकरण:** विभिन्न सिस्टम्स पर विभिन्न AI कोडिंग एजेंट्स के लिए CLI और VS Code एक्सटेंशन वर्कफ़्लो में RPG-Kit समर्थन।
 
-## Troubleshooting
+## समस्या-निवारण
 
-**AI assistant CLI नहीं मिला:** `rpgkit check` run करें, selected assistant CLI install और authenticate करें, फिर `rpgkit init` या `rpgkit update` दोबारा run करें।
+**AI सहायक CLI नहीं मिला:** `rpgkit check` चलाएँ, चयनित सहायक CLI को इंस्टॉल और प्रमाणित करें, फिर `rpgkit init` या `rpgkit update` पुनः चलाएँ।
 
-**MCP tools `rpg_unavailable` report करते हैं:** `.rpgkit/data/rpg.json` create करने के लिए `/rpgkit.encode` run करें।
+**MCP टूल्स `rpg_unavailable` की रिपोर्ट करते हैं:** `.rpgkit/data/rpg.json` बनाने के लिए `/rpgkit.encode` चलाएँ।
 
-**Incremental update failed:** `.rpgkit/logs/update_rpg.log` inspect करें, फिर `/rpgkit.update_rpg` run करें।
+**वृद्धिशील अपडेट विफल:** `.rpgkit/logs/update_rpg.log` की जाँच करें, फिर `/rpgkit.update_rpg` चलाएँ।
 
-**Rate limits या private repo access के कारण template download fail होता है:** `--github-token $GITHUB_TOKEN` pass करें या `GH_TOKEN` / `GITHUB_TOKEN` set करें।
+**रेट लिमिट्स या निजी रिपॉज़िटरी एक्सेस के कारण टेम्पलेट डाउनलोड विफल:** `--github-token $GITHUB_TOKEN` पास करें या `GH_TOKEN` / `GITHUB_TOKEN` सेट करें।
 
-## License
+## लाइसेंस
 
-MIT License - विवरण के लिए [LICENSE](LICENSE) देखें।
+MIT License — विवरण के लिए [LICENSE](LICENSE) देखें।
 
-## Acknowledgements
+## आभार
 
 [GitHub Spec-Kit](https://github.com/github/spec-kit) पर आधारित।
