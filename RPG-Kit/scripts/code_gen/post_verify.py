@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Post-verification: independent pytest re-run after a sub-agent batch.
+
+This module hosts :func:`post_verify`, extracted from
+``scripts/run_batch.py`` Module 4 ("Post-Verification").
+
+The sub-agent self-reports ``BATCH_RESULT: PASS`` or ``FAIL`` after its
+TDD cycle, but we do **not** trust that signal — :func:`post_verify`
+re-runs pytest from the orchestrator process to get an authoritative
+answer.  This catches two failure modes:
+
+* Sub-agent claims PASS but actually skipped failing tests.
+* Sub-agent's environment differed from the orchestrator's (different
+  PYTHONPATH, stale ``__pycache__``, etc.).
+
+This is an internal helper used only by ``scripts.run_batch``; no
+external API contract.
+"""
+
+from __future__ import annotations
+
+import logging
+import subprocess
+from pathlib import Path
+from typing import Tuple
+
+from common.git_utils import GitRunner
+from common.task_batch import PlannedTask
+from code_gen.prompts import is_project_docs_batch
+from code_gen.test_runner import (
+    ensure_deps_installed,
+    find_related_test_files,
+    run_pytest,
+)
+
+logger = logging.getLogger(__name__)
+
+
+from code_gen._constants import (  # noqa: E402
+    DEFAULT_PYTEST_OVERALL_TIMEOUT,
+    DEFAULT_TEST_TIMEOUT,
+)
+
+
+def post_verify(
+    repo_path: Path,
+    task: PlannedTask,
+    timeout: int = 0,  # 0 = auto-select based on task type
+) -> Tuple[bool, str]:
+    """Run an independent pytest to verify the batch result.
+
+    This is the authoritative check — we do NOT trust the sub-agent's
+    self-reported BATCH_RESULT.
+
+    Args:
+        repo_path: Project repo path.
+        task: The PlannedTask for this batch.
+        timeout: Overall pytest timeout.
+
+    Returns:
+        ``(passed, test_output_summary)``
+    """
+    # Skip verification for docs batches
+    if is_project_docs_batch(task):
+        logger.info("Skipping post-verification for docs batch")
+        return True, "Documentation batch — no tests."
+
+    # Use the global safety-net timeout for all task types.
+    # Per-test hang prevention is handled by pytest-timeout (--timeout=DEFAULT_TEST_TIMEOUT).
+    if timeout == 0:
+        timeout = DEFAULT_PYTEST_OVERALL_TIMEOUT
+
+    def _git_diff_test_files(prefix: str = "tests/") -> list:
+        """Return test files added/modified by this batch branch vs the main branch."""
+        try:
+            main_branch = GitRunner(str(repo_path)).main_branch
+            diff = subprocess.run(
+                ["git", "diff", f"{main_branch}..HEAD", "--name-only"],
+                cwd=repo_path, capture_output=True, text=True, timeout=10,
+            )
+            return [
+                str(repo_path / f) for f in diff.stdout.splitlines()
+                if f.startswith(prefix) and (repo_path / f).exists()
+            ]
+        except Exception:
+            return []
+
+    # Find test files to scope post-verification.
+    # Special file_path values like "<INTEGRATION_TEST>" or "<WIRING>" indicate
+    # synthetic tasks; use git diff to find only what this batch added/modified.
+    test_files = []
+    if not (task.file_path.startswith("<") and task.file_path.endswith(">")):
+        # Regular file batch: find tests related to the target source file.
+        test_files = find_related_test_files(task.file_path, repo_path)
+    elif task.task_type == "integration_test":
+        # Find integration test files added/modified in this batch via git diff.
+        # Falls back to deriving the filename from the unit name.
+        test_files = _git_diff_test_files("tests/test_integration_")
+        if not test_files:
+            # Derived fallback: "Application Core_integration_tests" → test_integration_app_core.py
+            for unit in task.units_key:
+                subtree_name = unit.replace("_integration_tests", "").strip()
+                fname = "test_integration_" + subtree_name.lower().replace(" ", "_") + ".py"
+                candidate = repo_path / "tests" / fname
+                if candidate.exists():
+                    test_files.append(str(candidate))
+    elif task.task_type == "wiring":
+        # Wiring verifies cross-module connections; run every test file the batch
+        # added or modified.  If git diff finds nothing (e.g., on a bare retry),
+        # fall back to all tests so no regression goes undetected.
+        test_files = _git_diff_test_files("tests/test_")
+
+    logger.info(
+        "Post-verification: running pytest on %s",
+        test_files if test_files else "all tests",
+    )
+
+    # Ensure deps are installed (sub-agent may have added new ones)
+    try:
+        ensure_deps_installed(repo_path)
+    except Exception as exc:
+        logger.warning("ensure_deps_installed failed: %s", exc)
+
+    result = run_pytest(
+        repo_path,
+        test_files=test_files or None,
+        timeout=timeout,
+        extra_args=[f"--timeout={DEFAULT_TEST_TIMEOUT}", "--timeout-method=thread"],
+    )
+
+    # Build summary
+    summary_lines = [
+        f"passed={result.passed} failed={result.failed} "
+        f"errors={result.errors} skipped={result.skipped}",
+    ]
+    if not result.success:
+        # Include truncated output for the resume prompt
+        output = result.output
+        if len(output) > 4000:
+            output = output[:4000] + "\n...(truncated)"
+        summary_lines.append(output)
+
+    summary = "\n".join(summary_lines)
+    logger.info("Post-verification result: success=%s %s", result.success, summary_lines[0])
+    if not result.success:
+        logger.debug("Post-verification pytest output:\n%s", result.output)
+    return result.success, summary
