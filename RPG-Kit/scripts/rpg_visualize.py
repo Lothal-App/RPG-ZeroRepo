@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""RPG Visualizer — Generate an interactive graph visualization of rpg.json.
+"""RPG Visualizer — Generate an interactive graph visualization of RPG data.
 
 Renders three views:
-1. **Feat Graph** — collapsible tree layout (D3.js) with semantic edges
-2. **Dep Graph** — collapsible force-directed layout of AST-level dependency graph
+1. **Feat Graph** — collapsible tree layout (D3.js) from rpg.json
+2. **Dep Graph** — collapsible force-directed layout from dep_graph.json
    Nodes are grouped by file hierarchy, collapsible at any level.
    Edges merge when groups are collapsed.
 3. **Mapping** — RPG feature tree (L→R) linked to dep tree (R→L) via _dep_to_rpg_map
@@ -11,7 +11,7 @@ Renders three views:
 Default: only the first level (functional areas) is expanded.
 
 Usage:
-    python3 scripts/rpg_visualize.py [rpg.json] [-o output.html]
+    python3 scripts/rpg_visualize.py [rpg.json] [--dep-graph dep_graph.json] [-o output.html]
 """
 
 import argparse
@@ -21,9 +21,47 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
-def load_rpg(path: str) -> dict:
+def load_json(path: str | Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def resolve_relative_to_rpg(rpg_path: Path, path: str | Path) -> Path:
+    candidate = Path(path).expanduser()
+    return candidate if candidate.is_absolute() else rpg_path.parent / candidate
+
+
+def resolve_dep_graph_path(rpg_path: Path, data: dict, dep_graph_path: str | Path | None = None) -> Path | None:
+    if dep_graph_path:
+        path = resolve_relative_to_rpg(rpg_path, dep_graph_path)
+        return path if path.is_file() else None
+
+    candidates: List[Path] = []
+    if data.get("dep_graph_file"):
+        candidates.append(Path(data["dep_graph_file"]).expanduser())
+    candidates.append(Path("dep_graph.json"))
+
+    for candidate in candidates:
+        path = resolve_relative_to_rpg(rpg_path, candidate)
+        if path.is_file():
+            return path
+    return None
+
+
+def load_rpg(path: str | Path, dep_graph_path: str | Path | None = None) -> dict:
+    rpg_path = Path(path).expanduser()
+    data = load_json(rpg_path)
+
+    embedded_dep = data.get("dep_graph", {})
+    has_embedded_dep = isinstance(embedded_dep, dict) and bool(embedded_dep.get("nodes"))
+    if dep_graph_path or not has_embedded_dep:
+        resolved_dep_path = resolve_dep_graph_path(rpg_path, data, dep_graph_path)
+        if resolved_dep_path:
+            data["dep_graph"] = load_json(resolved_dep_path)
+        elif dep_graph_path:
+            raise FileNotFoundError(f"dep_graph.json not found: {dep_graph_path}")
+
+    return data
 
 
 def normalize_to_tree(data: dict) -> dict:
@@ -1840,16 +1878,22 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize RPG as interactive graph")
     parser.add_argument("rpg_file", nargs="?", default=str(RPG_FILE),
                         help="Path to rpg.json (default: .rpgkit/data/rpg.json)")
+    parser.add_argument("--dep-graph", default=None,
+                        help="Path to dep_graph.json (default: dep_graph_file field or sibling dep_graph.json)")
     parser.add_argument("-o", "--output", default=None,
                         help="Output HTML file (default: <rpg_file>.html)")
     args = parser.parse_args()
 
-    rpg_path = Path(args.rpg_file)
+    rpg_path = Path(args.rpg_file).expanduser()
     if not rpg_path.exists():
         print(f"Error: {rpg_path} not found", file=sys.stderr)
         sys.exit(1)
 
-    data = load_rpg(str(rpg_path))
+    try:
+        data = load_rpg(rpg_path, args.dep_graph)
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
     html_content = generate_html(data)
 
     output = args.output or str(rpg_path.with_suffix(".html"))
