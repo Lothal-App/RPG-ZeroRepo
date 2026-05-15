@@ -8,13 +8,31 @@
   <a href="README.hi-IN.md">हिन्दी</a>
 </p>
 
-## AI-Powered Bidirectional Repository-RPG Toolkit
+## Make AI coding agents understand the whole repository
 
-RPG-Kit leverages LLM-based agents to work bidirectionally with **Repository Planning Graphs (RPG)** — a unified graph connecting features, files, components, and dependencies:
+AI coding agents are powerful, but they often work file by file. As a project grows, they can lose track of requirements, architecture, dependencies, and previous design decisions.
 
-- **Forward (Requirements → RPG → Code):** transforms high-level requirements into tested, structured repositories through a multi-phase pipeline powered by AI coding agents. [Quick start here](#quick-start-new-repository)
-- **Reverse (Code → RPG):** encodes existing codebases into RPG graphs for AI-assisted search, exploration, and incremental updates. [Quick start here](#quick-start-existing-repository)
-- **Surgical edits (Instruction → RPG + Code):** applies targeted changes while keeping code, RPG, and dependency graph synchronized. [Quick start here](#quick-start-existing-repository)
+RPG-Kit helps solve this by maintaining a **Repository Planning Graph (RPG)**: a structured map that connects requirements, features, files, components, and dependencies.
+
+Use RPG-Kit when you want AI agents to work with repository-level context instead of isolated prompts!
+
+### Why RPG-Kit?
+
+| Common problem with AI coding agents | How RPG-Kit helps |
+|---|---|
+| The agent forgets requirements after a few prompts | Requirements are encoded into the RPG |
+| The agent edits one file without understanding related files | Files, components, and dependencies are connected in the graph |
+| Generated code drifts away from the original plan | Planning artifacts and code are kept aligned |
+| Existing repositories are hard for agents to understand | The codebase can be encoded into an RPG |
+| Targeted edits can break hidden dependencies | Edits are made with graph-aware context |
+
+### Choose your workflow
+
+| Goal | Workflow | Start here |
+|---|---|---|
+| Create a new project from requirements | Forward workflow | [`Quick Start: New Repository`](#quick-start-new-repository) |
+| Understand or update an existing codebase | Reverse workflow | [`Quick Start: Existing Repository`](#quick-start-existing-repository) |
+| Make a precise repository-aware edit | Surgical edit workflow | [`Quick Start: Existing Repository`](#quick-start-existing-repository) |
 
 ## Installation
 
@@ -114,9 +132,9 @@ Use this path when you already have a repository and want an AI agent to underst
 
 4. After commits, RPG-Kit hooks keep `.rpgkit/data/rpg.json`, `.rpgkit/data/dep_graph.json`, and `.rpgkit/data/rpg.html` aligned with code changes. If the hook fails or is skipped, run `/rpgkit.update_rpg`.
 
-## What Gets Added
+## What happens after `rpgkit init`
 
-After `rpgkit init`, the workspace root is still your project repository root. RPG-Kit adds command definitions, runtime scripts, MCP configuration, and generated graph data alongside your code.
+After `rpgkit init`, the workspace keeps unchanged. RPG-Kit adds command definitions, runtime scripts, MCP configuration, and generated graph data alongside your code.
 
 ```text
 my-project/

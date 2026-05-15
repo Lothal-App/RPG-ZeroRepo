@@ -8,13 +8,31 @@
   <a href="README.hi-IN.md">हिन्दी</a>
 </p>
 
-## AI-संचालित द्विदिश Repository-RPG टूलकिट
+## AI coding agents को पूरे repository को समझने दें
 
-RPG-Kit LLM-आधारित agents का उपयोग करके **Repository Planning Graphs (RPG)** — एक unified graph जो features, files, components, और dependencies को जोड़ता है — के साथ द्विदिश रूप से काम करता है:
+AI coding agents शक्तिशाली होते हैं, लेकिन वे अक्सर file-by-file काम करते हैं। जैसे-जैसे project बढ़ता है, वे requirements, architecture, dependencies, और पिछले design decisions का track खो सकते हैं।
 
-- **Forward (Requirements → RPG → Code):** AI coding agents द्वारा संचालित multi-phase pipeline के माध्यम से high-level requirements को tested, structured repositories में बदलता है। [Quick start यहाँ देखें](#quick-start-new-repository)
-- **Reverse (Code → RPG):** मौजूदा codebases को RPG graphs में encode करता है ताकि AI-assisted search, exploration, और incremental updates किए जा सकें। [Quick start यहाँ देखें](#quick-start-existing-repository)
-- **Surgical edits (Instruction → RPG + Code):** code, RPG, और dependency graph को synchronized रखते हुए targeted changes लागू करता है। [Quick start यहाँ देखें](#quick-start-existing-repository)
+RPG-Kit इस समस्या को **Repository Planning Graph (RPG)** maintain करके हल करने में मदद करता है: एक structured map जो requirements, features, files, components, और dependencies को जोड़ता है।
+
+जब आप चाहते हैं कि AI agents isolated prompts के बजाय repository-level context के साथ काम करें, तब RPG-Kit का उपयोग करें।
+
+### RPG-Kit क्यों?
+
+| AI coding agents की common problem | RPG-Kit कैसे मदद करता है |
+|---|---|
+| Agent कुछ prompts के बाद requirements भूल जाता है | Requirements RPG में encode की जाती हैं |
+| Agent related files को समझे बिना एक file edit करता है | Files, components, और dependencies graph में connected होते हैं |
+| Generated code original plan से drift हो जाता है | Planning artifacts और code aligned रखे जाते हैं |
+| Existing repositories को agents के लिए समझना कठिन होता है | Codebase को RPG में encode किया जा सकता है |
+| Targeted edits hidden dependencies तोड़ सकते हैं | Edits graph-aware context के साथ किए जाते हैं |
+
+### अपना workflow चुनें
+
+| Goal | Workflow | Start here |
+|---|---|---|
+| Requirements से नया project create करें | Forward workflow | [`Quick Start: नया Repository`](#quick-start-new-repository) |
+| Existing codebase को समझें या update करें | Reverse workflow | [`Quick Start: मौजूदा Repository`](#quick-start-existing-repository) |
+| Precise repository-aware edit करें | Surgical edit workflow | [`Quick Start: मौजूदा Repository`](#quick-start-existing-repository) |
 
 ## Installation
 
