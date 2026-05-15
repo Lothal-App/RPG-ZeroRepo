@@ -6,6 +6,43 @@ RPG-Kit provides 13 slash commands that work in three paths:
 - **Reverse encoder:** Existing code → RPG
 - **Surgical edit:** Natural-language changes applied to code, RPG, and dependency graph together
 
+## Command Overview
+
+### Phase 1: Feature Specification
+
+| Command | Description |
+| ------- | ----------- |
+| `/rpgkit.feature_spec <desc>` | Create structured feature specifications from user input or `docs/` files |
+| `/rpgkit.feature_build` | Generate and expand the feature tree from specifications |
+| `/rpgkit.feature_refactor` | Refactor feature tree into modular component architecture |
+| `/rpgkit.feature_edit <instr>` | Edit feature tree nodes before skeleton planning — optional |
+
+### Phase 2: RPG Construction and Planning
+
+| Command | Description |
+| ------- | ----------- |
+| `/rpgkit.build_skeleton` | Build repository file skeleton from component architecture; creates `.rpgkit/data/rpg.json` |
+| `/rpgkit.build_data_flow` | Build inter-component data flow DAG and update the RPG |
+| `/rpgkit.design_base_classes` | Design shared base classes and data structures |
+| `/rpgkit.design_interfaces` | Design function/class interfaces with type hints and docstrings |
+| `/rpgkit.plan_tasks` | Plan dependency-ordered implementation task batches |
+
+### Phase 3: Code Generation and Surgical Edits
+
+| Command | Description |
+| ------- | ----------- |
+| `/rpgkit.code_gen` | TDD-based implementation with iterative test-code-fix cycles |
+| `/rpgkit.rpg_edit <instr>` | Surgical edit of RPG graph, code, and dependency graph from a natural-language instruction — optional |
+
+### RPG Encoder: Code to RPG
+
+| Command | Description |
+| ------- | ----------- |
+| `/rpgkit.encode` | Encode an existing repository into `.rpgkit/data/rpg.json` |
+| `/rpgkit.update_rpg` | Manually run incremental RPG update when the automatic hook is skipped or fails |
+
+Both directions produce the same RPG structure at `.rpgkit/data/rpg.json`, enabling AI agents to query the graph via the **MCP server** (`search_rpg`, `explore_rpg`, `get_node_detail`, `list_rpg_tree`). See [configuration.md](configuration.md) for MCP details.
+
 ---
 
 ## Phase 1: Feature Specification
