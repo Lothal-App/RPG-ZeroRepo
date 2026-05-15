@@ -29,7 +29,21 @@ The repository also includes the research code: **[ZeroRepo](#zerorepo-requireme
 
 ---
 
-## Why RPG-Kit?
+## Documentation
+
+- [RPG-Kit Guide](RPG-Kit/README.md) — setup, slash commands, MCP tools
+- [RPG-Kit Commands Reference](RPG-Kit/docs/commands.md)
+- [RPG-Kit CLI Reference](RPG-Kit/docs/cli-reference.md)
+- [RPG-Kit Configuration](RPG-Kit/docs/configuration.md)
+- [ZeroRepo Pipeline Details](docs/zerorepo-pipeline.md) — Phase 1/2/3, checkpoint files, configuration
+- [RPG-Encoder Module](zerorepo/rpg_encoder/README.md)
+- [RepoCraft Benchmark](repocraft/README.md)
+
+---
+
+## RPG-Kit
+
+### Why RPG-Kit?
 
 Coding agents are strong at local edits, but repository-level work requires durable context: requirements, architecture, implementation progress, and dependencies must stay aligned across many steps.
 
@@ -41,9 +55,7 @@ Coding agents are strong at local edits, but repository-level work requires dura
 | Updates are often local edits without impact analysis. | Edits are planned through affected RPG nodes and dependencies. |
 | The repository map is rebuilt mentally every time. | The RPG is searchable, explorable, and reusable across tasks. |
 
----
-
-## What can I do with RPG-Kit?
+### What can I do with RPG-Kit?
 
 | Task | Start from | RPG-Kit workflow | Benefit |
 |---|---|---|---|
@@ -51,9 +63,7 @@ Coding agents are strong at local edits, but repository-level work requires dura
 | **Understand an existing repository** | An existing codebase | Encode the repo into an RPG workspace, then search, explore, and explain through MCP tools (`search_rpg`, `explore_rpg`, `get_node_detail`). | A structured repository map beyond chat history and file search. |
 | **Update an existing repository** | A codebase + change request | Use the RPG to locate affected nodes, plan the edit, and update code and graph together (`/rpgkit.rpg_edit "..."`). | Graph-aware edits that account for cross-file dependencies. |
 
----
-
-## Quick Start with RPG-Kit
+### Quick Start
 
 ```bash
 uv tool install rpgkit-cli \
@@ -83,30 +93,9 @@ cd my-project
 See [`RPG-Kit/README.md`](RPG-Kit/README.md) for the full setup, slash commands, and MCP tools.
 Also available in [简体中文](RPG-Kit/README.zh-CN.md) · [日本語](RPG-Kit/README.ja-JP.md) · [한국어](RPG-Kit/README.ko-KR.md) · [हिन्दी](RPG-Kit/README.hi-IN.md).
 
----
-
-## RPG-Kit: RPG-driven coding agents
+### Overview
 
 RPG-Kit gives Claude Code and GitHub Copilot a **persistent RPG workspace** for repository-level tasks. Instead of relying only on chat history, file search, and local context, the agent can carry repository-level planning state across long tasks.
-
-```
-                         Claude Code / GitHub Copilot
-                                    │
-                                    ▼
-                                RPG-Kit
-                 CLI setup · slash commands · MCP graph tools
-                                    │
-                                    ▼
-                         Persistent RPG Workspace
-               requirements · features · files · code entities · deps
-                                    │
-          ┌─────────────────────────┼─────────────────────────┐
-          ▼                         ▼                         ▼
-    Build from scratch       Understand a repo          Update a repo
-    requirement → RPG       repo → RPG workspace        repo + change request
-    → implementation plan   → search/explore/explain    → affected nodes
-    → multi-file code       → repository context        → code + RPG update
-```
 
 RPG-Kit exposes the RPG workspace through three interfaces:
 
@@ -132,18 +121,6 @@ See [`RPG-Kit/`](RPG-Kit/) for the full guide.
 
 ## Standalone research code
 
-For paper reproduction and benchmarking — these run without an agent CLI.
-
-| Component | Use it for |
-|---|---|
-| **[ZeroRepo](#zerorepo-requirements--rpg--repository)** | Reproduce the RPG paper's forward pipeline: `requirements → RPG → repository`. |
-| **[RPG-Encoder](#rpg-encoder-repository--rpg)** | Reproduce the RPG-Encoder paper's reverse pipeline: `repository → RPG`. |
-| **[RepoCraft](#repocraft-benchmark)** | Evaluate repository-level code generation. |
-
----
-
-## How RPG-Kit relates to the research code
-
 ZeroRepo and RPG-Encoder are the standalone research pipelines for constructing RPGs:
 
 ```
@@ -151,11 +128,15 @@ requirements → RPG → repository      # ZeroRepo
 repository → RPG                     # RPG-Encoder
 ```
 
-RPG-Kit is the agent-facing layer that uses RPGs from either direction to drive planning, generation, navigation, and graph-aware updates inside coding agents.
+RPG-Kit (above) is the agent-facing layer that uses RPGs from either direction. The components below run **without an agent CLI** — useful for paper reproduction and benchmarking.
 
----
+| Component | Use it for |
+|---|---|
+| **[ZeroRepo](#zerorepo-requirements--rpg--repository)** | Reproduce the RPG paper's forward pipeline. |
+| **[RPG-Encoder](#rpg-encoder-repository--rpg)** | Reproduce the RPG-Encoder paper's reverse pipeline. |
+| **[RepoCraft](#repocraft-benchmark)** | Evaluate repository-level code generation. |
 
-## ZeroRepo: requirements → RPG → repository
+### ZeroRepo: requirements → RPG → repository
 
 > *RPG: A Repository Planning Graph for Unified and Scalable Codebase Generation* — [arXiv:2509.16198](https://arxiv.org/abs/2509.16198), ICLR 2026
 
@@ -180,9 +161,7 @@ python main.py \
 
 See [`docs/zerorepo-pipeline.md`](docs/zerorepo-pipeline.md) for phase details, checkpoint files, intermediate file reference, and configuration.
 
----
-
-## RPG-Encoder: repository → RPG
+### RPG-Encoder: repository → RPG
 
 > *Closing the Loop: Universal Repository Representation with RPG-Encoder* — [arXiv:2602.02084](https://arxiv.org/abs/2602.02084), ICML 2026
 
@@ -195,7 +174,7 @@ This enables agents to:
 - update RPGs incrementally after code changes;
 - use the graph as context for maintenance and editing tasks.
 
-### Three mechanisms
+#### Three mechanisms
 
 | Mechanism | Module | Description |
 |---|---|---|
@@ -203,7 +182,7 @@ This enables agents to:
 | **Evolution** | `rpg_parsing/rpg_evolution.py` | Incrementally maintains RPGs via commit-level diff parsing, avoiding full re-encoding after every change |
 | **Operation** | `rpg_agent/` | Provides a unified agentic interface (SearchNode, FetchNode, ExploreRPG) for structure-aware navigation |
 
-### Quick start (standalone)
+#### Quick start (standalone)
 
 ```bash
 python parse_rpg.py parse \
@@ -221,9 +200,7 @@ python parse_rpg.py update \
 
 See [`zerorepo/rpg_encoder/README.md`](zerorepo/rpg_encoder/README.md) for detailed documentation.
 
----
-
-## RepoCraft Benchmark
+### RepoCraft Benchmark
 
 RepoCraft is the benchmark and evaluation suite for repository-level code generation. It evaluates whether a model can plan and generate repository-scale software artifacts rather than isolated functions.
 
@@ -236,18 +213,6 @@ It consists of **1,052 tasks** across 6 real-world Python projects (scikit-learn
 | **Code Statistics** | File count, Lines of Code (LOC), Token count |
 
 See [`repocraft/README.md`](repocraft/README.md) for the full pipeline documentation.
-
----
-
-## Documentation
-
-- [RPG-Kit Guide](RPG-Kit/README.md) — setup, slash commands, MCP tools
-- [RPG-Kit Commands Reference](RPG-Kit/docs/commands.md)
-- [RPG-Kit CLI Reference](RPG-Kit/docs/cli-reference.md)
-- [RPG-Kit Configuration](RPG-Kit/docs/configuration.md)
-- [ZeroRepo Pipeline Details](docs/zerorepo-pipeline.md) — Phase 1/2/3, checkpoint files, configuration
-- [RPG-Encoder Module](zerorepo/rpg_encoder/README.md)
-- [RepoCraft Benchmark](repocraft/README.md)
 
 ---
 
