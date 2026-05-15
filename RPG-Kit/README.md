@@ -22,7 +22,7 @@ Use RPG-Kit when you want AI agents to work with repository-level context instea
 |---|---|---|
 | Create a new project from requirements | Forward workflow | [`Quick Start: New Repository`](#quick-start-new-repository) |
 | Understand or update an existing codebase | Reverse workflow | [`Quick Start: Existing Repository`](#quick-start-existing-repository) |
-| Make a precise repository-aware edit | Surgical edit workflow | [`Quick Start: New Repository`](#quick-start-new-repository) |
+| Make a precise repository-aware edit | Surgical edit workflow | [`Quick Start: Existing Repository`](#quick-start-existing-repository) |
 
 ### Workflow Details
 
