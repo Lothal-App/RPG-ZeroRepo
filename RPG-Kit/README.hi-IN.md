@@ -41,6 +41,9 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-K
 
 जब आप चाहते हैं कि RPG-Kit requirements को एक नए codebase में बदले, तो इस path का उपयोग करें।
 
+> [!WARNING]
+> जिन projects में generated code की मात्रा बड़ी हो, उनमें `/rpgkit.design_interfaces` और `/rpgkit.code_gen` का runtime लंबा हो सकता है। एक typical example: feature count 100 होने पर runtime लगभग 30 minutes होता है।
+
 1. नया project initialize करें:
 
    ```bash
@@ -82,6 +85,9 @@ RPG-Kit क्रमिक रूप से `.rpgkit/data/rpg.json` बनात
 ## Quick Start: मौजूदा Repository
 
 जब आपके पास पहले से repository हो और आप चाहते हों कि AI agent उसे RPG context के साथ समझे या edit करे, तो इस path का उपयोग करें।
+
+> [!WARNING]
+> बड़े projects के लिए, `rpgkit init . --encode` और `/rpgkit.encode` का runtime लंबा हो सकता है। एक typical example: source code files 200 होने पर runtime 100 minutes होता है।
 
 1. repository root में RPG-Kit initialize करें और initial graph build करें:
 

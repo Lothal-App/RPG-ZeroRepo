@@ -41,6 +41,9 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-K
 
 当你想让 RPG-Kit 将需求转换为新代码库时，使用此路径。
 
+> [!WARNING]
+> 对于生成代码量比较大的项目，`/rpgkit.design_interfaces` 和 `/rpgkit.code_gen` 的运行时间会比较长。一个典型的例子：特征数为100，运行时间大约30分钟。
+
 1. 初始化新项目：
 
    ```bash
@@ -82,6 +85,9 @@ RPG-Kit 会逐步创建 `.rpgkit/data/rpg.json`，并使用它来保持需求、
 ## 快速开始：现有仓库
 
 当你已经有一个代码仓库，并希望 AI 智能体借助 RPG 上下文理解或编辑它时，使用此路径。
+
+> [!WARNING]
+> 对于比较大的项目，`rpgkit init . --encode` 和 `/rpgkit.encode` 的运行时间可能会比较长。一个典型的例子：源代码文件数为200，运行时间100分钟。
 
 1. 在仓库根目录初始化 RPG-Kit，并构建初始图：
 

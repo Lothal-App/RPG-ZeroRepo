@@ -41,6 +41,9 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-K
 
 RPG-Kit に要件を新しいコードベースへ変換させたい場合は、この手順を使用します。
 
+> [!WARNING]
+> 生成されるコード量が多いプロジェクトでは、`/rpgkit.design_interfaces` と `/rpgkit.code_gen` の実行時間が長くなる場合があります。典型的な例として、機能数が 100 の場合、実行時間は約 30 分です。
+
 1. 新しいプロジェクトを初期化します：
 
    ```bash
@@ -82,6 +85,9 @@ RPG-Kit は `.rpgkit/data/rpg.json` を段階的に作成し、それを使用�
 ## クイックスタート：既存リポジトリ
 
 すでにリポジトリがあり、AI エージェントに RPG コンテキストを使って理解または編集させたい場合は、この手順を使用します。
+
+> [!WARNING]
+> 比較的大きなプロジェクトでは、`rpgkit init . --encode` と `/rpgkit.encode` の実行時間が長くなる場合があります。典型的な例として、ソースコードファイル数が 200 の場合、実行時間は約 100 分です。
 
 1. リポジトリルートで RPG-Kit を初期化し、初期グラフを構築します：
 

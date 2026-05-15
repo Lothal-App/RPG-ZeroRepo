@@ -40,6 +40,9 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-K
 
 Use this path when you want RPG-Kit to turn requirements into a new codebase.
 
+> [!WARNING]
+> For projects with a large amount of generated code, `/rpgkit.design_interfaces` and `/rpgkit.code_gen` can take a long time to run. As a typical example: 100 features take about 30 minutes.
+
 1. Initialize a new project:
 
    ```bash
@@ -80,6 +83,9 @@ RPG-Kit progressively creates `.rpgkit/data/rpg.json` and uses it to keep requir
 ## Quick Start: Existing Repository
 
 Use this path when you already have a repository and want an AI agent to understand or edit it with RPG context.
+
+> [!WARNING]
+> For larger projects, `rpgkit init . --encode` and `/rpgkit.encode` can take a long time to run. As a typical example: 200 source files take about 100 minutes.
 
 1. Initialize RPG-Kit in the repository root and build the initial graph:
 

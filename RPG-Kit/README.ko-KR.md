@@ -41,6 +41,9 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-K
 
 RPG-Kit이 요구사항을 새 코드베이스로 변환하도록 하려면 이 경로를 사용하세요.
 
+> [!WARNING]
+> 생성되는 코드 양이 많은 프로젝트의 경우, `/rpgkit.design_interfaces`와 `/rpgkit.code_gen`의 실행 시간이 길어질 수 있습니다. 대표적인 예로, 기능 수가 100개인 경우 실행 시간은 약 30분입니다.
+
 1. 새 프로젝트를 초기화합니다:
 
    ```bash
@@ -82,6 +85,9 @@ RPG-Kit은 `.rpgkit/data/rpg.json`을 점진적으로 생성하고, 이를 사�
 ## 빠른 시작: 기존 리포지토리
 
 이미 리포지토리가 있고 AI 에이전트가 RPG 컨텍스트로 이를 이해하거나 편집하게 하려면 이 경로를 사용하세요.
+
+> [!WARNING]
+> 규모가 큰 프로젝트의 경우, `rpgkit init . --encode`와 `/rpgkit.encode`의 실행 시간이 길어질 수 있습니다. 대표적인 예로, 소스 코드 파일 수가 200개인 경우 실행 시간은 약 100분입니다.
 
 1. 리포지토리 루트에서 RPG-Kit을 초기화하고 초기 그래프를 구축합니다:
 
