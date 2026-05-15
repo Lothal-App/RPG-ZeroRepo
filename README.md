@@ -9,7 +9,7 @@ The pipeline has three sequential phases:
 
 ![pipeline of zerorepo](docs/pipeline.png)
 
-Below is part of the graph visualization generated for this repository. Run `/rpgkit.encode` and open `rpg.html` to explore the full interactive graph.
+Below is part of the graph visualization generated for this repository. Try [**RPG-Kit**](RPG-Kit/) to explore the full interactive view!
 
 ![RPG visualization of RPG-ZeroRepo](docs/rpgkit_visualized_graph.png)
 
