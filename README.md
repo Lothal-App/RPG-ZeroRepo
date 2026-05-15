@@ -11,13 +11,17 @@ The pipeline has three sequential phases:
 
 ## News and Updates
 ---
-- [Coming Soon] An RPG-based plugin for Claude Code is under active development and will be open-sourced once ready.
+- [2026-05-15] 🔥 We have open-sourced [**RPG-Kit**](RPG-Kit/), an RPG-based toolkit for Claude Code and GitHub Copilot that supports repository encoding, visualization, and agentic navigation.
 - [2026-03-02] 🔥 We have officially open-sourced the **EpiCoder Feature Tree** (features and frequencies) at [Hugging Face](https://huggingface.co/datasets/microsoft/EpiCoder-meta-features). This provides the structured knowledge base needed to enable full repository planning capabilities in **ZeroRepo**.
 - [2026-02-27] 🔥 We have released code of the [RPG-Encoder](zerorepo/rpg_encoder/) for repository understanding and reconstruction and [RepoCraft](repocraft/) for end-to-end repository generation evaluation.
 - [2026-02-12] 🔥 We have open-sourced the ZeroRepo codebase. RPG-Encoder is currently going through the open-source release process and will be released once the process is complete.
 - [2026.02.02] 🔥 Our paper "[Closing the Loop: Universal Repository Representation with RPG-Encoder](https://arxiv.org/abs/2602.02084)" has been released on arXiv.
 - [2026.01.26] 🔥 [RPG-ZeroRepo](https://arxiv.org/abs/2509.16198) has been accepted as a poster at ICLR 2026.
 - [2025.09.19] 🔥 Our paper "[RPG: A Repository Planning Graph for Unified and Scalable Codebase Generation](https://arxiv.org/abs/2509.16198)" has been released on arXiv.
+
+Below is a snapshot of the graph visualization generated for this repository. Run `/rpgkit.encode` and open `rpg.html` to explore the full interactive graph.
+
+![RPG visualization of RPG-ZeroRepo](docs/rpgkit_visualized_graph.jpg)
 
 
 ## Table of Contents
