@@ -8,35 +8,80 @@
   <a href="README.hi-IN.md">हिन्दी</a>
 </p>
 
-## AI コーディングエージェントにリポジトリ全体を理解させる
+## コーディングエージェントに、編集する前にプランを立てさせる
 
-AI コーディングエージェントは強力ですが、多くの場合、ファイル単位で作業します。プロジェクトが成長すると、要件、アーキテクチャ、依存関係、過去の設計判断を見失うことがあります。
+コーディングエージェントはローカルな編集には強いものの、リポジトリレベルのタスクは安定した計画構造がないと失敗しがちです。要件はドリフトし、アーキテクチャ上の判断は失われ、複数ファイルにまたがる生成は一貫性を欠き、更新は隠れた依存関係を見落とすことがあります。
 
-RPG-Kit は **Repository Planning Graph (RPG)** を維持することで、この問題の解決を支援します。RPG は、要件、機能、ファイル、コンポーネント、依存関係を接続する構造化されたマップです。
+RPG-Kit は Claude Code と GitHub Copilot に、リポジトリレベルのコーディングのための**永続的な RPG ワークスペース**を提供します。このワークスペースは、要件・機能・アーキテクチャ・ファイル・コードエンティティ・依存関係をつなぐ **Repository Planning Graph (RPG)** を中心に構成されています。
 
-孤立したプロンプトではなく、リポジトリレベルのコンテキストで AI エージェントに作業させたい場合に RPG-Kit を使用します。
+RPG-Kit を使うと、エージェントはグラフ駆動のワークフローで作業できます:
 
-### RPG-Kit を使う理由
+- **Build（構築）**: 要件を RPG プランに変換し、複数ファイルからなるリポジトリを生成する。
+- **Understand（理解）**: 既存のリポジトリを RPG にマッピングし、検索・探索・説明する。
+- **Update（更新）**: 影響を受ける RPG ノードを特定し、編集プランを立て、コードとグラフを同時に更新する。
 
-| AI コーディングエージェントによくある問題 | RPG-Kit による解決 |
-|---|---|
-| 数回のプロンプトの後にエージェントが要件を忘れる | 要件が RPG にエンコードされます |
-| 関連ファイルを理解せずに 1 つのファイルだけを編集する | ファイル、コンポーネント、依存関係がグラフで接続されます |
-| 生成されたコードが元の計画からずれていく | 計画成果物とコードが整合した状態に保たれます |
-| 既存リポジトリをエージェントが理解しにくい | コードベースを RPG にエンコードできます |
-| 対象を絞った編集が隠れた依存関係を壊す可能性がある | グラフ認識型のコンテキストで編集されます |
+### ワークフローを選ぶ
 
-### ワークフローを選択する
-
-| 目的 | ワークフロー | ここから開始 |
+| 目的 | ワークフロー | ここから始める |
 |---|---|---|
-| 要件から新しいプロジェクトを作成する | 順方向ワークフロー | [`クイックスタート：新規リポジトリ`](#quick-start-new-repository) |
-| 既存のコードベースを理解または更新する | 逆方向ワークフロー | [`クイックスタート：既存リポジトリ`](#quick-start-existing-repository) |
-| 正確なリポジトリ認識型編集を行う | 外科的編集ワークフロー | [`クイックスタート：既存リポジトリ`](#quick-start-existing-repository) |
+| 要件から新しいリポジトリを構築する | Build ワークフロー（requirements → RPG → code） | [`クイックスタート: 新規リポジトリ`](#クイックスタート-新規リポジトリ) |
+| 既存のリポジトリを理解する | Understand ワークフロー（repository → RPG → search/explore） | [`クイックスタート: 既存リポジトリ`](#クイックスタート-既存リポジトリ) |
+| 既存のリポジトリを更新する | Update ワークフロー（change request → affected RPG nodes → edit plan → code/RPG update） | [`クイックスタート: 既存リポジトリ`](#クイックスタート-既存リポジトリ) |
 
-以下は、このリポジトリ用に生成されたグラフ可視化の一部です。`/rpgkit.encode` を実行し、`rpg.html` を開くと、完全なインタラクティブグラフを探索できます。
+### 詳細なパイプライン
 
-![RPG-Kit リポジトリグラフ可視化](../docs/rpgkit_visualized_graph.png)
+初めて使う方は、このセクションを飛ばして下のクイックスタートから始められます。
+
+<details>
+<summary>コマンドレベルの完全なワークフロー図</summary>
+
+```text
+Forward Direction: Requirements → RPG → Code
+
+ Phase 1: Feature Specification       Phase 2: RPG Construction & Planning                             Phase 3
+┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+│ feature  │ │ feature  │ │ feature  │ │  build   │ │  build   │ │ design   │ │ design   │ │  plan    │ │          │
+│  _spec   ├─▶  _build  ├─▶_refactor ├─▶ skeleton ├─▶  data    ├─▶  base    ├─▶interfaces├─▶  tasks  ├─▶ code_gen │
+│          │ │          │ │          │ │          │ │  flow    │ │ classes  │ │          │ │          │ │   (TDD)  │
+└──────────┘ └──────────┘ └────┬─────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘ └────┬─────┘
+ feature_     feature_        │        skeleton     data_flow    base_        interfaces   tasks        source
+ spec/        build           │        .json        .json        classes      .json        .json        code
+ feature_     .json           │        skeleton_    data_flow    .json
+ spec.json                    │        summary.txt  _viz.html
+                              │
+                       ┌──────▼──────┐
+                       │ feature_edit│ optional pre-planning edits to feature_tree.json
+                       └─────────────┘
+                                        ╰───── rpg.json (created → progressively enriched) ─────╯
+                                                                            │
+                                                                            ▼
+                                                                     ┌──────────┐
+Surgical edit workflow: Requirements -> RPG update -> Code Update    │ rpg_edit │ optional synchronized RPG + code + dep_graph edits
+                                                                     └──▲────▲──┘
+                                                                        │    │
+Reverse Direction: Code → RPG                                           │    │
+                                                                        │    │
+┌──────────────────┐         ┌──────────┐       ┌──────────┐            │    │
+│ Existing Codebase│────────▶│  encode  │──────▶│update_rpg│────────────┘    │
+│                  │         │  (full)  │       │ (manual  │                 │
+└──────────────────┘         └────┬─────┘       │ fallback)│                 │
+                              rpg.json          └──────────┘                 │
+                              dep_graph.json     rpg.json / dep_graph.json   │
+                                  │                                          │
+                                  └──────────────────────────────────────────┘
+                                                  ▲
+                                                  │ post-commit hook normally runs incremental updates
+
+MCP Server: search_rpg / explore_rpg / get_node_detail / list_rpg_tree
+```
+
+</details>
+
+### RPG-Kit の実例
+
+下の図は、本リポジトリに対して生成されたグラフ可視化の一部です。`/rpgkit.encode` を実行し、`.rpgkit/data/rpg.html` を開くと完全なインタラクティブグラフを閲覧できます。
+
+![RPG-Kit repository graph visualization](../docs/rpgkit_visualized_graph.png)
 
 ## インストール
 
@@ -45,36 +90,34 @@ RPG-Kit は **Repository Planning Graph (RPG)** を維持することで、こ�
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
 - Git
-- インストール済みで認証済みの AI コーディングエージェント CLI：[GitHub Copilot](https://docs.github.com/en/copilot) または [Claude Code](https://docs.anthropic.com/en/docs/claude-code/setup)
+- インストール済みで認証済みの AI コーディングエージェント CLI: [GitHub Copilot](https://docs.github.com/en/copilot) または [Claude Code](https://docs.anthropic.com/en/docs/claude-code/setup)
 
-### RPG-Kit をインストールする
+### RPG-Kit のインストール
 
 ```bash
 # 永続インストール（推奨）
 uv tool install rpgkit-cli --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-Kit"
 rpgkit check
 
-# 一回限りの使用
+# 一度きりの使用
 uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=RPG-Kit" rpgkit init <project-name>
 ```
 
-<a id="quick-start-new-repository"></a>
+## クイックスタート: 新規リポジトリ
 
-## クイックスタート：新規リポジトリ
-
-RPG-Kit に要件を新しいコードベースへ変換させたい場合は、この手順を使用します。
+要件から新しいコードベースを生成したい場合は、こちらの手順を使います。
 
 > [!WARNING]
-> 生成されるコード量が多いプロジェクトでは、`/rpgkit.design_interfaces` と `/rpgkit.code_gen` の実行時間が長くなる場合があります。典型的な例として、機能数が 100 の場合、実行時間は約 30 分です。
+> 生成コード量が多いプロジェクトでは、`/rpgkit.design_interfaces` と `/rpgkit.code_gen` の実行に時間がかかることがあります。例として、100 個の feature でおおよそ 30 分かかります。
 
-1. 新しいプロジェクトを初期化します：
+1. 新しいプロジェクトを初期化します:
 
    ```bash
    rpgkit init my-project
    cd my-project
    ```
 
-   一般的なバリエーション：
+   よく使うバリエーション:
 
    ```bash
    rpgkit init my-project --ai claude --script sh
@@ -86,7 +129,7 @@ RPG-Kit に要件を新しいコードベースへ変換させたい場合は、
 
 3. プロジェクトディレクトリで AI コーディングエージェントを起動します。
 
-4. 順方向パイプラインを実行します：
+4. フォワードパイプラインを実行します:
 
    ```text
    /rpgkit.feature_spec <feature description>
@@ -102,18 +145,16 @@ RPG-Kit に要件を新しいコードベースへ変換させたい場合は、
    [Optional] /rpgkit.rpg_edit <edit instructions>
    ```
 
-RPG-Kit は `.rpgkit/data/rpg.json` を段階的に作成し、それを使用して要件、計画成果物、生成されたコード、依存関係情報の整合性を保ちます。
+RPG-Kit は `.rpgkit/data/rpg.json` を段階的に作成し、それを使って要件・計画成果物・生成コード・依存情報を整合した状態に保ちます。
 
-<a id="quick-start-existing-repository"></a>
+## クイックスタート: 既存リポジトリ
 
-## クイックスタート：既存リポジトリ
-
-すでにリポジトリがあり、AI エージェントに RPG コンテキストを使って理解または編集させたい場合は、この手順を使用します。
+すでにリポジトリがあり、AI エージェントに RPG コンテキストで理解または編集させたい場合は、こちらの手順を使います。
 
 > [!WARNING]
-> 比較的大きなプロジェクトでは、`rpgkit init . --encode` と `/rpgkit.encode` の実行時間が長くなる場合があります。典型的な例として、ソースコードファイル数が 200 の場合、実行時間は約 100 分です。
+> 大きめのプロジェクトでは、`rpgkit init . --encode` と `/rpgkit.encode` の実行に時間がかかることがあります。例として、200 ファイルでおおよそ 100 分かかります。
 
-1. リポジトリルートで RPG-Kit を初期化し、初期グラフを構築します：
+1. リポジトリのルートで RPG-Kit を初期化し、初期グラフを構築します:
 
    ```bash
    mkdir my-project
@@ -122,48 +163,48 @@ RPG-Kit は `.rpgkit/data/rpg.json` を段階的に作成し、それを使用�
    rpgkit init . --encode
    ```
 
-   空でないディレクトリの確認プロンプトをスキップしたい場合：
+   空でないディレクトリでの確認プロンプトをスキップしたい場合:
 
    ```bash
    rpgkit init . --force --encode
    ```
 
-2. リポジトリ内で AI コーディングエージェントを起動します。
+2. リポジトリで AI コーディングエージェントを起動します。
 
-3. MCP ツールとスラッシュコマンドを通じて、生成された RPG を使用します：
+3. 生成された RPG を MCP ツールおよびスラッシュコマンド経由で利用します:
 
    ```text
    /rpgkit.encode                                  # 必要に応じて完全な RPG を再構築
-   /rpgkit.update_rpg                              # 手動インクリメンタル更新のフォールバック
-   /rpgkit.rpg_edit <edit instructions>            # グラフ認識型コード編集
+   /rpgkit.update_rpg                              # 手動の増分更新（フォールバック）
+   /rpgkit.rpg_edit <edit instructions>            # グラフ認識型のコード編集
    ```
 
-4. コミット後、RPG-Kit hooks は `.rpgkit/data/rpg.json`、`.rpgkit/data/dep_graph.json`、`.rpgkit/data/rpg.html` をコード変更と整合させます。hook が失敗またはスキップされた場合は、`/rpgkit.update_rpg` を実行してください。
+4. コミット後、RPG-Kit のフックが `.rpgkit/data/rpg.json`、`.rpgkit/data/dep_graph.json`、`.rpgkit/data/rpg.html` をコード変更に合わせて整合します。フックが失敗したりスキップされた場合は `/rpgkit.update_rpg` を実行してください。
 
-## 追加されるもの
+## `rpgkit init` の後に起きること
 
-`rpgkit init` の実行後も、workspace root はプロジェクトリポジトリのルートのままです。RPG-Kit は、コマンド定義、ランタイムスクリプト、MCP 設定、生成されたグラフデータをコードと並べて追加します。
+`rpgkit init` はソースファイルを変更しません。コードのそばに、コマンド定義・ランタイムスクリプト・MCP 設定・生成されたグラフデータを追加します。
 
 ```text
 my-project/
 ├── docs/                 # /rpgkit.feature_spec 用の任意の要件ドキュメント
-├── .github/ or .claude/  # AI assistant コマンド定義と設定
+├── .github/ or .claude/  # AI アシスタントのコマンド定義と設定
 ├── .vscode/              # 該当する場合の Copilot/VS Code MCP 設定
 └── .rpgkit/              # RPG-Kit ランタイム
-    ├── scripts/          # パイプラインスクリプトとサポートパッケージ
-    ├── data/             # rpg.json と dep_graph.json を含む生成アーティファクト
+    ├── scripts/          # パイプラインスクリプトおよびサポートパッケージ
+    ├── data/             # 生成成果物（rpg.json と dep_graph.json を含む）
     ├── logs/             # ステージごとの実行ログ
-    └── reports/          # 生成されたレビューおよび診断レポート
+    └── reports/          # 生成時のレビュー・診断レポート
 ```
 
-完全なレイアウトとデータファイルリファレンスについては、[docs/project-structure.md](docs/project-structure.md) を参照してください。
+完全なレイアウトとデータファイルのリファレンスは [docs/project-structure.md](docs/project-structure.md) を参照してください。
 
-## サポートされるプラットフォーム
+## 対応プラットフォーム
 
-| プラットフォーム        | Claude Code | GitHub Copilot | Codex |
-| ----------------------- | ----------- | -------------- | ----- |
-| CLI 使用                | ✅          | ✅(MCP なし)   | ⌛    |
-| VS Code 拡張の使用      | ✅          | ✅             | ⌛    |
+| プラットフォーム      | Claude Code | GitHub Copilot | Codex |
+| --------------------- | ----------- | -------------- | ----- |
+| CLI 使用              | ✅          | ✅ (No MCP)    | ⌛    |
+| VS Code 拡張使用      | ✅          | ✅             | ⌛    |
 
 | スクリプト | Linux | Windows | Mac |
 | ---------- | ----- | ------- | --- |
@@ -172,31 +213,31 @@ my-project/
 
 ## ドキュメント
 
-- [スラッシュコマンドリファレンス](docs/commands.md) — すべての `/rpgkit.*` コマンド、入力、出力、例。
-- [CLI リファレンス](docs/cli-reference.md) — `rpgkit init`、`rpgkit update`、`rpgkit check`、`rpgkit version`、およびすべてのオプション。
-- [設定](docs/configuration.md) — AI assistant のセットアップ、MCP 登録、hooks、自動承認、トラブルシューティング。
+- [スラッシュコマンドリファレンス](docs/commands.md) — すべての `/rpgkit.*` コマンドの入力・出力・例。
+- [CLI リファレンス](docs/cli-reference.md) — `rpgkit init`、`rpgkit update`、`rpgkit check`、`rpgkit version` とすべてのオプション。
+- [設定](docs/configuration.md) — AI アシスタントのセットアップ、MCP 登録、フック、自動承認、およびトラブルシューティング。
 - [プロジェクト構造](docs/project-structure.md) — RPG-Kit が作成するファイルとディレクトリ。
 
 ## 今後の機能
 
-- **よりシンプルなデコーダーコマンド：** 現在のデコーダーフローをより少ないコマンドに統合します。これには、エンドツーエンドのリポジトリ生成用の `/rpgkit.generate_repo`、および機能生成と RPG 計画用の `/rpgkit.generate_feature` と `/rpgkit.plan` が含まれます。
-- **多言語サポート：** Go、C++、Rust、JavaScript/TypeScript などのサポートを追加します。
-- **より多くのプラットフォーム統合：** さまざまなシステム上で、異なる AI コーディングエージェント向けに CLI と VS Code 拡張ワークフローで RPG-Kit をサポートします。
+- **よりシンプルな生成コマンド:** 現在の多段階の生成フローを、`/rpgkit.generate_repo`、`/rpgkit.generate_feature`、`/rpgkit.plan` などのより少ないコマンドにまとめます。
+- **多言語サポート:** Go、C++、Rust、JavaScript/TypeScript などのサポートを追加します。
+- **より多くのプラットフォーム連携:** さまざまなシステム上の異なる AI コーディングエージェントについて、CLI と VS Code 拡張ワークフローを横断して RPG-Kit をサポートします。
 
 ## トラブルシューティング
 
-**AI assistant CLI が見つからない：** `rpgkit check` を実行し、選択した assistant CLI をインストールして認証したうえで、`rpgkit init` または `rpgkit update` を再実行します。
+**AI アシスタント CLI が見つからない:** `rpgkit check` を実行し、選択したアシスタント CLI をインストールおよび認証し、`rpgkit init` または `rpgkit update` を再実行してください。
 
-**MCP ツールが `rpg_unavailable` を報告する：** `/rpgkit.encode` を実行して `.rpgkit/data/rpg.json` を作成します。
+**MCP ツールが `rpg_unavailable` を報告する:** `/rpgkit.encode` を実行して `.rpgkit/data/rpg.json` を作成してください。
 
-**インクリメンタル更新に失敗した：** `.rpgkit/logs/update_rpg.log` を確認し、その後 `/rpgkit.update_rpg` を実行します。
+**増分更新が失敗する:** `.rpgkit/logs/update_rpg.log` を確認し、`/rpgkit.update_rpg` を実行してください。
 
-**レート制限またはプライベートリポジトリアクセスによりテンプレートのダウンロードに失敗する：** `--github-token $GITHUB_TOKEN` を渡すか、`GH_TOKEN` / `GITHUB_TOKEN` を設定します。
+**レート制限またはプライベートリポジトリのアクセス権でテンプレートのダウンロードに失敗する:** `--github-token $GITHUB_TOKEN` を渡すか、`GH_TOKEN` / `GITHUB_TOKEN` を設定してください。
 
 ## ライセンス
 
-MIT License - 詳細は [LICENSE](LICENSE) を参照してください。
+MIT License — 詳細は [LICENSE](LICENSE) を参照してください。
 
 ## 謝辞
 
-[GitHub Spec-Kit](https://github.com/github/spec-kit) に基づいています。
+[GitHub Spec-Kit](https://github.com/github/spec-kit) を基にしています。
