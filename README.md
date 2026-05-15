@@ -233,38 +233,58 @@ See [`repocraft/README.md`](repocraft/README.md) for the full pipeline documenta
 
 ---
 
-## RPG in Action
+## Usage scenarios
 
-Three user stories showing RPG across the ecosystem:
+Three common scenarios and which components map to each.
 
-### Generate a new project from scratch
+### 1. Generate a new repository from scratch
+
+You have a one-line idea, no code yet, and want a fully planned and tested repository.
+
+**Components used:** RPG (ZeroRepo) — forward direction only.
 
 ```
-User requirement
+your spec
   → RPG feature planning
-  → architecture and task graph
-  → dependency-aware multi-file generation
-  → complete repository
+  → architecture and interface design
+  → graph-guided multi-file code generation
+  → tested repository
 ```
 
-### Understand an existing repository
+→ Standalone Python pipeline: [`python main.py ...`](#zerorepo-requirements--rpg--repository)
+→ Inside an agent: [`/rpgkit.feature_spec ... → /rpgkit.code_gen`](RPG-Kit/README.md)
+
+### 2. Understand an existing repository
+
+You inherited a 200-file codebase. You want the agent to reason about its architecture without re-reading every file.
+
+**Components used:** RPG-Encoder — reverse direction only.
 
 ```
-Existing codebase
+existing codebase
   → RPG-Encoder
-  → semantic + structural RPG
-  → agent navigation and explanation
+  → RPG of the repository (semantic + structural)
+  → agent queries via search_rpg / explore_rpg / get_node_detail
 ```
 
-### Apply a graph-aware update
+→ Standalone parser: [`python parse_rpg.py parse ...`](#rpg-encoder-repository--rpg)
+→ Inside an agent: [`rpgkit init . --encode`](RPG-Kit/README.md)
+
+### 3. Plan and apply non-trivial changes to an existing repository
+
+You have a repo and want to make a multi-file change (refactor, cross-cutting feature, large update) without breaking hidden dependencies.
+
+**Components used:** RPG-Encoder + RPG planning — both directions, closing the loop.
 
 ```
-Change request
-  → locate affected RPG nodes
-  → inspect dependencies
-  → update code and graph
-  → validate the repository
+existing repo
+  → RPG-Encoder produces the RPG (the map)
+  → RPG planning extends or edits the graph for the new change
+  → updates propagate from graph back to code
+  → tested, incrementally updated repository
 ```
+
+→ Inside an agent: [`/rpgkit.rpg_edit "..."`](RPG-Kit/README.md) — the combined workflow RPG-Kit is built for.
 
 ---
 
