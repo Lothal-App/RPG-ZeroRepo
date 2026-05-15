@@ -38,12 +38,12 @@ RPG-ZeroRepo connects repository generation and repository understanding through
 
 ## Which component should I use?
 
-| Component | Use it when you want to... | Direction |
+| Component | Type | Use it when you want to... |
 |---|---|---|
-| **[RPG-Kit](RPG-Kit/)** *(NEW)* | Use RPG inside Claude Code or GitHub Copilot to guide planning, generation, navigation, and updates. | RPG → agent planning / generation / editing |
-| **[ZeroRepo](#zerorepo-requirements--rpg--repository)** | Generate a new repository from a natural-language requirement. | requirements → RPG → code |
-| **[RPG-Encoder](#rpg-encoder-repository--rpg)** | Convert an existing repository into an RPG for understanding and maintenance. | code → RPG |
-| **[RepoCraft](#repocraft-benchmark)** | Evaluate repository-level code generation and planning quality. | benchmark / evaluation |
+| **[RPG-Kit](RPG-Kit/)** *(NEW)* | Agent plug-in / toolkit | Use RPG inside Claude Code or GitHub Copilot for long-horizon planning, multi-file generation, repository navigation, and graph-aware updates. |
+| **[ZeroRepo](#zerorepo-requirements--rpg--repository)** | RPG paper code | Run the forward RPG pipeline: `requirements → RPG → repository`. |
+| **[RPG-Encoder](#rpg-encoder-repository--rpg)** | RPG-Encoder paper code | Run the reverse RPG pipeline: `repository → RPG`. |
+| **[RepoCraft](#repocraft-benchmark)** | Benchmark | Evaluate repository-level planning and code generation. |
 
 ---
 
