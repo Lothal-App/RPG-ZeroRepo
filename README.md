@@ -43,6 +43,13 @@ The repository also includes the research code: **[ZeroRepo](#zerorepo-requireme
 
 ## RPG-Kit
 
+RPG-Kit turns Repository Planning Graphs into a control layer for long-horizon AI coding agents.
+
+> Good planning for coding agents should be grounded, executable, verifiable, and reusable. RPG-Kit makes the plan a graph, not a transient chat artifact.
+
+RPG-Kit gives agents such as Claude Code and GitHub Copilot a persistent RPG workspace for planning, generation, repository understanding, and graph-aware editing.
+
+
 ### Why RPG-Kit?
 
 Coding agents are strong at local edits, but repository-level work requires durable context: requirements, architecture, implementation progress, and dependencies must stay aligned across many steps.
