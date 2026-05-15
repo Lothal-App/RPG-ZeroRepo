@@ -16,27 +16,57 @@ RPG-Kit helps solve this by maintaining a **Repository Planning Graph (RPG)**: a
 
 Use RPG-Kit when you want AI agents to work with repository-level context instead of isolated prompts!
 
-### Why RPG-Kit?
-
-| Common problem with AI coding agents | How RPG-Kit helps |
-|---|---|
-| The agent forgets requirements after a few prompts | Requirements are encoded into the RPG |
-| The agent edits one file without understanding related files | Files, components, and dependencies are connected in the graph |
-| Generated code drifts away from the original plan | Planning artifacts and code are kept aligned |
-| Existing repositories are hard for agents to understand | The codebase can be encoded into an RPG |
-| Targeted edits can break hidden dependencies | Edits are made with graph-aware context |
-
 ### Choose your workflow
 
 | Goal | Workflow | Start here |
 |---|---|---|
 | Create a new project from requirements | Forward workflow | [`Quick Start: New Repository`](#quick-start-new-repository) |
 | Understand or update an existing codebase | Reverse workflow | [`Quick Start: Existing Repository`](#quick-start-existing-repository) |
-| Make a precise repository-aware edit | Surgical edit workflow | [`Quick Start: Existing Repository`](#quick-start-existing-repository) |
+| Make a precise repository-aware edit | Surgical edit workflow | [`Quick Start: New Repository`](#quick-start-new-repository) |
 
 Below is part of the graph visualization generated for this repository. Run `/rpgkit.encode` and open `rpg.html` to explore the full interactive graph.
 
 ![RPG-Kit repository graph visualization](../docs/rpgkit_visualized_graph.png)
+
+### Workflow Details
+
+```text
+Forward Direction: Requirements → RPG → Code
+
+ Phase 1: Feature Specification       Phase 2: RPG Construction & Planning                             Phase 3
+┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+│ feature  │ │ feature  │ │ feature  │ │  build   │ │  build   │ │ design   │ │ design   │ │  plan    │ │          │
+│  _spec   ├─▶  _build  ├─▶_refactor ├─▶ skeleton ├─▶  data    ├─▶  base    ├─▶interfaces├─▶  tasks  ├─▶ code_gen │
+│          │ │          │ │          │ │          │ │  flow    │ │ classes  │ │          │ │          │ │   (TDD)  │
+└──────────┘ └──────────┘ └────┬─────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘ └────┬─────┘
+ feature_     feature_        │        skeleton     data_flow    base_        interfaces   tasks        source
+ spec/        build           │        .json        .json        classes      .json        .json        code
+ feature_     .json           │        skeleton_    data_flow    .json
+ spec.json                    │        summary.txt  _viz.html
+                              │
+                       ┌──────▼──────┐
+                       │ feature_edit│ optional pre-planning edits to feature_tree.json
+                       └─────────────┘
+                                        ╰───── rpg.json (created → progressively enriched) ─────╯
+                                                                            │
+                                                                            ▼
+                                                                     ┌──────────┐
+Surgical edit workflow: Requirements -> RPG update -> Code Update    │ rpg_edit │ optional synchronized RPG + code + dep_graph edits
+                                                                     └──────────┘
+
+Reverse Direction: Code → RPG
+
+┌──────────────────┐         ┌──────────┐       ┌──────────┐
+│ Existing Codebase│────────▶│  encode  │──────▶│update_rpg│
+│                  │         │  (full)  │       │ (manual  │
+└──────────────────┘         └──────────┘       │ fallback)│
+                              rpg.json          └──────────┘
+                              dep_graph.json     rpg.json / dep_graph.json
+                                                  ▲
+                                                  │ post-commit hook normally runs incremental updates
+
+MCP Server: search_rpg / explore_rpg / get_node_detail / list_rpg_tree
+```
 
 ## Installation
 
