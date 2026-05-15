@@ -38,15 +38,24 @@ RPG-ZeroRepo connects repository generation and repository understanding through
 
 ## Which workflow should I use?
 
+ZeroRepo and RPG-Encoder are the standalone research pipelines for constructing RPGs from requirements or code. **RPG-Kit is the agent-facing layer that uses those RPGs to drive planning, generation, navigation, and graph-aware updates inside coding agents.**
+
+### Inside a coding agent — use RPG-Kit
+
 | Scenario | Use | Workflow | Benefit |
 |---|---|---|---|
-| **Understand an existing repository**<br>Start from: codebase | **RPG-Encoder** or **RPG-Kit encode** | `repository → RPG → navigation` | Get a structured map of features, files, code entities, and dependencies. |
-| **Generate a new repository**<br>Start from: requirement | **ZeroRepo** or **RPG-Kit forward workflow** | `requirements → RPG → architecture/tasks → code` | Keep multi-file generation grounded in an explicit plan. |
-| **Update an existing repository**<br>Start from: codebase + change request | **RPG-Encoder + RPG-Kit** | `repository → RPG → affected nodes → code/RPG update` | Plan the change on the graph before editing files. |
-| **Navigate during coding**<br>Start from: existing or generated RPG | **RPG-Kit MCP tools** | `RPG → search/explore/fetch` | Ask where something is implemented, what depends on it, and what context is needed. |
-| **Evaluate repository-level generation**<br>Start from: benchmark tasks or generated repos | **RepoCraft** | `repo/tasks → metrics` | Evaluate planning and generation beyond isolated functions. |
+| **Understand an existing repository**<br>Start from: codebase | RPG-Kit encode | `rpgkit init . --encode` then MCP queries | Get a structured map of features, files, code entities, and dependencies. |
+| **Generate a new repository**<br>Start from: requirement | RPG-Kit forward workflow | `/rpgkit.feature_spec → ... → /rpgkit.code_gen` | Keep multi-file generation grounded in an explicit plan. |
+| **Update an existing repository**<br>Start from: codebase + change request | RPG-Kit surgical edit | `/rpgkit.rpg_edit "..."` on an encoded repo | Plan the change on the graph before editing files. |
+| **Navigate during coding**<br>Start from: existing or generated RPG | RPG-Kit MCP tools | `search_rpg / explore_rpg / get_node_detail` | Ask where something is implemented, what depends on it, and what context is needed. |
 
-ZeroRepo and RPG-Encoder are the standalone research pipelines for constructing RPGs from requirements or code. **RPG-Kit is the agent-facing layer that uses those RPGs to drive planning, generation, navigation, and graph-aware updates inside coding agents.**
+### Standalone — use the research code or benchmark directly
+
+| Scenario | Use | Workflow | Benefit |
+|---|---|---|---|
+| **Generate a new repository from a spec** | ZeroRepo | `python main.py` — `requirements → RPG → code` | Reproduce the RPG paper's forward pipeline without an agent CLI. |
+| **Encode an existing repository** | RPG-Encoder | `python parse_rpg.py` — `repository → RPG` | Reproduce the RPG-Encoder paper's reverse pipeline. |
+| **Evaluate repository-level generation** | RepoCraft | `repo/tasks → metrics` | Evaluate planning and generation beyond isolated functions. |
 
 ## What is each component?
 
