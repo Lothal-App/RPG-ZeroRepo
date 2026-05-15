@@ -21,7 +21,7 @@ The pipeline has three sequential phases:
 
 Below is a snapshot of the graph visualization generated for this repository. Run `/rpgkit.encode` and open `rpg.html` to explore the full interactive graph.
 
-![RPG visualization of RPG-ZeroRepo](docs/rpgkit_visualized_graph.jpg)
+![RPG visualization of RPG-ZeroRepo](docs/rpgkit_visualized_graph.png)
 
 
 ## Table of Contents
