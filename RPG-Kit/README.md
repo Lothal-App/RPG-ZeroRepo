@@ -8,23 +8,32 @@
   <a href="README.hi-IN.md">हिन्दी</a>
 </p>
 
-## Make AI coding agents understand the whole repository
+## Make coding agents plan before they edit
 
-AI coding agents are powerful, but they often work file by file. As a project grows, they can lose track of requirements, architecture, dependencies, and previous design decisions.
+Coding agents are strong at local edits, but repo-level tasks often fail without a stable planning structure. Requirements drift, architecture decisions disappear, multi-file generation becomes inconsistent, and updates can miss hidden dependencies.
 
-RPG-Kit helps solve this by maintaining a **Repository Planning Graph (RPG)**: a structured map that connects requirements, features, files, components, and dependencies.
+RPG-Kit gives Claude Code and GitHub Copilot a **persistent RPG workspace** for repository-level coding. The workspace is built around a Repository Planning Graph (RPG) that connects requirements, features, architecture, files, code entities, and dependencies.
 
-Use RPG-Kit when you want AI agents to work with repository-level context instead of isolated prompts!
+With RPG-Kit, agents work through graph-driven workflows:
+
+- **Build**: turn requirements into an RPG plan, then generate a multi-file repository.
+- **Understand**: map an existing repo into RPG, then search, explore, and explain it.
+- **Update**: locate affected RPG nodes, plan the edit, and update code and graph together.
 
 ### Choose your workflow
 
 | Goal | Workflow | Start here |
 |---|---|---|
-| Create a new project from requirements | Forward workflow | [`Quick Start: New Repository`](#quick-start-new-repository) |
-| Understand or update an existing codebase | Reverse workflow | [`Quick Start: Existing Repository`](#quick-start-existing-repository) |
-| Make a precise repository-aware edit | Surgical edit workflow | [`Quick Start: Existing Repository`](#quick-start-existing-repository) |
+| Build a new repository from requirements | Build workflow (requirements → RPG → code) | [`Quick Start: New Repository`](#quick-start-new-repository) |
+| Understand an existing repository | Understand workflow (repository → RPG → search/explore) | [`Quick Start: Existing Repository`](#quick-start-existing-repository) |
+| Update an existing repository | Update workflow (change request → affected RPG nodes → edit plan → code/RPG update) | [`Quick Start: Existing Repository`](#quick-start-existing-repository) |
 
-### Workflow Details
+### Detailed pipeline
+
+New users can skip this and start from the Quick Start sections below.
+
+<details>
+<summary>Full command-level workflow diagram</summary>
 
 ```text
 Forward Direction: Requirements → RPG → Code
@@ -66,7 +75,11 @@ Reverse Direction: Code → RPG                                           │   
 MCP Server: search_rpg / explore_rpg / get_node_detail / list_rpg_tree
 ```
 
-Below is part of the graph visualization generated for this repository. Run `/rpgkit.encode` and open `rpg.html` to explore the full interactive graph.
+</details>
+
+### RPG-Kit in action
+
+Below is part of the graph visualization generated for this repository. Run `/rpgkit.encode` and open `.rpgkit/data/rpg.html` to explore the full interactive graph.
 
 ![RPG-Kit repository graph visualization](../docs/rpgkit_visualized_graph.png)
 
@@ -170,7 +183,7 @@ Use this path when you already have a repository and want an AI agent to underst
 
 ## What happens after `rpgkit init`
 
-After `rpgkit init`, the workspace keeps unchanged. RPG-Kit adds command definitions, runtime scripts, MCP configuration, and generated graph data alongside your code.
+`rpgkit init` does not modify your source files. It adds command definitions, runtime scripts, MCP configuration, and generated graph data alongside your code.
 
 ```text
 my-project/
@@ -190,7 +203,7 @@ See [docs/project-structure.md](docs/project-structure.md) for the full layout a
 
 | Platform                | Claude Code | GitHub Copilot | Codex |
 | ----------------------- | ----------- | -------------- | ----- |
-| CLI usage               | ✅          | ✅(No MCP)     | ⌛    |
+| CLI usage               | ✅          | ✅ (No MCP)    | ⌛    |
 | VS Code extension usage | ✅          | ✅             | ⌛    |
 
 | Script | Linux | Windows | Mac |
@@ -207,7 +220,7 @@ See [docs/project-structure.md](docs/project-structure.md) for the full layout a
 
 ## Upcoming Features
 
-- **Simpler decoder commands:** merge the current decoder flow into fewer commands, including `/rpgkit.generate_repo` for end-to-end repository generation and `/rpgkit.generate_feature` plus `/rpgkit.plan` for feature generation and RPG planning.
+- **Simpler generation commands:** merge the current multi-step generation flow into fewer commands, such as `/rpgkit.generate_repo`, `/rpgkit.generate_feature`, and `/rpgkit.plan`.
 - **Multi-language support:** add support for Go, C++, Rust, JavaScript/TypeScript, and more.
 - **More platform integrations:** support RPG-Kit across CLI and VS Code extension workflows for different AI coding agents on different systems.
 
