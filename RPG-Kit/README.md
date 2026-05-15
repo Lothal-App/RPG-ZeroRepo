@@ -19,10 +19,10 @@ RPG-Kit leverages LLM-based agents to work bidirectionally with **Repository Pla
 | CLI usage               | ✅          | ✅(No MCP)     | ⌛    |
 | VS Code extension usage | ✅          | ✅             | ⌛    |
 
-| Script | Linux | Windows |
-| ------ | ----- | ------- |
-| sh     | ✅    | ⌛      |
-| ps     | N/A   | ⌛      |
+| Script | Linux | Windows | Mac |
+| ------ | ----- | ------- | --- |
+| sh     | ✅    | ⌛      | ⌛  |
+| ps     | N/A   | ⌛      | ⌛  |
 
 ## Prerequisites
 
