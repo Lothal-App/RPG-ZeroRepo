@@ -48,16 +48,18 @@ Forward Direction: Requirements → RPG → Code
                                                                             ▼
                                                                      ┌──────────┐
 Surgical edit workflow: Requirements -> RPG update -> Code Update    │ rpg_edit │ optional synchronized RPG + code + dep_graph edits
-                                                                     └──────────┘
-
-Reverse Direction: Code → RPG
-
-┌──────────────────┐         ┌──────────┐       ┌──────────┐
-│ Existing Codebase│────────▶│  encode  │──────▶│update_rpg│
-│                  │         │  (full)  │       │ (manual  │
-└──────────────────┘         └──────────┘       │ fallback)│
-                              rpg.json          └──────────┘
-                              dep_graph.json     rpg.json / dep_graph.json
+                                                                     └──▲────▲──┘
+                                                                        │    │
+Reverse Direction: Code → RPG                                           │    │
+                                                                        │    │
+┌──────────────────┐         ┌──────────┐       ┌──────────┐            │    │
+│ Existing Codebase│────────▶│  encode  │──────▶│update_rpg│────────────┘    │
+│                  │         │  (full)  │       │ (manual  │                 │
+└──────────────────┘         └────┬─────┘       │ fallback)│                 │
+                              rpg.json          └──────────┘                 │
+                              dep_graph.json     rpg.json / dep_graph.json   │
+                                  │                                          │
+                                  └──────────────────────────────────────────┘
                                                   ▲
                                                   │ post-commit hook normally runs incremental updates
 
