@@ -8,6 +8,17 @@ RPG-Kit leverages LLM-based agents to work bidirectionally with **Repository Pla
 - **Reverse (Code → RPG):** encodes existing codebases into RPG graphs for AI-assisted search, exploration, and incremental updates
 - **Surgical edits (Instruction → RPG + Code):** applies targeted changes while keeping code, RPG, and dependency graph synchronized
 
+### Upcoming Features
+
+- **Simpler decoder commands:** merge the current decoder flow into fewer commands, including `/rpgkit.generate_repo` for end-to-end repository generation and `/rpgkit.generate_feature` plus `/rpgkit.plan` for feature generation and RPG planning.
+- **Multi-language support:** add support for Go, C++, Rust, JavaScript/TypeScript, and more.
+- **More tool integrations:** support RPG-Kit across CLI and VS Code extension workflows for different AI coding agents.
+
+| Workflow | Claude Code | GitHub Copilot | Codex |
+| --- | --- | --- | --- |
+| CLI usage | ✅ | ✅ | ⌛ |
+| VS Code extension usage | ✅ | ✅ | ⌛ |
+
 ## Prerequisites
 
 - Python 3.12+
