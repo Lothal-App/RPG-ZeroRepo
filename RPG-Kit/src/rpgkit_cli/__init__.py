@@ -551,6 +551,9 @@ _GITIGNORE_RPGKIT_COMMON = """\
 # Runtime workspace (logs, generated data, trajectory)
 .rpgkit/
 
+# RPG-Kit Python environment
+.venv_rpgkit/
+
 # Codegen dev environments
 .venv_dev/
 .rpgkit_dev_env/
@@ -1375,7 +1378,7 @@ def _workspace_has_python_code(project_path: Path) -> bool:
     ``__pycache__``) are pruned too — a ``*.py`` under any of them
     would not indicate user code.
     """
-    PRUNE = {".rpgkit", ".git", ".venv", "venv", "node_modules",
+    PRUNE = {".rpgkit", ".git", ".venv", ".venv_rpgkit", "venv", "node_modules",
              "__pycache__", ".tox", ".mypy_cache", ".pytest_cache",
              ".ruff_cache", "dist", "build"}
     for dirpath, dirnames, filenames in os.walk(project_path):
@@ -2753,6 +2756,116 @@ def download_template_from_github(
     return zip_path, metadata
 
 
+def _resolve_rpgkit_source_root(source: Path) -> Path:
+    source = source.expanduser().resolve()
+    candidates = [source]
+    if (source / "RPG-Kit").is_dir():
+        candidates.insert(0, source / "RPG-Kit")
+
+    for candidate in candidates:
+        if (
+            (candidate / "templates" / "commands").is_dir()
+            and (candidate / "scripts").is_dir()
+            and (candidate / "pyproject.toml").is_file()
+        ):
+            return candidate
+
+    raise RuntimeError(
+        f"Invalid RPG-Kit source path: {source}. Expected the RPG-Kit directory "
+        "or the repository root containing RPG-Kit/."
+    )
+
+
+def _build_local_template_package(
+    source: Path,
+    ai_assistant: str,
+    script_type: str,
+) -> Tuple[Path, dict]:
+    source_root = _resolve_rpgkit_source_root(source)
+    repo_root = source_root.parent
+    project_dir = source_root.relative_to(repo_root).as_posix()
+    scripts_root = repo_root / ".github" / "workflows" / "scripts" / "rpgkit"
+    version = "v0.0.0-local"
+    env = os.environ.copy()
+    env.update(
+        {
+            "GITHUB_WORKSPACE": str(repo_root),
+            "PROJECT_DIR": project_dir,
+            "AGENTS": ai_assistant,
+            "SCRIPTS": script_type,
+            "PYTHON": sys.executable,
+        }
+    )
+
+    if os.name == "nt":
+        release_script = scripts_root / "create-release-packages.ps1"
+        runner = shutil.which("pwsh")
+        command = (
+            [
+                runner,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(release_script),
+                version,
+                "-Agents",
+                ai_assistant,
+                "-Scripts",
+                script_type,
+            ]
+            if runner
+            else None
+        )
+    else:
+        release_script = scripts_root / "create-release-packages.sh"
+        runner = shutil.which("bash")
+        command = [runner, str(release_script), version] if runner else None
+
+    if not release_script.is_file():
+        raise RuntimeError(
+            f"Release packaging script not found: {release_script}. "
+            "Pass the RPG-ZeroRepo root or its RPG-Kit/ directory to --source."
+        )
+    if command is None:
+        requirement = "PowerShell 7 (pwsh)" if os.name == "nt" else "bash"
+        raise RuntimeError(
+            f"Local --source packaging requires {requirement}, but it was not found on PATH."
+        )
+
+    result = subprocess.run(
+        command,
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        detail = (
+            result.stderr or result.stdout or "local package build failed"
+        ).strip()
+        raise RuntimeError(
+            f"Failed to build local RPG-Kit template package from {source_root}: {detail}"
+        )
+
+    archive = (
+        source_root
+        / ".genreleases"
+        / f"rpgkit-template-{ai_assistant}-{script_type}-{version}.zip"
+    )
+    if not archive.is_file():
+        raise RuntimeError(
+            f"Local RPG-Kit template package was not created: {archive}"
+        )
+
+    return archive, {
+        "filename": archive.name,
+        "size": archive.stat().st_size,
+        "release": version,
+        "source": str(source_root),
+    }
+
+
 def download_and_extract_template(
     project_path: Path,
     ai_assistant: str,
@@ -2765,32 +2878,44 @@ def download_and_extract_template(
     debug: bool = False,
     github_token: str = None,
     pre: bool = False,
+    source: Path | None = None,
 ) -> Path:
-    """Download the latest release and extract it to create a new project.
+    """Download or build a template archive and extract it to create a project.
 
     Returns project_path. Uses tracker if provided (with keys: fetch, download, extract, cleanup).
     """
     current_dir = Path.cwd()
+    cleanup_zip = source is None
 
     if tracker:
-        tracker.start("fetch", "contacting GitHub API")
-    try:
-        zip_path, meta = download_template_from_github(
-            ai_assistant,
-            current_dir,
-            script_type=script_type,
-            verbose=verbose and tracker is None,
-            show_progress=(tracker is None),
-            client=client,
-            debug=debug,
-            github_token=github_token,
-            pre=pre,
+        fetch_detail = (
+            "building local template package" if source else "contacting GitHub API"
         )
+        tracker.start("fetch", fetch_detail)
+    try:
+        if source:
+            zip_path, meta = _build_local_template_package(
+                source,
+                ai_assistant,
+                script_type,
+            )
+        else:
+            zip_path, meta = download_template_from_github(
+                ai_assistant,
+                current_dir,
+                script_type=script_type,
+                verbose=verbose and tracker is None,
+                show_progress=(tracker is None),
+                client=client,
+                debug=debug,
+                github_token=github_token,
+                pre=pre,
+            )
         if tracker:
             tracker.complete(
-                "fetch", f"release {meta['release']} ({meta['size']:,} bytes)"
+                "fetch", f"template {meta['release']} ({meta['size']:,} bytes)"
             )
-            tracker.add("download", "Download template")
+            tracker.add("download", "Use template archive" if source else "Download template")
             tracker.complete("download", meta["filename"])
     except Exception as e:
         if tracker:
@@ -2942,12 +3067,14 @@ def download_and_extract_template(
         if tracker:
             tracker.add("cleanup", "Remove temporary archive")
 
-        if zip_path.exists():
+        if cleanup_zip and zip_path.exists():
             zip_path.unlink()
             if tracker:
                 tracker.complete("cleanup")
             elif verbose:
                 console.print(f"Cleaned up: {zip_path.name}")
+        elif tracker:
+            tracker.skip("cleanup", "local package retained")
 
     return project_path
 
@@ -3005,6 +3132,71 @@ def ensure_executable_scripts(
             console.print("[yellow]Some scripts could not be updated:[/yellow]")
             for f in failures:
                 console.print(f"  - {f}")
+
+
+def setup_venv_rpgkit(
+    project_path: Path, tracker: StepTracker | None = None
+) -> None:
+    """Create or update .venv_rpgkit with RPG-Kit Python dependencies."""
+    venv_dir = project_path / ".venv_rpgkit"
+    rpgkit_dir = project_path / ".rpgkit"
+    pyproject = rpgkit_dir / "pyproject.toml"
+
+    if tracker:
+        tracker.start("venv")
+
+    if not pyproject.is_file():
+        msg = ".rpgkit/pyproject.toml not found — cannot install Python dependencies"
+        if tracker:
+            tracker.skip("venv", msg)
+        else:
+            console.print(f"[yellow]Warning:[/yellow] {msg}")
+        return
+
+    try:
+        is_new = not venv_dir.exists()
+
+        if is_new:
+            subprocess.run(
+                ["uv", "venv", str(venv_dir)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        if os.name == "nt":
+            pip_python = venv_dir / "Scripts" / "python.exe"
+        else:
+            pip_python = venv_dir / "bin" / "python3"
+
+        subprocess.run(
+            ["uv", "pip", "install", str(rpgkit_dir), "--python", str(pip_python)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        if tracker:
+            tracker.complete(
+                "venv",
+                "created .venv_rpgkit" if is_new else "updated .venv_rpgkit",
+            )
+    except FileNotFoundError:
+        msg = "uv not found — install uv (https://docs.astral.sh/uv/) to enable auto-setup"
+        if tracker:
+            tracker.skip("venv", msg)
+        console.print(f"[yellow]Warning:[/yellow] {msg}")
+    except subprocess.CalledProcessError as e:
+        detail = e.stderr.strip() if e.stderr else str(e)
+        msg = f"Failed to set up .venv_rpgkit:\n{detail}"
+        if tracker:
+            tracker.error("venv", detail[:120])
+        console.print(f"[red]Error:[/red] {msg}")
+    except Exception as e:
+        msg = f"Failed to set up .venv_rpgkit: {e}"
+        if tracker:
+            tracker.error("venv", str(e)[:120])
+        console.print(f"[red]Error:[/red] {msg}")
 
 
 def ensure_rpgkit_runtime_dirs(
@@ -3125,6 +3317,14 @@ def init(
         False,
         "--pre",
         help="Download the latest pre-release (dev build) instead of the latest stable release",
+    ),
+    source: Optional[Path] = typer.Option(
+        None,
+        "--source",
+        help=(
+            "Use a local RPG-Kit source checkout to build and install the "
+            "template package instead of downloading a release asset."
+        ),
     ),
     no_mcp: bool = typer.Option(
         False,
@@ -3293,6 +3493,12 @@ def init(
 
     console.print(f"[cyan]Selected AI assistant:[/cyan] {selected_ai}")
     console.print(f"[cyan]Selected script type:[/cyan] {selected_script}")
+    if source:
+        console.print(f"[cyan]Template source:[/cyan] {source}")
+        if pre:
+            console.print(
+                "[yellow]Warning:[/yellow] --pre is ignored when --source is provided"
+            )
 
     tracker = StepTracker("Initialize RPG-Kit Project")
 
@@ -3305,8 +3511,15 @@ def init(
     tracker.add("script-select", "Select script type")
     tracker.complete("script-select", selected_script)
     for key, label in [
-        ("fetch", "Fetch latest pre-release" if pre else "Fetch latest release"),
-        ("download", "Download template"),
+        (
+            "fetch",
+            "Build local template package"
+            if source
+            else "Fetch latest pre-release"
+            if pre
+            else "Fetch latest release",
+        ),
+        ("download", "Use local template package" if source else "Download template"),
         ("extract", "Extract template"),
         ("zip-list", "Archive contents"),
         ("extracted-summary", "Extraction summary"),
@@ -3314,6 +3527,7 @@ def init(
         ("gitignore", "Configure .gitignore"),
         ("mcp", "Configure MCP server"),
         ("legacy-cleanup", "Remove obsolete persistent rules"),
+        ("venv", "Set up Python environment"),
         ("cleanup", "Cleanup"),
         ("git", "Initialize git repository"),
         ("hooks", "Install auto-update hooks"),
@@ -3344,6 +3558,7 @@ def init(
                 debug=debug,
                 github_token=github_token,
                 pre=pre,
+                source=source,
             )
 
             ensure_executable_scripts(project_path, tracker=tracker)
@@ -3380,6 +3595,8 @@ def init(
                     tracker.skip("legacy-cleanup", "none")
             except Exception as exc:
                 tracker.error("legacy-cleanup", str(exc))
+
+            setup_venv_rpgkit(project_path, tracker=tracker)
 
             if not no_git:
                 tracker.start("git")
@@ -3496,6 +3713,18 @@ def init(
         )
         step_num += 1
 
+    venv_path = project_path / ".venv_rpgkit"
+    if os.name == "nt":
+        activate_cmd = r".venv_rpgkit\Scripts\activate"
+    else:
+        activate_cmd = "source .venv_rpgkit/bin/activate"
+    steps_lines.append(
+        f"{step_num}. Activate the RPG-Kit Python environment: "
+        f"[cyan]{activate_cmd}[/cyan]"
+    )
+
+    step_num += 1
+
     steps_lines.append(f"{step_num}. Start using slash commands with your AI agent:")
 
     steps_lines.extend([
@@ -3592,6 +3821,14 @@ def update(
         "--pre",
         help="Download the latest pre-release (dev build) instead of the latest stable release",
     ),
+    source: Optional[Path] = typer.Option(
+        None,
+        "--source",
+        help=(
+            "Use a local RPG-Kit source checkout to build and install the "
+            "template package instead of downloading a release asset."
+        ),
+    ),
     no_mcp: bool = typer.Option(
         False,
         "--no-mcp",
@@ -3677,6 +3914,12 @@ def update(
 
     console.print(f"[cyan]Selected AI assistant:[/cyan] {selected_ai}")
     console.print(f"[cyan]Selected script type:[/cyan] {selected_script}")
+    if source:
+        console.print(f"[cyan]Template source:[/cyan] {source}")
+        if pre:
+            console.print(
+                "[yellow]Warning:[/yellow] --pre is ignored when --source is provided"
+            )
 
     # Build step tracker
     tracker = StepTracker("Update RPG-Kit Project")
@@ -3688,8 +3931,15 @@ def update(
     tracker.add("script-select", "Select script type")
     tracker.complete("script-select", selected_script)
     for key, label in [
-        ("fetch", "Fetch latest pre-release" if pre else "Fetch latest release"),
-        ("download", "Download template"),
+        (
+            "fetch",
+            "Build local template package"
+            if source
+            else "Fetch latest pre-release"
+            if pre
+            else "Fetch latest release",
+        ),
+        ("download", "Use local template package" if source else "Download template"),
         ("extract", "Extract template"),
         ("zip-list", "Archive contents"),
         ("extracted-summary", "Extraction summary"),
@@ -3697,6 +3947,7 @@ def update(
         ("gitignore", "Configure .gitignore"),
         ("mcp", "Configure MCP server"),
         ("legacy-cleanup", "Remove obsolete persistent rules"),
+        ("venv", "Set up Python environment"),
         ("hooks", "Install auto-update hooks"),
         ("cleanup", "Cleanup"),
         ("final", "Finalize"),
@@ -3723,6 +3974,7 @@ def update(
                 debug=debug,
                 github_token=github_token,
                 pre=pre,
+                source=source,
             )
 
             ensure_executable_scripts(project_path, tracker=tracker)
@@ -3764,6 +4016,8 @@ def update(
                     tracker.skip("legacy-cleanup", "none")
             except Exception as exc:
                 tracker.error("legacy-cleanup", str(exc))
+
+            setup_venv_rpgkit(project_path, tracker=tracker)
 
             # Re-install hooks so behavior fixes propagate to existing
             # workspaces.  Without this, the .git/hooks/* files stay
@@ -3811,7 +4065,23 @@ def update(
         f"[dim]Updated: scripts, templates, and {AGENT_CONFIG[selected_ai]['name']} "
         f"command definitions in [cyan]{project_path}[/cyan][/dim]"
     )
-
+    console.print()
+    venv_path = Path(project_path) / ".venv_rpgkit"
+    if venv_path.exists():
+        activate_cmd = (
+            r".venv_rpgkit\Scripts\activate"
+            if os.name == "nt"
+            else "source .venv_rpgkit/bin/activate"
+        )
+        console.print(
+            Panel(
+                "Activate the RPG-Kit Python environment before using slash commands:\n\n"
+                f"[cyan]{activate_cmd}[/cyan]",
+                title="[yellow]Environment Setup[/yellow]",
+                border_style="yellow",
+                padding=(1, 2),
+            )
+        )
 
 @app.command()
 def check():
