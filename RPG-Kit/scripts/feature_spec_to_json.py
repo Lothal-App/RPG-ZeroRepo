@@ -8,7 +8,7 @@ This script parses:
 Output: A structured JSON file with all parsed content.
 
 Usage:
-    python .rpgkit/scripts/feature_spec_to_json.py [--input-dir DIR] [--output FILE] [--no-evidence]
+    rpgkit script feature_spec_to_json.py [--input-dir DIR] [--output FILE] [--no-evidence]
 
 Arguments:
     --input-dir    Directory containing feature_spec.md and features/ folder
@@ -24,6 +24,15 @@ import re
 import sys
 from pathlib import Path
 from typing import Optional
+
+# Use the canonical paths from common.paths so the output location
+# matches what downstream stages (feature_build, feature_build_validation,
+# ...) expect.  That resolves to
+# ``~/.rpgkit/workspaces/<workspace-id>/data/feature_spec.json`` rather than the
+# workspace-local ``.rpgkit/data/feature_spec.json`` this script used
+# to compute on its own — a mismatch that previously broke the
+# feature_spec → feature_build handoff.
+from common.paths import FEATURE_SPEC_FILE
 
 
 def parse_evidence_line(line: str) -> Optional[dict]:
@@ -390,12 +399,14 @@ def main():
     if args.output:
         output_file = args.output
     else:
-        # Default output is in parent directory of input_dir
-        output_file = input_dir.parent / "feature_spec.json"
+        # Default to the canonical location from common.paths so
+        # downstream stages (feature_build) can find it.  The output
+        # lives in the home-side data dir.
+        output_file = FEATURE_SPEC_FILE
     
     include_evidence = not args.no_evidence
     
-    print(f"Parsing feature specification from: {input_dir}")
+    print(f"Parsing feature specification from: {input_dir.name}")
     print(f"Include evidence: {include_evidence}")
     
     try:
@@ -406,8 +417,9 @@ def main():
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(spec, f, indent=2, ensure_ascii=False)
         
-        # Print summary
-        print(f"\nOutput written to: {output_file}")
+        # Print summary — use only the file name so stdout stays
+        # workspace-independent; the agent cannot access home-side paths.
+        print(f"\nOutput written to: {output_file.name}")
         print(f"  - Repository: {spec.get('repository_name', 'N/A')}")
         print(f"  - Background items: {len(spec.get('background_and_overview', []))}")
         print(f"  - NFR items: {len(spec.get('non_functional_requirements', []))}")

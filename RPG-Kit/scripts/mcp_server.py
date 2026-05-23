@@ -10,14 +10,16 @@ Tools provided:
 - ``list_rpg_tree``    -- browse RPG feature tree structure
 
 The server communicates over stdio (the standard MCP transport for
-CLI-based servers).  It is designed to be deployed under
-``<workspace>/.rpgkit/scripts/`` by ``rpgkit init`` / ``rpgkit update``,
-and registered automatically in ``.mcp.json`` (Claude) or
-``.vscode/mcp.json`` (VS Code Copilot).
+CLI-based servers).  It ships inside the ``rpgkit-cli`` wheel and is
+launched by MCP clients via the ``rpgkit-mcp`` console script (which
+``.mcp.json`` / ``.vscode/mcp.json`` register as the ``rpg-tools``
+command — see ``rpgkit_cli.entries:mcp_main``).
 
-Run directly::
+Run directly (for debugging)::
 
-    python <workspace>/.rpgkit/scripts/mcp_server.py [--rpg-file PATH]
+    rpgkit-mcp [--rpg-file PATH]
+    # or equivalently:
+    rpgkit script mcp_server.py [--rpg-file PATH]
 """
 
 import json
@@ -73,7 +75,17 @@ def _log_tool_call(tool_name: str, params: dict, result_summary: dict, duration_
 # ---------------------------------------------------------------------------
 
 def _resolve_rpg_path() -> str:
-    """Resolve RPG file path from CLI args or default (.rpgkit/data/rpg.json)."""
+    """Resolve the RPG file path from CLI args, falling back to the default.
+
+    The default (``RPG_FILE``) is provided by
+    :mod:`common.paths`, which resolves to
+    ``~/.rpgkit/workspaces/<workspace-id>/data/rpg.json`` for the current
+    workspace (discovered by walking up from cwd looking for
+    ``.rpgkit/config.toml``).  Callers running ``rpgkit-mcp`` from any
+    subdirectory of a workspace therefore get the right RPG file
+    automatically; ``--rpg-file`` is reserved for explicit overrides
+    (test fixtures, alternative graphs, …).
+    """
     rpg_path = str(RPG_FILE)
     args = sys.argv[1:]
     for i, arg in enumerate(args):
@@ -84,11 +96,13 @@ def _resolve_rpg_path() -> str:
 
 # Standard message returned to the AI agent when the RPG graph isn't ready
 # (e.g. ``rpgkit init`` ran, but the encoder hasn't been run yet so
-# ``.rpgkit/data/rpg.json`` doesn't exist).  Kept short + actionable so
-# the agent will relay it verbatim to the user.
+# the resolved ``rpg.json`` doesn't exist).  Kept short + actionable so
+# the agent will relay it verbatim to the user.  The hint omits the
+# concrete directory path; the actual location is reported as the
+# ``rpg_file`` field of :func:`_unavailable_payload`.
 _ENCODE_HINT = (
     "RPG graph not generated yet. Ask the user to run **`/rpgkit.encode`** "
-    "in this AI agent to build `.rpgkit/data/rpg.json`. Once it finishes, "
+    "in this AI agent to build the workspace's `rpg.json`. Once it finishes, "
     "RPG tools will start working automatically on the next call — no need "
     "to restart the MCP server."
 )
@@ -97,7 +111,7 @@ _ENCODE_HINT = (
 def _unavailable_payload(rpg_path: str, reason: str) -> str:
     """Render a uniform 'graph not available' JSON response for every tool.
 
-    The shape is deliberately identical across all 4 tools so the AI agent
+    The shape is identical across all 4 tools so the AI agent
     can reliably detect the condition (``error == "rpg_unavailable"``)
     and surface the ``next_step`` field to the user.
     """
@@ -179,7 +193,7 @@ def create_mcp_server(rpg_file: str):
             "Program Graph (RPG) for the current workspace \u2014 a "
             "pre-computed, queryable index of the codebase built by "
             "`/rpgkit.encode` and kept in sync with HEAD by a "
-            "pre-commit hook.\n\n"
+            "post-commit hook.\n\n"
             "What the RPG knows about this repository:\n"
             "  \u2022 The feature hierarchy: functional areas \u2192 "
             "feature groups \u2192 individual features, each linked to "
@@ -377,10 +391,18 @@ def create_mcp_server(rpg_file: str):
 
 
 # ---------------------------------------------------------------------------
-# Entry point: python .rpgkit/scripts/mcp_server.py [--rpg-file PATH]
+# Entry point: ``rpgkit-mcp`` console script (via rpgkit_cli.entries:mcp_main)
+# or direct ``python <scripts_dir>/mcp_server.py [--rpg-file PATH]`` for
+# debugging.
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def main() -> None:
+    """Run the MCP server over stdio.
+
+    Used by both the ``rpgkit-mcp`` console-script entry (which sets up
+    ``sys.path`` then imports and calls this function) and the direct
+    ``python mcp_server.py`` invocation under ``__main__``.
+    """
     rpg_path = _resolve_rpg_path()
     # NOTE: do NOT sys.exit when the file is missing.  The MCP transport
     # must stay up so the client can actually receive the
@@ -396,3 +418,7 @@ if __name__ == "__main__":
 
     server = create_mcp_server(rpg_file=rpg_path)
     server.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

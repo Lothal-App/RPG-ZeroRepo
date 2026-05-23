@@ -54,6 +54,8 @@ import platform
 import importlib.metadata
 import tomllib
 
+from . import _storage
+
 ssl_context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 client = httpx.Client(verify=ssl_context)
 
@@ -61,6 +63,23 @@ client = httpx.Client(verify=ssl_context)
 _FALLBACK_REPO_OWNER = "microsoft"
 _FALLBACK_REPO_NAME = "RPG-ZeroRepo"
 _RPGKIT_RELEASE_TAG_PREFIX = "rpgkit-v"
+
+
+# ---------------------------------------------------------------------------
+# DEPRECATED: GitHub release-zip provisioning helpers.
+#
+# As of v0.1.4 ``rpgkit init`` / ``rpgkit update`` are bundle-only and no
+# longer fetch templates from GitHub releases at runtime — users upgrade
+# the CLI itself to pick up newer prompts.  The helpers below
+# (``_parse_github_owner_repo``, ``_github_token``,
+# ``_github_auth_headers``, ``_parse_rate_limit_headers``,
+# ``_format_rate_limit_error``, ``_is_private_repo``,
+# ``_get_asset_download_url``, ``_fetch_latest_rpgkit_release``,
+# ``download_template_from_github``, ``_download_and_extract_release_zip``)
+# are kept temporarily so the change is reversible and so any third-party
+# callers don't break on upgrade.  They are slated for removal in v0.2.0
+# along with the ``httpx`` dependency they bring in.
+# ---------------------------------------------------------------------------
 
 
 def _parse_github_owner_repo(url: str) -> Tuple[str, str] | None:
@@ -298,6 +317,280 @@ SCRIPT_TYPE_CHOICES = {"sh": "POSIX Shell (bash/zsh)", "ps": "PowerShell"}
 
 CLAUDE_LOCAL_PATH = Path.home() / ".claude" / "local" / "claude"
 
+
+# ---------------------------------------------------------------------------
+# Bundle mode (packaged assets) — added in 0.1.3
+# ---------------------------------------------------------------------------
+#
+# rpgkit-cli ships ``scripts/`` and ``templates/commands/`` as packaged
+# assets under ``rpgkit_cli/core_pack/`` so that ``rpgkit init`` works
+# offline.  This block exposes:
+#
+#   _AI_TO_CLI_CMD        — single source of truth for "selected AI" →
+#                           "AI CLI command to invoke from scripts".
+#                           Must stay in sync with the corresponding case
+#                           statement in
+#                           ``.github/workflows/scripts/rpgkit/create-release-packages.sh``
+#                           (the release-zip pipeline) and with
+#                           ``scripts/common/llm_client.py:_CLI_TO_AGENT``
+#                           (the reverse mapping consumed by detect_agent_type()).
+#
+#   _SOURCE_BUNDLE / _SOURCE_LEGACY  — provisioning channel; persisted as
+#                                       ``channel`` in ``~/.rpgkit/workspaces/
+#                                       <workspace-id>/.meta.toml`` so subsequent
+#                                       ``rpgkit update`` calls honour the
+#                                       user's original choice.  Mirrors the
+#                                       constants in :mod:`rpgkit_cli._storage`.
+
+_AI_TO_CLI_CMD = {
+    # NOTE: values below are copied verbatim from
+    # .github/workflows/scripts/rpgkit/create-release-packages.sh lines ~142-169
+    # to guarantee bundle mode and legacy-download mode behave identically.
+    "copilot":      "copilot",
+    "claude":       "claude",
+    "gemini":       "gemini -p",
+    "qwen":         "qwen -p",
+    "cursor-agent": "agent -p",
+    "auggie":       "augment -p",
+    "codex":        "codex exec",
+    "codebuddy":    "codebuddy -p",
+    "qoder":        "qodercli -p",
+    "opencode":     "opencode run",
+    "amp":          "amp --execute",
+}
+
+# Re-exported (under the older names) to minimise churn at call sites;
+# the canonical strings now live in :mod:`rpgkit_cli._storage`.
+_SOURCE_BUNDLE = _storage.CHANNEL_BUNDLE
+_SOURCE_LEGACY = _storage.CHANNEL_LEGACY
+_CONFIG_RELPATH = _storage.WORKSPACE_MARKER_RELPATH
+
+
+def _current_cli_version() -> str:
+    """Return the installed ``rpgkit-cli`` version, or ``"dev"`` on failure.
+
+    Used to stamp ``.meta.toml`` with the version that last touched a
+    given workspace.  Failures (editable install, missing METADATA,
+    namespace package weirdness) are silently swallowed -- the version
+    field is purely informational.
+    """
+    try:
+        return importlib.metadata.version("rpgkit-cli")
+    except importlib.metadata.PackageNotFoundError:
+        return "dev"
+
+
+def _read_source_marker(project_path: Path) -> str | None:
+    """Return the recorded provisioning channel for ``project_path``.
+
+    Reads ``channel`` from ``~/.rpgkit/workspaces/<workspace-id>/.meta.toml``.
+    Returns ``None`` when no meta file exists (fresh workspace) or the
+    channel field is missing.
+    """
+    meta = _storage.read_meta(project_path)
+    if meta is None:
+        return None
+    channel = meta.get("channel")
+    if isinstance(channel, str) and channel:
+        return channel
+    return None
+
+
+def _write_source_marker(project_path: Path, source: str) -> None:
+    """Persist the provisioning channel in the home-side ``.meta.toml``.
+
+    Replaces the legacy ``workspace/.rpgkit/.source`` text file with a
+    structured TOML record under ``~/.rpgkit/workspaces/<workspace-id>/`` that
+    also carries timestamps and the version of rpgkit-cli that last
+    touched the workspace.  See :mod:`rpgkit_cli._storage` for the
+    layout rationale.
+    """
+    _storage.write_meta(
+        project_path,
+        channel=source,
+        rpgkit_cli_version=_current_cli_version(),
+    )
+
+
+def _write_workspace_config(project_path: Path, selected_ai: str) -> None:
+    """Materialise ``.rpgkit/config.toml`` with the selected AI's CLI command.
+
+    Idempotent: if the file already exists and already contains
+    ``ai_cli_cmd``, leave it alone (the user may have customised it).
+    Only writes a fresh file when one is missing.
+    """
+    cfg_path = project_path / _CONFIG_RELPATH
+    cli_cmd = _AI_TO_CLI_CMD.get(selected_ai, selected_ai)
+
+    if cfg_path.exists():
+        # Don't clobber user edits.  We could merge here, but plain
+        # workspaces don't need the complexity and a stale value is a
+        # supported configuration (env var override remains available).
+        return
+
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        "# RPG-Kit workspace configuration\n"
+        "# Managed by `rpgkit init` / `rpgkit update`.  Safe to commit.\n"
+        "# See: https://github.com/microsoft/RPG-ZeroRepo (RPG-Kit/docs/configuration.md)\n"
+        "\n"
+        "[rpgkit]\n"
+        f'ai_cli_cmd = "{cli_cmd}"\n',
+        encoding="utf-8",
+    )
+
+
+def _detect_install_method() -> str:
+    """Best-effort detection of how ``rpgkit-cli`` was installed.
+
+    Returns one of ``"uv"``, ``"pipx"``, ``"pip-user"``, ``"pip-system"``,
+    ``"editable"``, ``"unknown"``.  Used by ``rpgkit update`` to pick the
+    right self-upgrade command.
+    """
+    try:
+        # Do not call ``.resolve()`` here.  The python
+        # interpreter inside a uv tool venv is typically a symlink to
+        # the system python (``/usr/bin/python3.12`` on Linux); resolving
+        # it discards the ``~/.local/share/uv/tools/rpgkit-cli/`` prefix
+        # we depend on for installer detection.  We want the path *as*
+        # the kernel saw it for ``sys.executable``, not the underlying
+        # interpreter binary it points to.
+        exe = Path(sys.executable)
+        exe_str = str(exe)
+    except Exception:
+        return "unknown"
+
+    exe_posix = exe_str.replace("\\", "/")
+
+    # IMPORTANT: editable detection must run FIRST.  An editable install
+    # placed inside a uv-managed venv would otherwise be reported as
+    # "uv" and ``rpgkit update`` would try to upgrade from the
+    # registry instead of leaving the local checkout alone.
+    try:
+        import importlib.metadata as _im
+
+        dist = _im.distribution("rpgkit-cli")
+        durl = dist.read_text("direct_url.json")
+        if durl and '"editable": true' in durl:
+            return "editable"
+    except Exception:
+        pass
+
+    # uv tool install creates venvs under ~/.local/share/uv/tools/<name>/
+    # (or %LOCALAPPDATA%\uv\tools\<name>\ on Windows).
+    if "/uv/tools/" in exe_posix:
+        return "uv"
+    try:
+        # uv writes a receipt file at the venv root one level above bin/.
+        # Newer uv versions use ``uv-receipt.toml``; older releases used
+        # ``uv-receipt.json``.  Check both so the heuristic stays robust
+        # across the version most users have installed at any given time.
+        receipt_parent = exe.parent.parent
+        if (
+            (receipt_parent / "uv-receipt.toml").exists()
+            or (receipt_parent / "uv-receipt.json").exists()
+        ):
+            return "uv"
+    except Exception:
+        pass
+
+    # pipx puts each tool's venv under ~/.local/share/pipx/venvs/<name>/
+    if "/pipx/venvs/" in exe_posix:
+        return "pipx"
+
+    # Plain pip: distinguish user-site vs system-site by path prefix.
+    try:
+        import site
+
+        if site.ENABLE_USER_SITE and exe_str.startswith(site.getuserbase()):
+            return "pip-user"
+    except Exception:
+        pass
+
+    return "pip-system"
+
+
+def _upgrade_command(method: str) -> list[str] | None:
+    """Return the shell command argv that upgrades the installed CLI.
+
+    Returns ``None`` when no automatic command is appropriate (editable
+    install, or unknown installer).
+    """
+    if method == "uv":
+        return ["uv", "tool", "upgrade", "rpgkit-cli"]
+    if method == "pipx":
+        return ["pipx", "upgrade", "rpgkit-cli"]
+    if method == "pip-user":
+        return [sys.executable, "-m", "pip", "install", "-U", "--user", "rpgkit-cli"]
+    if method == "pip-system":
+        return [sys.executable, "-m", "pip", "install", "-U", "rpgkit-cli"]
+    return None
+
+
+def _install_source() -> str:
+    """Identify *where* the installed ``rpgkit-cli`` came from.
+
+    Used by the default-on auto-upgrade flow to skip dev-mode installs
+    (local checkout, editable) that the user is actively iterating on —
+    blindly running ``uv tool upgrade`` on those would either no-op
+    (uv complains it's not a registry release) or, worse, replace the
+    user's local working copy with the registry build.
+
+    Returns:
+        * ``"git"``       — installed from a ``git+https://...`` URL.
+          Safe to auto-upgrade.
+        * ``"pypi"``      — installed from a PyPI release (no
+          ``direct_url.json`` recorded).  Safe to auto-upgrade.
+        * ``"file"``      — installed from a local path
+          (``uv tool install .``).  Skip auto-upgrade — the user is
+          developing.
+        * ``"editable"``  — installed with ``--editable``.  Skip.
+        * ``"unknown"``   — couldn't determine source.  Skip (conservative).
+
+    The detection reads PEP 610's ``direct_url.json`` from the
+    installed distribution's metadata.  We never shell out to ``uv``
+    or ``pip`` for this — the local metadata is the single source of
+    truth and works in offline environments.
+    """
+    try:
+        import importlib.metadata as _im
+        dist = _im.distribution("rpgkit-cli")
+        raw = dist.read_text("direct_url.json")
+    except Exception:
+        return "unknown"
+
+    if raw is None:
+        # No direct_url.json file recorded -> installed from a PyPI
+        # release (PEP 610 mandates this file only for non-registry
+        # installs).
+        return "pypi"
+
+    try:
+        info = json.loads(raw)
+    except Exception:
+        return "unknown"
+
+    # Editable installs always set ``dir_info.editable: true``.
+    dir_info = info.get("dir_info") or {}
+    if isinstance(dir_info, dict) and dir_info.get("editable") is True:
+        return "editable"
+
+    url = info.get("url")
+    if isinstance(url, str):
+        if url.startswith("git+") or info.get("vcs_info"):
+            return "git"
+        if url.startswith("file://"):
+            return "file"
+
+    return "unknown"
+
+
+#: Sources where auto-upgrade is safe to run by default in
+#: ``rpgkit update``.  Matches the values returned by
+#: :func:`_install_source`.
+_AUTO_UPGRADE_SOURCES: frozenset[str] = frozenset({"git", "pypi"})
+
+
 # ── Default .gitignore template ──────────────────────────────────────────
 # Split into three parts so init can compose the right output depending on
 # project state:
@@ -305,12 +598,9 @@ CLAUDE_LOCAL_PATH = Path.home() / ".claude" / "local" / "claude"
 #                         absent (greenfield), so we don't impose Python
 #                         conventions on an existing repo that already has
 #                         its own .gitignore preferences.
-#   * RPGKIT_COMMON    → always injected — these files MUST be ignored
+#   * RPGKIT_COMMON    → always injected; these files must be ignored
 #                         (runtime data, machine-specific config).
-#   * RPGKIT_AI[ai]    → always injected for the selected AI assistant —
-#                         RPG-Kit regenerates slash command files on every
-#                         `rpgkit init/update`, so they are build artifacts,
-#                         not source.
+#   * RPGKIT_AI[ai]    → always injected for the selected AI assistant.
 #
 # The Python template is a verbatim copy of GitHub's official
 # ``github/gitignore/Python.gitignore`` (220-line community baseline).
@@ -550,9 +840,9 @@ _GITIGNORE_RPGKIT_HEADER = "# RPG-Kit ignores (managed by `rpgkit init/update`)"
 _GITIGNORE_RPGKIT_COMMON = """\
 # Runtime workspace (logs, generated data, trajectory)
 .rpgkit/
-
-# RPG-Kit Python environment
-.venv_rpgkit/
+# but DO track the workspace AI config so collaborators see the same
+# default — see docs/configuration.md
+!.rpgkit/config.toml
 
 # Codegen dev environments
 .venv_dev/
@@ -565,10 +855,10 @@ _GITIGNORE_RPGKIT_COMMON = """\
 """
 
 # AI-specific slash-command directories that RPG-Kit regenerates each time
-# `rpgkit init/update` runs. We deliberately scope each entry to a sub-
-# directory rather than the whole agent folder so unrelated assets in
-# ``.github/`` (workflows, CODEOWNERS, …) or ``.claude/`` (settings.json
-# with team-shared permissions) remain trackable.
+# `rpgkit init/update` runs. Each entry covers only a sub-directory of
+# the agent folder so unrelated assets in ``.github/`` (workflows,
+# CODEOWNERS, …) or ``.claude/`` (settings.json with team-shared
+# permissions) remain trackable.
 _GITIGNORE_RPGKIT_AI = {
     "copilot": """\
 # Copilot slash command definitions (regenerated by rpgkit)
@@ -931,19 +1221,19 @@ def is_git_repo(path: Path = None) -> bool:
 def _setup_gitignore(project_path: Path, selected_ai: str) -> None:
     """Materialize ``.gitignore`` with RPG-Kit's required rules.
 
-    This is the **single injection point** for all RPG-Kit gitignore
+    This is the single injection point for all RPG-Kit gitignore
     management.  Other init steps (``_generate_mcp_config``,
-    ``_install_copilot_hooks``) MUST NOT modify ``.gitignore``
-    themselves — all rules they used to inject have been folded into
+    ``_install_copilot_hooks``) must not modify ``.gitignore``
+    themselves; all rules they used to inject have been folded into
     ``_GITIGNORE_RPGKIT_COMMON`` / ``_GITIGNORE_RPGKIT_AI``.
 
-    Behavior (decided by the user via interactive design review):
+    Behavior:
 
     * **Greenfield** — both ``.git/`` and ``.gitignore`` are absent:
       write Python standard template + RPG-Kit common + AI-specific
       rules.  Gives new projects a complete, sensible default.
 
-    * **Existing repo or existing ``.gitignore``** — *do not* overwrite
+    * **Existing repo or existing ``.gitignore``** — do not overwrite
       the user's Python conventions.  Only append RPG-Kit rules
       (deduplicated by exact line match) under a single
       ``# RPG-Kit ignores`` header.
@@ -1212,8 +1502,7 @@ def _cleanup_legacy_codegen_persistent(project_path: Path) -> list[str]:
     Earlier versions of ``rpgkit init`` (pre-C4 cleanup) wrote a
     codegen-specific instructions file that AI agents would auto-load on
     every session, polluting unrelated commands (rpg_edit, encode, plain
-    Q&A) with codegen workflow noise.  See ``plans/20260508-1-rpgkit-
-    optimization*.md`` § C4.
+    Q&A) with codegen workflow noise.
 
     This helper:
 
@@ -1269,37 +1558,26 @@ def _generate_mcp_config(
 ) -> None:
     """Generate MCP server configuration for the selected AI assistant.
 
-    Both Claude and VS Code Copilot launch the MCP server via the current
-    Python interpreter (``sys.executable``) running
-    ``<project>/.rpgkit/scripts/mcp_server.py`` — this guarantees the
-    interpreter that has ``rpgkit-cli``'s dependencies (mcp, rapidfuzz, …)
-    installed is used to host the server.
+    Both Claude and VS Code Copilot launch the MCP server via the
+    ``rpgkit-mcp`` console script installed alongside ``rpgkit-cli``.
+    This keeps the config portable across machines (no absolute paths
+    to a workspace-local copy) and ensures the server always runs
+    against the bundled scripts that match the installed CLI version.
 
     - Claude:  ``.mcp.json``         (key ``mcpServers.rpg-tools``)
     - Copilot: ``.vscode/mcp.json``  (key ``servers.rpg-tools``,
       VS Code 1.102+ standard layout)
 
-    Generated paths are absolute and machine-specific; the corresponding
-    files are ignored via :func:`_setup_gitignore` (called earlier in the
-    init flow), not by this function.
+    The ``rpgkit-mcp`` command must be on ``PATH``.  ``rpgkit init``
+    emits a warning at the end of the run when it isn't, so MCP
+    clients fail with a clear cause rather than the opaque
+    ``Connection closed`` error.
     """
-    # Resolve absolute paths up-front so we never write a stale/relative path.
     project_path = project_path.resolve()
-    server_script = (project_path / ".rpgkit" / "scripts" / "mcp_server.py").resolve()
-
-    if not server_script.is_file():
-        # Should not happen — extraction step runs before us — but bail out
-        # cleanly instead of writing a config that would fail at runtime.
-        msg = f"mcp_server.py not found at {server_script}"
-        if tracker:
-            tracker.error("mcp", msg)
-        else:
-            console.print(f"[yellow]Warning: {msg}[/yellow]")
-        return
 
     mcp_server_config = {
-        "command": sys.executable,
-        "args": [str(server_script)],
+        "command": "rpgkit-mcp",
+        "args": [],
     }
 
     try:
@@ -1315,18 +1593,11 @@ def _generate_mcp_config(
 
         elif selected_ai == "copilot":
             # VS Code Copilot (1.102+): .vscode/mcp.json with top-level "servers".
-            #
-            # We deliberately do NOT write a ``sandbox`` block here.  VS
-            # Code's MCP sandbox requires ``bubblewrap`` (bwrap) and
-            # ``socat`` on PATH; most Linux desktops, WSL, minimal Docker
-            # images and fresh macOS installs lack these, causing the
-            # server to crash on startup with the opaque ``Connection
-            # closed`` error.  The only thing sandbox gained us was
-            # auto-approving tool confirmations — a one-click setting in
-            # VS Code's MCP UI ("Always allow this server") covers the
-            # same UX without the dependency landmine.  RPG-Kit's MCP
-            # server is also read-only and offline, so sandbox added no
-            # security value.
+            # No ``sandbox`` block: VS Code's MCP sandbox requires bwrap +
+            # socat which are absent on most Linux desktops, WSL, minimal
+            # Docker images, and fresh macOS installs, causing the server
+            # to crash with "Connection closed".  Tool auto-approval is
+            # handled by VS Code's "Always allow this server" setting.
             vscode_dir = project_path / ".vscode"
             vscode_dir.mkdir(parents=True, exist_ok=True)
             mcp_file = vscode_dir / "mcp.json"
@@ -1360,6 +1631,175 @@ def _generate_mcp_config(
 
 
 # ---------------------------------------------------------------------------
+# Copilot CLI: global MCP registration
+# ---------------------------------------------------------------------------
+
+_COPILOT_CLI_MCP_CONFIG = Path.home() / ".copilot" / "mcp-config.json"
+
+
+def _register_copilot_cli_global_mcp(tracker=None) -> None:
+    """Register ``rpg-tools`` in ``~/.copilot/mcp-config.json`` (global).
+
+    The GitHub Copilot CLI (``copilot``) — unlike the VS Code Copilot
+    extension — does NOT read workspace-local ``.vscode/mcp.json``.  It
+    only reads the global ``~/.copilot/mcp-config.json`` (or accepts
+    inline JSON via ``--additional-mcp-config``).
+
+    To make ``copilot`` find ``rpg-tools`` automatically in any
+    rpgkit-initialised workspace, we register the server globally on
+    first ``rpgkit init --ai copilot`` (or ``rpgkit update``).
+
+    This is safe because ``rpgkit-mcp`` is cwd-aware (it walks up to
+    find ``rpg.json``) and stateless across workspaces — one global
+    registration serves every workspace the user ``cd``-s into.  In
+    workspaces without ``rpg.json`` the server starts in degraded mode
+    and tool calls return a ``rpg_unavailable`` hint instructing the
+    user to run ``/rpgkit.encode``.
+
+    Safety rules (see audit decisions D-globalmcp-1..4):
+      - **No-op when in-sync.**  If the file already contains exactly
+        the entry we'd write, we don't touch it at all (no mtime bump,
+        no .bak).  This makes ``rpgkit update`` cheap to run repeatedly.
+      - **Refuse to wipe a malformed config.**  If the file exists but
+        isn't valid JSON we abort with a clear error instead of
+        overwriting; the user is expected to fix it (or run with
+        ``--no-copilot-cli-mcp``).  Without this guard a stray comma
+        in the user's config would have us silently drop every
+        non-rpg-tools server.
+      - **Atomic write.**  We serialise to ``mcp-config.json.tmp``
+        first and then ``os.replace()`` into place, so a Ctrl-C or
+        crash mid-write can't leave the file half-written.
+      - **Respect user-customised entries.**  If an existing
+        ``rpg-tools`` entry uses a different ``command`` (the user has
+        intentionally pointed it elsewhere, e.g. to a dev checkout) we
+        leave it alone and ask them to use ``--no-copilot-cli-mcp``.
+      - **One-shot .bak.**  Only created on the first modification we
+        actually perform — never on no-op runs, never overwritten.
+    """
+    config_path = _COPILOT_CLI_MCP_CONFIG
+    bak_path = config_path.with_suffix(".json.bak")
+    tmp_path = config_path.with_suffix(".json.tmp")
+    desired = {
+        "type": "stdio",
+        "command": "rpgkit-mcp",
+        "args": [],
+    }
+
+    def _report_skip(detail: str) -> None:
+        if tracker:
+            tracker.skip("copilot-cli-mcp", detail)
+
+    def _report_error(detail: str) -> None:
+        if tracker:
+            tracker.error("copilot-cli-mcp", detail)
+        else:
+            console.print(
+                f"[yellow]Warning: could not register rpg-tools in "
+                f"{config_path}: {detail}[/yellow]"
+            )
+
+    def _report_done(detail: str) -> None:
+        if tracker:
+            tracker.complete("copilot-cli-mcp", detail)
+
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # ----- Parse existing file (strictly, so we can refuse to
+        # clobber a malformed user config).  An empty/missing file is
+        # fine — we treat that as "start fresh".
+        if config_path.exists():
+            raw = config_path.read_text(encoding="utf-8")
+            if raw.strip() == "":
+                existing: Dict[str, Any] = {}
+            else:
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    _report_error(
+                        f"{config_path} is not valid JSON ({exc.msg} "
+                        f"at line {exc.lineno} col {exc.colno}); refusing to "
+                        f"overwrite. Fix the file or re-run with "
+                        f"--no-copilot-cli-mcp."
+                    )
+                    return
+                if not isinstance(parsed, dict):
+                    _report_error(
+                        f"{config_path} top-level is not a JSON object; "
+                        f"refusing to overwrite. Re-run with "
+                        f"--no-copilot-cli-mcp."
+                    )
+                    return
+                existing = parsed
+        else:
+            existing = {}
+
+        servers = existing.get("mcpServers")
+        if servers is None:
+            existing["mcpServers"] = {}
+            servers = existing["mcpServers"]
+        elif not isinstance(servers, dict):
+            _report_error(
+                f"{config_path}: `mcpServers` is not a JSON object; "
+                f"refusing to overwrite. Re-run with --no-copilot-cli-mcp."
+            )
+            return
+
+        current = servers.get("rpg-tools")
+        # No-op fast path: file already contains exactly what we'd write.
+        if current == desired:
+            _report_skip(f"already up-to-date at {config_path}")
+            return
+
+        # Respect a user-customised entry — only touch entries that
+        # either don't exist or already point at our `rpgkit-mcp`
+        # console script (the latter happens on a version bump where
+        # we'd want to e.g. add new default args).
+        if (
+            isinstance(current, dict)
+            and current.get("command")
+            and current.get("command") != "rpgkit-mcp"
+        ):
+            _report_skip(
+                f"existing entry uses custom command "
+                f"{current.get('command')!r}; leaving alone "
+                f"(use --no-copilot-cli-mcp to silence)"
+            )
+            return
+
+        # We're going to write — back up the original (one-shot).
+        if config_path.exists() and not bak_path.exists():
+            try:
+                shutil.copy2(config_path, bak_path)
+            except OSError:
+                pass  # backup is best-effort
+
+        servers["rpg-tools"] = desired
+
+        # Atomic write: serialise to .tmp then rename.  ``os.replace``
+        # is atomic on POSIX and Windows.
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(existing, f, indent=2)
+                f.write("\n")
+            os.replace(tmp_path, config_path)
+        except Exception:
+            # Clean up a stray .tmp on failure so the next run isn't
+            # confused by a leftover.
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+            raise
+
+        action = "updated" if current is not None else "registered"
+        _report_done(f"{action} at {config_path}")
+    except Exception as exc:
+        _report_error(f"failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Optional initial encode
 # ---------------------------------------------------------------------------
 
@@ -1371,14 +1811,13 @@ def _workspace_has_python_code(project_path: Path) -> bool:
     code) skip the prompt because the encoder would produce an empty
     graph and waste LLM tokens.
 
-    The walk prunes the ``.rpgkit`` directory in-place so we don't
-    accidentally count the runtime scripts we just extracted (every
-    workspace has ``.rpgkit/scripts/*.py`` after init).  Common
-    boilerplate dirs (``.git``, ``.venv``, ``node_modules``,
+    The walk prunes the ``.rpgkit`` directory in-place so workspace
+    runtime state (``data/``, ``logs/``) doesn't influence the detection.
+    Common boilerplate dirs (``.git``, ``.venv``, ``node_modules``,
     ``__pycache__``) are pruned too — a ``*.py`` under any of them
     would not indicate user code.
     """
-    PRUNE = {".rpgkit", ".git", ".venv", ".venv_rpgkit", "venv", "node_modules",
+    PRUNE = {".rpgkit", ".git", ".venv", "venv", "node_modules",
              "__pycache__", ".tox", ".mypy_cache", ".pytest_cache",
              ".ruff_cache", "dist", "build"}
     for dirpath, dirnames, filenames in os.walk(project_path):
@@ -1537,8 +1976,8 @@ def _run_initial_encode(project_path: Path) -> bool:
     of lines of ``RPGParser - INFO - ...``), so instead we:
 
       * Capture stderr in a reader thread and write it verbatim to
-        ``.rpgkit/logs/encode.log`` — power users can ``tail -f`` it
-        for the full firehose.
+        ``~/.rpgkit/workspaces/<workspace-id>/logs/encode.log`` — power users
+        can ``tail -f`` it for the full firehose.
       * Parse a handful of phase markers off each line to drive a
         :class:`rich.progress.Progress` bar with a spinner + current
         phase + (when known) an M/N batch counter.
@@ -1552,13 +1991,27 @@ def _run_initial_encode(project_path: Path) -> bool:
     """
     encoder = project_path / ".rpgkit" / "scripts" / "rpg_encoder" / "run_encode.py"
     if not encoder.is_file():
-        console.print(
-            f"[yellow]Encoder script not found at {encoder}; "
-            f"run [cyan]/rpgkit.encode[/] in your AI agent later.[/yellow]"
-        )
-        return False
+        # Scripts live inside the installed wheel under
+        # ``rpgkit_cli/core_pack/scripts/``.  Resolve the encoder
+        # from there so the optional initial-encode kickoff works after
+        # ``rpgkit init`` — which no longer copies scripts into the
+        # workspace.
+        from . import _assets
+        candidate = _assets.scripts_dir() / "rpg_encoder" / "run_encode.py"
+        if candidate.is_file():
+            encoder = candidate
+        else:
+            console.print(
+                f"[yellow]Encoder script not found at {candidate}; "
+                f"run [cyan]/rpgkit.encode[/] in your AI agent later.[/yellow]"
+            )
+            return False
 
-    log_dir = project_path / ".rpgkit" / "logs"
+    # Keep all generated artefacts (logs/data/inner-git) in the
+    # per-workspace home dir under ~/.rpgkit/workspaces/<workspace-id>/.  The
+    # workspace tree should stay clean — no .rpgkit/logs/ written here.
+    from . import _storage
+    log_dir = _storage.workspace_logs_dir(project_path)
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -1570,8 +2023,8 @@ def _run_initial_encode(project_path: Path) -> bool:
     console.print(
         Panel(
             "[cyan]Running the encoder now…[/]\n\n"
-            "Building [cyan].rpgkit/data/rpg.json[/] from your code via the "
-            "LLM.  Verbose logs stream to [cyan].rpgkit/logs/encode.log[/] — "
+            "Building [cyan]rpg.json[/] from your code via the LLM.  "
+            "Verbose logs stream to [cyan]" + str(log_path) + "[/] — "
             "`tail -f` it in another terminal for the gory details.  "
             "Press Ctrl-C to abort; re-run later with [cyan]/rpgkit.encode[/].",
             title="[bold]Initial encode[/bold]",
@@ -1768,8 +2221,8 @@ def _run_initial_encode(project_path: Path) -> bool:
         console.print(
             Panel(
                 "[green]Encoder finished successfully.[/]\n\n"
-                "The RPG graph is now available at "
-                "[cyan].rpgkit/data/rpg.json[/].  The post-commit hook will "
+                "The RPG graph is now available under your home-dir "
+                "workspace store ([cyan]rpg.json[/]).  The post-commit hook will "
                 "keep it in sync on every commit; the MCP tools "
                 "([cyan]search_rpg[/], [cyan]explore_rpg[/], …) are now usable.",
                 title="[bold green]Encode complete[/bold green]",
@@ -1892,13 +2345,10 @@ def _install_claude_hooks(project_path: Path) -> None:
     if settings_path.exists():
         shutil.copy2(settings_path, settings_dir / "settings.json.bak")
 
-    # Shell form: ``command`` is passed to ``sh -c``. Use shlex.quote so
-    # paths containing spaces or special characters survive shell
-    # tokenisation (json.dumps is JSON-safe but not shell-safe).
-    update_script = shlex.quote(
-        str((project_path / ".rpgkit" / "scripts" / "update_graphs.py").resolve())
-    )
-    python = shlex.quote(sys.executable)
+    # The command is executed by Claude Code via ``sh -c``, so we inline
+    # the same PATH-fallback used by git hooks (see _HOOK_PATH_FALLBACK).
+    # Use ``;`` rather than ``&&`` so the rpgkit call always runs after
+    # the (possibly no-op) PATH adjustment.
     marker = "update_graphs.py"  # used for idempotent dedupe across upgrades
 
     rpg_session_entry = {
@@ -1907,7 +2357,8 @@ def _install_claude_hooks(project_path: Path) -> None:
             {
                 "type": "command",
                 "command": (
-                    f"{python} {update_script} status 2>/dev/null"
+                    f"{_HOOK_PATH_FALLBACK}; "
+                    "rpgkit script update_graphs.py status 2>/dev/null"
                     " || echo '[RPG-Kit] RPG status unavailable'"
                 ),
                 "timeout": 10,
@@ -2141,6 +2592,27 @@ def _strip_hook_block(
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------------------
+# PATH fallback for hook bodies
+# ---------------------------------------------------------------------------
+#
+# Hooks invoke ``rpgkit`` (the globally-installed CLI) rather than a
+# workspace-local script copy.  When the hook is triggered from a GUI
+# editor's source-control panel (VS Code, IntelliJ, GitHub Desktop, ...)
+# the process environment may not include the user's shell PATH, so
+# ``rpgkit`` is unresolvable and the hook silently fails.
+#
+# This snippet is prepended to every hook body.  When ``rpgkit`` is
+# already on PATH (terminal invocations) the test short-circuits and
+# the ``export`` is skipped — zero overhead.  When it isn't, we
+# prepend ``$HOME/.local/bin`` which is ``uv tool install``'s default
+# bin directory.
+_HOOK_PATH_FALLBACK = (
+    'command -v rpgkit >/dev/null 2>&1 || '
+    'export PATH="$HOME/.local/bin:$PATH"'
+)
+
+
 def _install_hook_snippet(
     hooks_dir: Path,
     hook_name: str,
@@ -2197,39 +2669,48 @@ def _install_hook_snippet(
     return True
 
 
-def _install_git_pre_commit_hook(project_path: Path) -> bool:
-    """Install the RPG incremental-sync command into ``pre-commit``.
+def _uninstall_git_pre_commit_hook(project_path: Path) -> bool:
+    """Remove any previously-installed RPG-Kit ``pre-commit`` block.
 
-    Returns ``True`` when the hook is active on disk, ``False`` only
-    when no git checkout was found at all.
+    Pre-commit was retired in favour of ``post-commit`` only: the
+    pre-commit sync ran ``--staged-only`` and was immediately followed
+    by the full post-commit sync, so its output had a ~1 sec lifetime
+    and added latency to every ``git commit`` for no observable benefit.
+    Existing workspaces upgraded via ``rpgkit init`` / ``rpgkit update``
+    have their pre-commit block stripped here; user-authored hook
+    content (and other tools' blocks such as husky / pre-commit /
+    lefthook) is preserved untouched.
 
-    The hook passes ``--staged-only`` so only files the user
-    ``git add``'d contribute to the diff — working-tree-but-not-staged
-    changes are out of scope for the imminent commit.
+    Returns ``True`` when the workspace had a hooks dir to clean,
+    ``False`` only when no git checkout was found at all.
     """
     hooks_dir = _resolve_git_hooks_dir(project_path)
     if hooks_dir is None:
         return False
 
-    python = shlex.quote(sys.executable)
-    update_script = shlex.quote(
-        str((project_path / ".rpgkit" / "scripts" / "update_graphs.py").resolve())
+    hook_path = hooks_dir / "pre-commit"
+    if not hook_path.is_file():
+        return True
+
+    existing = hook_path.read_text(encoding="utf-8")
+    legacy = (
+        ("# RPG-Kit: pre-commit dispatcher", 3),
+        ("# RPG-Kit: full RPG sync on commit", 2),
+        ("# RPG-Kit: incremental RPG sync on commit", 3),
     )
-    marker = "# RPG-Kit: incremental RPG sync on commit"
-    body = (
-        f"{marker}\n"
-        f"{python} {update_script} sync --staged-only 2>/dev/null || true"
-    )
-    # Legacy: pre-Step-3 pre-commit shipped a 2-line snippet under the
-    # marker below.  Removed on upgrade so users don't end up running
-    # both the old full-sync and the new staged-only path.
-    return _install_hook_snippet(
-        hooks_dir,
-        "pre-commit",
-        "pre-commit",
-        body,
-        legacy_blocks=(("# RPG-Kit: full RPG sync on commit", 2),),
-    )
+    cleaned = _strip_hook_block(existing, "pre-commit", legacy).rstrip("\n")
+
+    # If nothing user-authored remains, delete the hook file so git
+    # falls back to its default no-hook behaviour.
+    if not cleaned.strip() or cleaned.strip() == "#!/bin/sh":
+        try:
+            hook_path.unlink()
+        except OSError:
+            pass
+    else:
+        hook_path.write_text(cleaned + "\n", encoding="utf-8")
+        hook_path.chmod(0o755)
+    return True
 
 
 def _install_git_post_merge_hook(project_path: Path) -> bool:
@@ -2248,119 +2729,71 @@ def _install_git_post_merge_hook(project_path: Path) -> bool:
     if hooks_dir is None:
         return False
 
-    python = shlex.quote(sys.executable)
-    update_script = shlex.quote(
-        str((project_path / ".rpgkit" / "scripts" / "update_graphs.py").resolve())
-    )
-    marker = "# RPG-Kit: incremental RPG sync after merge / pull"
+    # Level-1 hook: stub delegates to ``rpgkit hook post-merge``.
+    marker = "# RPG-Kit: post-merge dispatcher"
     body = (
         f"{marker}\n"
-        f"{python} {update_script} sync 2>/dev/null || true"
+        f"{_HOOK_PATH_FALLBACK}\n"
+        f"rpgkit hook post-merge 2>/dev/null || true"
     )
-    # post-merge was introduced with the sentinel-block design already
-    # in mind, so no legacy migration is needed here.
-    return _install_hook_snippet(hooks_dir, "post-merge", "post-merge", body)
+    return _install_hook_snippet(
+        hooks_dir,
+        "post-merge",
+        "post-merge",
+        body,
+        legacy_blocks=(
+            ("# RPG-Kit: incremental RPG sync after merge / pull", 3),
+        ),
+    )
 
 
 def _install_git_post_commit_hook(project_path: Path) -> bool:
-    """Install sync + background RPG update into ``post-commit``.
+    """Install the Level-1 ``post-commit`` dispatcher stub.
 
-    Two phases run after every commit:
+    The on-disk hook is now a 3-line shell snippet that ``exec``s
+    ``rpgkit hook post-commit``.  All orchestration lives in the
+    :func:`hook` Python command:
 
-    1. **Synchronous** (foreground): ``update_graphs.py sync`` advances
-       ``meta.git`` to the new HEAD (~50ms).  The pre-commit hook already
-       updated dep_graph for the staged files, so this is a cheap
-       hash-verify pass.
+    * **Phase 1 (foreground)**: ``update_graphs.py sync`` advances
+      ``meta.git`` to the new HEAD.  Output is teed into
+      ``~/.rpgkit/workspaces/<workspace-id>/logs/hooks.log``.
 
-    2. **Asynchronous** (background): ``update_graphs.py update-rpg``
-       creates a git worktree for ``HEAD~1``, runs the LLM-driven
-       ``RPGEvolution.process_diff`` to update the feature graph, and
-       cleans up the worktree.  Detached via ``nohup ... &`` (POSIX,
-       portable to macOS where ``setsid`` is absent).  Output goes to
-       ``.rpgkit/logs/update_rpg.log``.
+    * **Phase 2 (background)**: ``update_graphs.py update-rpg`` is
+      detached via ``subprocess.Popen(start_new_session=True)``.  A
+      mkdir-based directory lock at
+      ``~/.rpgkit/workspaces/<workspace-id>/logs/.update_rpg.lock`` serialises
+      overlapping commits; locks older than 60 minutes are treated as
+      orphaned and removed.  The worker's stdout/stderr land in
+      ``~/.rpgkit/workspaces/<workspace-id>/logs/update_rpg.log``.
 
-       Concurrency is serialised by a *directory* lock at
-       ``.rpgkit/logs/.update_rpg.lock`` \u2014 ``mkdir`` is the only
-       POSIX-atomic exclusive-create primitive available from shell,
-       so two commits firing in the same second reliably get one and
-       only one worker.  Stale locks left by a SIGKILL'd previous run
-       are auto-recovered after 60 minutes.
+    Both phases are best-effort: every failure path is swallowed inside
+    :func:`hook` so a hook misbehaviour never blocks ``git commit``.
 
-    Both phases are best-effort: failures are swallowed so they never
-    block a commit.
+    Legacy multi-line shell bodies from earlier releases (pre-Level-1)
+    are stripped on upgrade -- the ``legacy_blocks`` tuple below covers
+    every shape we've shipped.
     """
     hooks_dir = _resolve_git_hooks_dir(project_path)
     if hooks_dir is None:
         return False
 
-    python = shlex.quote(sys.executable)
-    update_script = shlex.quote(
-        str((project_path / ".rpgkit" / "scripts" / "update_graphs.py").resolve())
-    )
-    log_file = shlex.quote(
-        str((project_path / ".rpgkit" / "logs" / "update_rpg.log").resolve())
-    )
-    lock_file = shlex.quote(
-        str((project_path / ".rpgkit" / "logs" / ".update_rpg.lock").resolve())
-    )
-    marker = "# RPG-Kit: advance meta.git + background feature graph update"
-    workspace_dir = shlex.quote(str(project_path.resolve()))
+    marker = "# RPG-Kit: post-commit dispatcher"
     body = (
         f"{marker}\n"
-        # Phase 1: synchronous meta.git advance
-        f"{python} {update_script} sync 2>/dev/null || true\n"
-        # Phase 2: background full RPG update.
-        #
-        # Lock semantics (v4):
-        #   The lock is a *directory* created with ``mkdir`` — the only
-        #   POSIX-atomic exclusive-create primitive available from shell.
-        #   Two commits firing within the same second (interactive rebase,
-        #   squash merge) reliably get serialised: exactly one wins the
-        #   ``mkdir`` and spawns the background worker; the other no-ops.
-        #
-        # Lock recovery:
-        #   (a) Pre-v4 installs used a *file* at this path.  ``rm -f``
-        #       removes that file but silently no-ops on a directory
-        #       ("Is a directory" error swallowed), so an active v4 lock
-        #       is preserved.
-        #   (b) Any v4 lock directory older than 60 minutes is assumed
-        #       orphaned (worker SIGKILL'd, OOM, machine rebooted) and
-        #       wiped.  Without this, a single crashed run would silently
-        #       disable all future background updates.
-        #
-        # Detach strategy:
-        #   ``nohup ... &`` is POSIX-portable.  We previously used
-        #   ``setsid`` which is util-linux-only and absent from default
-        #   macOS installs, leaving every macOS commit's phase-2 silently
-        #   dead.
-        #
-        # env -u GIT_INDEX_FILE -u GIT_DIR:
-        #   git sets these during hooks; if they leak into the background
-        #   worker, ``git worktree add`` fails with cryptic index errors.
-        f"rm -f {lock_file} 2>/dev/null\n"
-        f"find {lock_file} -maxdepth 0 -mmin +60 -exec rm -rf {{}} + 2>/dev/null || true\n"
-        f"if mkdir {lock_file} 2>/dev/null; then\n"
-        f"  nohup env -u GIT_INDEX_FILE -u GIT_DIR "
-        f'sh -c "cd {workspace_dir}; sleep 2; '
-        f'{python} {update_script} update-rpg --json >> {log_file} 2>&1; '
-        f'rmdir {lock_file}" </dev/null >/dev/null 2>&1 &\n'
-        f"fi"
+        f"{_HOOK_PATH_FALLBACK}\n"
+        f"rpgkit hook post-commit 2>/dev/null || true"
     )
-    # Legacy shapes that may exist in users' .git/hooks/post-commit from
-    # earlier releases.  Both are stripped before the new sentinel block
-    # is written so the upgrade is a true replace, not an append.
-    #   v1 (pre-Step-3 polish): 2-line sync-only snippet.
-    #   v3 (release 0576393):   5-line snippet with the same first-line
-    #                           marker we use today plus phase-1 sync,
-    #                           phase-2 setsid background, and the
-    #                           wrapping ``if/fi`` lock check.
     return _install_hook_snippet(
         hooks_dir,
         "post-commit",
         "post-commit",
         body,
         legacy_blocks=(
+            # v1 (pre-Step-3): two-line sync-only snippet.
             ("# RPG-Kit: advance meta.git after commit", 2),
+            # v3 (release 0576393): five-line snippet with phase-1 sync
+            # + phase-2 setsid background under the same marker we used
+            # before Level-1.
             ("# RPG-Kit: advance meta.git + background feature graph update", 5),
         ),
     )
@@ -2393,15 +2826,15 @@ def _install_copilot_hooks(project_path: Path) -> None:
             # Backup is best-effort; never block installation on it.
             pass
 
-    update_script = str(
-        (project_path / ".rpgkit" / "scripts" / "update_graphs.py").resolve()
-    )
-
     rpg_status_task = {
         "label": "RPG-Kit: load status",
         "type": "shell",
-        "command": sys.executable,
-        "args": [update_script, "status"],
+        # Invoke the globally-installed CLI rather than a workspace
+        # script copy (which no longer exists).  Same
+        # rationale as the git-hook bodies: portable command name,
+        # auto-tracks the installed wheel's scripts.
+        "command": "rpgkit",
+        "args": ["script", "update_graphs.py", "status"],
         "presentation": {
             "echo": False,
             "reveal": "silent",
@@ -2452,12 +2885,13 @@ def _install_hooks(
       ``.vscode/tasks.json`` that runs the same status command on
       workspace open — VS Code's closest analogue to a SessionStart
       hook for GitHub Copilot.
-    - All:     appends an RPG incremental sync (``update_graphs.py sync``)
-      to ``.git/hooks/pre-commit`` AND ``.git/hooks/post-merge``.
-      The pre-commit hook uses ``--staged-only`` so it sees only what's
-      about to be committed; the post-merge hook (fired after
-      ``git pull`` / ``git merge``) considers the whole working tree
-      so teammate-incoming changes get picked up immediately.
+    - All:     installs an RPG sync trigger on ``.git/hooks/post-commit``
+      (fired after every successful commit) AND ``.git/hooks/post-merge``
+      (fired after ``git pull`` / ``git merge`` so teammate-incoming
+      changes get picked up immediately). Any legacy ``pre-commit``
+      block from earlier releases is stripped on upgrade — the design
+      now relies on post-commit only, so commit latency stays low and
+      the inner-git history is cleaner.
       Complements the MCP server already registered in
       ``.mcp.json`` / ``.vscode/mcp.json``.
     """
@@ -2470,8 +2904,8 @@ def _install_hooks(
             _install_copilot_hooks(project_path)
             installed.append("copilot")
 
-        if _install_git_pre_commit_hook(project_path):
-            installed.append("git:pre-commit")
+        # Strip any leftover pre-commit block from older installs.
+        _uninstall_git_pre_commit_hook(project_path)
         if _install_git_post_commit_hook(project_path):
             installed.append("git:post-commit")
         if _install_git_post_merge_hook(project_path):
@@ -2756,117 +3190,180 @@ def download_template_from_github(
     return zip_path, metadata
 
 
-def _resolve_rpgkit_source_root(source: Path) -> Path:
-    source = source.expanduser().resolve()
-    candidates = [source]
-    if (source / "RPG-Kit").is_dir():
-        candidates.insert(0, source / "RPG-Kit")
-
-    for candidate in candidates:
-        if (
-            (candidate / "templates" / "commands").is_dir()
-            and (candidate / "scripts").is_dir()
-            and (candidate / "pyproject.toml").is_file()
-        ):
-            return candidate
-
-    raise RuntimeError(
-        f"Invalid RPG-Kit source path: {source}. Expected the RPG-Kit directory "
-        "or the repository root containing RPG-Kit/."
-    )
-
-
-def _build_local_template_package(
-    source: Path,
+def download_and_extract_template(
+    project_path: Path,
     ai_assistant: str,
     script_type: str,
-) -> Tuple[Path, dict]:
-    source_root = _resolve_rpgkit_source_root(source)
-    repo_root = source_root.parent
-    project_dir = source_root.relative_to(repo_root).as_posix()
-    scripts_root = repo_root / ".github" / "workflows" / "scripts" / "rpgkit"
-    version = "v0.0.0-local"
-    env = os.environ.copy()
-    env.update(
-        {
-            "GITHUB_WORKSPACE": str(repo_root),
-            "PROJECT_DIR": project_dir,
-            "AGENTS": ai_assistant,
-            "SCRIPTS": script_type,
-            "PYTHON": sys.executable,
-        }
+    is_current_dir: bool = False,
+    *,
+    verbose: bool = True,
+    tracker: StepTracker | None = None,
+    client: httpx.Client = None,
+    debug: bool = False,
+    # DEPRECATED params (kept for source-compat; CLI no longer passes
+    # them as of v0.1.4 and they are slated for removal in v0.2.0).
+    github_token: str = None,
+    pre: bool = False,
+    legacy_download: bool = False,
+) -> Path:
+    """Provision the workspace with scripts + command templates.
+
+    Bundle-only as of v0.1.4: templates are always sourced from the
+    packaged assets shipped inside ``rpgkit_cli/core_pack/``.  To pick
+    up newer prompts the user upgrades the CLI itself (``uv tool
+    upgrade rpgkit-cli`` etc.), which ``rpgkit update`` does
+    automatically by default.
+
+    The ``github_token`` / ``pre`` / ``legacy_download`` parameters and
+    the underlying ``_download_and_extract_release_zip`` path are kept
+    for now as dead code so the change is reversible, but they are no
+    longer reachable from the CLI surface.
+
+    Returns ``project_path``.  Uses the supplied :class:`StepTracker`
+    to report progress when provided.
+    """
+    return _install_from_bundle(
+        project_path,
+        ai_assistant,
+        script_type,
+        is_current_dir,
+        verbose=verbose,
+        tracker=tracker,
     )
 
-    if os.name == "nt":
-        release_script = scripts_root / "create-release-packages.ps1"
-        runner = shutil.which("pwsh")
-        command = (
-            [
-                runner,
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(release_script),
-                version,
-                "-Agents",
-                ai_assistant,
-                "-Scripts",
-                script_type,
-            ]
-            if runner
-            else None
+
+def _install_from_bundle(
+    project_path: Path,
+    ai_assistant: str,
+    script_type: str,
+    is_current_dir: bool,
+    *,
+    verbose: bool = True,
+    tracker: StepTracker | None = None,
+) -> Path:
+    """Materialise per-AI command templates into the workspace.
+
+    The pipeline scripts themselves live inside the installed wheel at
+    ``rpgkit_cli/core_pack/scripts/`` and are invoked via ``rpgkit
+    script <name>`` (and ``rpgkit-mcp`` for the MCP server) — they are
+    NOT copied to ``<workspace>/.rpgkit/scripts/`` anymore.  This gives
+    one source of truth per CLI install, no
+    risk of workspace/wheel drift, and no per-workspace scripts dir
+    to keep in sync.
+
+    Only slash-command templates land in the workspace, plus the
+    provisioning marker that records which channel was used.
+    """
+    from . import _assets
+
+    if tracker:
+        # init()/update() already registered fetch/download/extract step keys,
+        # so just transition them through completed states instead of
+        # re-adding (which would overwrite the existing label).
+        tracker.start("fetch", "packaged assets (offline)")
+        tracker.complete("fetch", "bundle ready")
+        tracker.skip("download", "bundle mode (no network)")
+
+    if not is_current_dir:
+        project_path.mkdir(parents=True)
+
+    if tracker:
+        tracker.start("extract")
+
+    try:
+        rpgkit_root = project_path / ".rpgkit"
+        rpgkit_root.mkdir(parents=True, exist_ok=True)
+
+        # 1. Materialise slash-command templates into the AI-specific
+        #    directory.  _materialise_commands_for_agent owns the
+        #    per-agent file-name / folder rules.
+        _materialise_commands_for_agent(
+            ai_assistant, _assets.commands_dir(), project_path
         )
+
+        # 2. Record the provisioning source so subsequent ``rpgkit update``
+        #    invocations default to the same channel.
+        _write_source_marker(project_path, _SOURCE_BUNDLE)
+
+        if tracker:
+            tracker.skip("zip-list", "bundle (no archive)")
+            tracker.skip("extracted-summary", "templates only")
+            tracker.complete("extract")
+            tracker.skip("cleanup", "bundle mode")
+    except Exception as e:
+        if tracker:
+            tracker.error("extract", str(e))
+        else:
+            console.print(f"[red]Error installing from bundle:[/red] {e}")
+        raise
+
+    return project_path
+
+
+def _materialise_commands_for_agent(
+    ai_assistant: str,
+    src_commands_dir: Path,
+    project_path: Path,
+) -> None:
+    """Place command templates into the agent-specific workspace location.
+
+    This intentionally mirrors what the legacy release-zip path produces
+    (see ``.github/workflows/scripts/rpgkit/create-release-packages.sh``
+    ``generate_commands`` / ``generate_copilot_prompts``), so that
+    downstream consumers see the same layout regardless of provisioning
+    source.
+
+    Layout produced:
+      claude  → ``.claude/commands/rpgkit.<name>.md``
+      copilot → ``.github/agents/rpgkit.<name>.agent.md``
+                ``.github/prompts/rpgkit.<name>.prompt.md`` (frontmatter
+                points at the corresponding agent)
+      others  → fallback: ``.rpgkit/commands/rpgkit.<name>.md`` (same
+                ``rpgkit.<name>.md`` prefix for consistency with the
+                supported agents above)
+
+    NOTE: ``claude`` and ``copilot`` are the only verified agents in
+    AGENT_CONFIG today.  Add new agents here when AGENT_CONFIG grows.
+    """
+    def _read_body(src: Path) -> str:
+        # Normalise CRLF → LF, matching what the CI's ``tr -d '\r'`` does.
+        return src.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+
+    if ai_assistant == "claude":
+        dest = project_path / ".claude" / "commands"
+        dest.mkdir(parents=True, exist_ok=True)
+        for src in src_commands_dir.glob("*.md"):
+            target = dest / f"rpgkit.{src.stem}.md"
+            target.write_text(_read_body(src), encoding="utf-8")
+    elif ai_assistant == "copilot":
+        agents = project_path / ".github" / "agents"
+        prompts = project_path / ".github" / "prompts"
+        agents.mkdir(parents=True, exist_ok=True)
+        prompts.mkdir(parents=True, exist_ok=True)
+        for src in src_commands_dir.glob("*.md"):
+            stem = f"rpgkit.{src.stem}"
+            body = _read_body(src)
+            (agents / f"{stem}.agent.md").write_text(body, encoding="utf-8")
+            # Copilot prompt files reference the agent by name in
+            # frontmatter; the body is empty so the agent prompt
+            # (already written above) is the source of truth.
+            (prompts / f"{stem}.prompt.md").write_text(
+                f"---\nagent: {stem}\n---\n", encoding="utf-8"
+            )
     else:
-        release_script = scripts_root / "create-release-packages.sh"
-        runner = shutil.which("bash")
-        command = [runner, str(release_script), version] if runner else None
-
-    if not release_script.is_file():
-        raise RuntimeError(
-            f"Release packaging script not found: {release_script}. "
-            "Pass the RPG-ZeroRepo root or its RPG-Kit/ directory to --source."
-        )
-    if command is None:
-        requirement = "PowerShell 7 (pwsh)" if os.name == "nt" else "bash"
-        raise RuntimeError(
-            f"Local --source packaging requires {requirement}, but it was not found on PATH."
-        )
-
-    result = subprocess.run(
-        command,
-        cwd=repo_root,
-        env=env,
-        text=True,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        detail = (
-            result.stderr or result.stdout or "local package build failed"
-        ).strip()
-        raise RuntimeError(
-            f"Failed to build local RPG-Kit template package from {source_root}: {detail}"
-        )
-
-    archive = (
-        source_root
-        / ".genreleases"
-        / f"rpgkit-template-{ai_assistant}-{script_type}-{version}.zip"
-    )
-    if not archive.is_file():
-        raise RuntimeError(
-            f"Local RPG-Kit template package was not created: {archive}"
-        )
-
-    return archive, {
-        "filename": archive.name,
-        "size": archive.stat().st_size,
-        "release": version,
-        "source": str(source_root),
-    }
+        # Unknown agent (init() validates against AGENT_CONFIG so this
+        # branch is unreachable from the public CLI, but provides a
+        # well-defined behaviour if a future caller bypasses validation).
+        dest = project_path / ".rpgkit" / "commands"
+        dest.mkdir(parents=True, exist_ok=True)
+        for src in src_commands_dir.glob("*.md"):
+            (dest / f"rpgkit.{src.stem}.md").write_text(_read_body(src), encoding="utf-8")
 
 
-def download_and_extract_template(
+# DEPRECATED: legacy release-zip provisioning path — no longer reachable
+# from the CLI as of v0.1.4 (see top-of-file DEPRECATED block).  Slated for
+# removal in v0.2.0.
+def _download_and_extract_release_zip(
     project_path: Path,
     ai_assistant: str,
     script_type: str,
@@ -2878,44 +3375,34 @@ def download_and_extract_template(
     debug: bool = False,
     github_token: str = None,
     pre: bool = False,
-    source: Path | None = None,
 ) -> Path:
-    """Download or build a template archive and extract it to create a project.
+    """Release-zip download + extract path.
 
-    Returns project_path. Uses tracker if provided (with keys: fetch, download, extract, cleanup).
+    Kept available for users that need the very latest prompts before the
+    next CLI release, or to bypass packaging glitches.  Activated via
+    ``rpgkit init --legacy-download``.
     """
     current_dir = Path.cwd()
-    cleanup_zip = source is None
 
     if tracker:
-        fetch_detail = (
-            "building local template package" if source else "contacting GitHub API"
-        )
-        tracker.start("fetch", fetch_detail)
+        tracker.start("fetch", "contacting GitHub API")
     try:
-        if source:
-            zip_path, meta = _build_local_template_package(
-                source,
-                ai_assistant,
-                script_type,
-            )
-        else:
-            zip_path, meta = download_template_from_github(
-                ai_assistant,
-                current_dir,
-                script_type=script_type,
-                verbose=verbose and tracker is None,
-                show_progress=(tracker is None),
-                client=client,
-                debug=debug,
-                github_token=github_token,
-                pre=pre,
-            )
+        zip_path, meta = download_template_from_github(
+            ai_assistant,
+            current_dir,
+            script_type=script_type,
+            verbose=verbose and tracker is None,
+            show_progress=(tracker is None),
+            client=client,
+            debug=debug,
+            github_token=github_token,
+            pre=pre,
+        )
         if tracker:
             tracker.complete(
-                "fetch", f"template {meta['release']} ({meta['size']:,} bytes)"
+                "fetch", f"release {meta['release']} ({meta['size']:,} bytes)"
             )
-            tracker.add("download", "Use template archive" if source else "Download template")
+            tracker.add("download", "Download template")
             tracker.complete("download", meta["filename"])
     except Exception as e:
         if tracker:
@@ -3067,178 +3554,104 @@ def download_and_extract_template(
         if tracker:
             tracker.add("cleanup", "Remove temporary archive")
 
-        if cleanup_zip and zip_path.exists():
+        if zip_path.exists():
             zip_path.unlink()
             if tracker:
                 tracker.complete("cleanup")
             elif verbose:
                 console.print(f"Cleaned up: {zip_path.name}")
-        elif tracker:
-            tracker.skip("cleanup", "local package retained")
+
+    # Record provisioning source so a later ``rpgkit update`` defaults
+    # to the same channel.  Counterpart to ``_install_from_bundle`` which
+    # writes ``bundle``.
+    _write_source_marker(project_path, _SOURCE_LEGACY)
+
+    # Discard the scripts copy extracted from the zip — they're not
+    # used at runtime anymore (the workspace invokes ``rpgkit script
+    # <name>`` which resolves to the packaged scripts dir).  Keeping
+    # them would just be dead weight that drifts vs the installed CLI.
+    # Legacy zip contributes commands only.
+    legacy_scripts_dir = project_path / ".rpgkit" / "scripts"
+    if legacy_scripts_dir.is_dir():
+        shutil.rmtree(legacy_scripts_dir, ignore_errors=True)
 
     return project_path
-
-
-def ensure_executable_scripts(
-    project_path: Path, tracker: StepTracker | None = None
-) -> None:
-    """Ensure POSIX .sh scripts under .rpgkit/scripts (recursively) have execute bits (no-op on Windows)."""
-    if os.name == "nt":
-        return  # Windows: skip silently
-    scripts_root = project_path / ".rpgkit" / "scripts"
-    if not scripts_root.is_dir():
-        return
-    failures: list[str] = []
-    updated = 0
-    for script in scripts_root.rglob("*.sh"):
-        try:
-            if script.is_symlink() or not script.is_file():
-                continue
-            try:
-                with script.open("rb") as f:
-                    if f.read(2) != b"#!":
-                        continue
-            except Exception:
-                continue
-            st = script.stat()
-            mode = st.st_mode
-            if mode & 0o111:
-                continue
-            new_mode = mode
-            if mode & 0o400:
-                new_mode |= 0o100
-            if mode & 0o040:
-                new_mode |= 0o010
-            if mode & 0o004:
-                new_mode |= 0o001
-            if not (new_mode & 0o100):
-                new_mode |= 0o100
-            os.chmod(script, new_mode)
-            updated += 1
-        except Exception as e:
-            failures.append(f"{script.relative_to(scripts_root)}: {e}")
-    if tracker:
-        detail = f"{updated} updated" + (
-            f", {len(failures)} failed" if failures else ""
-        )
-        tracker.add("chmod", "Set script permissions recursively")
-        (tracker.error if failures else tracker.complete)("chmod", detail)
-    else:
-        if updated:
-            console.print(
-                f"[cyan]Updated execute permissions on {updated} script(s) recursively[/cyan]"
-            )
-        if failures:
-            console.print("[yellow]Some scripts could not be updated:[/yellow]")
-            for f in failures:
-                console.print(f"  - {f}")
-
-
-def setup_venv_rpgkit(
-    project_path: Path, tracker: StepTracker | None = None
-) -> None:
-    """Create or update .venv_rpgkit with RPG-Kit Python dependencies."""
-    venv_dir = project_path / ".venv_rpgkit"
-    rpgkit_dir = project_path / ".rpgkit"
-    pyproject = rpgkit_dir / "pyproject.toml"
-
-    if tracker:
-        tracker.start("venv")
-
-    if not pyproject.is_file():
-        msg = ".rpgkit/pyproject.toml not found — cannot install Python dependencies"
-        if tracker:
-            tracker.skip("venv", msg)
-        else:
-            console.print(f"[yellow]Warning:[/yellow] {msg}")
-        return
-
-    try:
-        is_new = not venv_dir.exists()
-
-        if is_new:
-            subprocess.run(
-                ["uv", "venv", str(venv_dir)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-
-        if os.name == "nt":
-            pip_python = venv_dir / "Scripts" / "python.exe"
-        else:
-            pip_python = venv_dir / "bin" / "python3"
-
-        subprocess.run(
-            ["uv", "pip", "install", str(rpgkit_dir), "--python", str(pip_python)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
-        if tracker:
-            tracker.complete(
-                "venv",
-                "created .venv_rpgkit" if is_new else "updated .venv_rpgkit",
-            )
-    except FileNotFoundError:
-        msg = "uv not found — install uv (https://docs.astral.sh/uv/) to enable auto-setup"
-        if tracker:
-            tracker.skip("venv", msg)
-        console.print(f"[yellow]Warning:[/yellow] {msg}")
-    except subprocess.CalledProcessError as e:
-        detail = e.stderr.strip() if e.stderr else str(e)
-        msg = f"Failed to set up .venv_rpgkit:\n{detail}"
-        if tracker:
-            tracker.error("venv", detail[:120])
-        console.print(f"[red]Error:[/red] {msg}")
-    except Exception as e:
-        msg = f"Failed to set up .venv_rpgkit: {e}"
-        if tracker:
-            tracker.error("venv", str(e)[:120])
-        console.print(f"[red]Error:[/red] {msg}")
 
 
 def ensure_rpgkit_runtime_dirs(
     project_path: Path, tracker: StepTracker | None = None
 ) -> None:
-    """Pre-create RPG-Kit runtime directories under ``.rpgkit/``.
+    """Pre-create RPG-Kit runtime directories under ``~/.rpgkit/``.
 
-    Some early-pipeline prompts redirect stdout/stderr to
-    ``.rpgkit/logs/<stage>.log`` via shell ``>``, which fails with
-    "No such file or directory" if the parent directory does not yet exist.
-    The first script that calls ``setup_file_logging`` would normally
-    auto-create ``.rpgkit/logs/``, but that only helps stages that use
-    the Python logging helper — shell-redirected stages fail BEFORE the
-    Python process even starts.
+    The per-workspace data, logs, and inner-git snapshot repo live
+    under the user's home directory at ``~/.rpgkit/workspaces/<workspace-id>/``
+    rather than inside the workspace.  Reports stay in the workspace
+    (``<workspace>/.rpgkit/reports/``) because they're user-facing
+    artefacts.
 
-    Creating the runtime directories upfront (during ``rpgkit init`` /
-    ``rpgkit update``) makes all stage prompts robust without each one
-    having to ``mkdir -p`` defensively.
+    This function is the central bootstrap for the home layout: it's
+    idempotent and safe to call from both ``rpgkit init`` (when the
+    channel was just chosen) and ``rpgkit update`` (when the channel
+    is read from the existing meta file).  Some early-pipeline prompts
+    redirect stdout/stderr to ``<logs>/<stage>.log`` via shell ``>``
+    before any Python code runs, so we must create the directories
+    upfront rather than lazily.
 
     Created (idempotent):
-        - ``.rpgkit/logs/``        — per-stage log files
-        - ``.rpgkit/data/``        — encoder / pipeline JSON artifacts
-        - ``.rpgkit/data/trajectory/`` — execution trajectories
+        - ``~/.rpgkit/workspaces/<workspace-id>/data/``
+        - ``~/.rpgkit/workspaces/<workspace-id>/data/trajectory/``
+        - ``~/.rpgkit/workspaces/<workspace-id>/logs/``
+        - ``<workspace>/.rpgkit/reports/``
+        - ``~/.rpgkit/workspaces/<workspace-id>/.meta.toml`` (refreshed)
+
+    The inner ``.git/`` directory is NOT created here; that's
+    the responsibility of :mod:`rpgkit_cli._inner_git`, which seeds an
+    initial commit with a meaningful message.
     """
-    subdirs = ("logs", "data", "data/trajectory")
-    created: list[str] = []
-    for sub in subdirs:
-        path = project_path / ".rpgkit" / sub
-        existed = path.exists()
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            if not existed:
-                created.append(sub)
-        except OSError:
-            # Filesystem read-only / permission issue — non-blocking.
-            continue
-    if tracker:
-        tracker.add("runtime-dirs", "Ensure .rpgkit/{logs,data} directories")
-        detail = (
-            f"created {', '.join(created)}" if created else "all already present"
+    # Resolve channel: prefer what's already recorded, fall back to
+    # bundle.  The caller (init) will explicitly call
+    # ``_write_source_marker`` afterwards to lock in the final value,
+    # so this lookup is just a sensible default for the first run.
+    existing_channel = _read_source_marker(project_path)
+    channel = existing_channel or _storage.CHANNEL_BUNDLE
+
+    try:
+        home_dir = _storage.ensure_workspace_storage(
+            project_path,
+            channel=channel,
+            rpgkit_cli_version=_current_cli_version(),
         )
-        tracker.complete("runtime-dirs", detail)
+    except _storage.WorkspaceMetaMismatch as exc:
+        # Hash collision or manual rename.  Surface clearly: silently
+        # writing into the wrong workspace would corrupt the other
+        # one's data.
+        if tracker:
+            tracker.add("runtime-dirs", "Ensure ~/.rpgkit/{logs,data} directories")
+            tracker.error("runtime-dirs", str(exc))
+        else:
+            console.print(f"[red]error:[/red] {exc}")
+        raise
+    except OSError as exc:
+        # Filesystem read-only / permission issue — non-blocking.
+        if tracker:
+            tracker.add("runtime-dirs", "Ensure ~/.rpgkit/{logs,data} directories")
+            tracker.error("runtime-dirs", f"could not create: {exc}")
+        return
+
+    # data/trajectory is a script-specific subdir; create explicitly
+    # so the encoder's early stages can write into it without their
+    # own ``mkdir -p`` dance.
+    try:
+        (home_dir / "data" / "trajectory").mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    if tracker:
+        tracker.add("runtime-dirs", "Ensure ~/.rpgkit/{logs,data} directories")
+        tracker.complete(
+            "runtime-dirs",
+            f"home dir at {home_dir}",
+        )
 
 
 def _detect_ai_agent(project_path: Path) -> str | None:
@@ -3300,36 +3713,27 @@ def init(
         "--force",
         help="Force merge/overwrite when using --here (skip confirmation)",
     ),
-    skip_tls: bool = typer.Option(
-        False, "--skip-tls", help="Skip SSL/TLS verification (not recommended)"
-    ),
     debug: bool = typer.Option(
         False,
         "--debug",
-        help="Show verbose diagnostic output for network and extraction failures",
-    ),
-    github_token: str = typer.Option(
-        None,
-        "--github-token",
-        help="GitHub token to use for API requests (or set GH_TOKEN or GITHUB_TOKEN environment variable)",
-    ),
-    pre: bool = typer.Option(
-        False,
-        "--pre",
-        help="Download the latest pre-release (dev build) instead of the latest stable release",
-    ),
-    source: Optional[Path] = typer.Option(
-        None,
-        "--source",
-        help=(
-            "Use a local RPG-Kit source checkout to build and install the "
-            "template package instead of downloading a release asset."
-        ),
+        help="Show verbose diagnostic output",
     ),
     no_mcp: bool = typer.Option(
         False,
         "--no-mcp",
         help="Skip MCP server registration (rpg-tools won't be exposed to the AI agent)",
+    ),
+    no_copilot_cli_mcp: bool = typer.Option(
+        False,
+        "--no-copilot-cli-mcp",
+        help=(
+            "When --ai copilot is selected, skip also registering "
+            "rpg-tools globally in ~/.copilot/mcp-config.json.  The "
+            "Copilot CLI does not read workspace .vscode/mcp.json, so "
+            "this global registration is what makes `copilot` find "
+            "rpg-tools.  Pass this flag if you manage your Copilot CLI "
+            "MCP config by hand."
+        ),
     ),
     encode: Optional[bool] = typer.Option(
         None,
@@ -3341,14 +3745,26 @@ def init(
             "prompt and run, or --no-encode to skip the prompt and not run."
         ),
     ),
+    no_rpgkit_git: bool = typer.Option(
+        False,
+        "--no-rpgkit-git",
+        help=(
+            "Skip initialising a private git repository inside .rpgkit/. "
+            "Default is ON: rpgkit init seeds .rpgkit/.git "
+            "so every subsequent `rpgkit script` invocation auto-snapshots "
+            "the workspace state, letting you `git log` / `git diff` "
+            "between pipeline stages without extra tooling.  This flag "
+            "disables the feature for the current init only."
+        ),
+    ),
 ):
     """Initialize a new RPG-Kit project from the latest template.
 
     This command will:
     1. Check that required tools are installed (git is optional)
     2. Let you choose your AI assistant
-    3. Download the appropriate template from GitHub
-    4. Extract the template to a new project directory or current directory
+    3. Install command templates from the packaged bundle
+    4. Place them into a new project directory or current directory
     5. Initialize a fresh git repository (if not --no-git and no existing repo)
     6. Optionally set up AI assistant commands
 
@@ -3478,9 +3894,20 @@ def init(
                 f"[red]Error:[/red] Invalid script type '{script_type}'. Choose from: {', '.join(SCRIPT_TYPE_CHOICES.keys())}"
             )
             raise typer.Exit(1)
+        # PowerShell support is planned but not yet wired into the
+        # bundled templates / pipeline scripts.  Reject explicit
+        # --script ps with a friendly message so users aren't surprised
+        # by missing files later.
+        if script_type == "ps":
+            console.print(
+                "[yellow]PowerShell (--script ps) is not yet supported and will "
+                "be added in a future release. Please use --script sh for now.[/yellow]"
+            )
+            raise typer.Exit(1)
         selected_script = script_type
     else:
-        default_script = "ps" if os.name == "nt" else "sh"
+        # Default to sh on every platform until PowerShell templates land.
+        default_script = "sh"
 
         if sys.stdin.isatty():
             selected_script = select_with_arrows(
@@ -3493,12 +3920,6 @@ def init(
 
     console.print(f"[cyan]Selected AI assistant:[/cyan] {selected_ai}")
     console.print(f"[cyan]Selected script type:[/cyan] {selected_script}")
-    if source:
-        console.print(f"[cyan]Template source:[/cyan] {source}")
-        if pre:
-            console.print(
-                "[yellow]Warning:[/yellow] --pre is ignored when --source is provided"
-            )
 
     tracker = StepTracker("Initialize RPG-Kit Project")
 
@@ -3511,23 +3932,16 @@ def init(
     tracker.add("script-select", "Select script type")
     tracker.complete("script-select", selected_script)
     for key, label in [
-        (
-            "fetch",
-            "Build local template package"
-            if source
-            else "Fetch latest pre-release"
-            if pre
-            else "Fetch latest release",
-        ),
-        ("download", "Use local template package" if source else "Download template"),
+        ("fetch", "Install bundled templates"),
+        ("download", "Download template"),
         ("extract", "Extract template"),
         ("zip-list", "Archive contents"),
         ("extracted-summary", "Extraction summary"),
         ("chmod", "Ensure scripts executable"),
         ("gitignore", "Configure .gitignore"),
         ("mcp", "Configure MCP server"),
+        ("copilot-cli-mcp", "Register rpg-tools in ~/.copilot/mcp-config.json"),
         ("legacy-cleanup", "Remove obsolete persistent rules"),
-        ("venv", "Set up Python environment"),
         ("cleanup", "Cleanup"),
         ("git", "Initialize git repository"),
         ("hooks", "Install auto-update hooks"),
@@ -3543,10 +3957,6 @@ def init(
     ) as live:
         tracker.attach_refresh(lambda: live.update(tracker.render()))
         try:
-            verify = not skip_tls
-            local_ssl_context = ssl_context if verify else False
-            local_client = httpx.Client(verify=local_ssl_context)
-
             download_and_extract_template(
                 project_path,
                 selected_ai,
@@ -3554,14 +3964,16 @@ def init(
                 here,
                 verbose=False,
                 tracker=tracker,
-                client=local_client,
                 debug=debug,
-                github_token=github_token,
-                pre=pre,
-                source=source,
             )
 
-            ensure_executable_scripts(project_path, tracker=tracker)
+            # .rpgkit/.source is written by whichever provisioning path
+            # actually ran (_install_from_bundle / _download_and_extract_release_zip).
+
+            # Materialise .rpgkit/config.toml with the resolved AI CLI
+            # command.  llm_client.py reads this at runtime to invoke
+            # the right sub-agent.
+            _write_workspace_config(project_path, selected_ai)
 
             # Materialize .gitignore *before* MCP/hook generation so the
             # files those steps create (.vscode/mcp.json, .vscode/tasks.json,
@@ -3581,6 +3993,19 @@ def init(
             else:
                 _generate_mcp_config(project_path, selected_ai, tracker=tracker)
 
+            # Global registration for Copilot CLI (which doesn't read
+            # workspace .vscode/mcp.json).  Skipped for non-copilot AIs,
+            # when --no-mcp is set, or when the user opts out explicitly.
+            if no_mcp:
+                pass
+            elif selected_ai != "copilot":
+                tracker.skip("copilot-cli-mcp", f"ai={selected_ai}")
+            elif no_copilot_cli_mcp:
+                tracker.skip("copilot-cli-mcp", "--no-copilot-cli-mcp flag")
+            else:
+                tracker.start("copilot-cli-mcp")
+                _register_copilot_cli_global_mcp(tracker=tracker)
+
             # Migrate workspaces created before C4: drop the auto-loaded
             # rpgkit-codegen.* persistent-instruction files.
             tracker.start("legacy-cleanup")
@@ -3595,8 +4020,6 @@ def init(
                     tracker.skip("legacy-cleanup", "none")
             except Exception as exc:
                 tracker.error("legacy-cleanup", str(exc))
-
-            setup_venv_rpgkit(project_path, tracker=tracker)
 
             if not no_git:
                 tracker.start("git")
@@ -3651,6 +4074,39 @@ def init(
     console.print(tracker.render())
     console.print("\n[bold green]Project ready.[/bold green]")
 
+    # PATH self-check: hooks and MCP rely on ``rpgkit`` / ``rpgkit-mcp``
+    # being resolvable.  If they aren't on PATH, the user will hit
+    # opaque failures from git hooks and MCP clients later — surface
+    # the actionable hint now.
+    import shutil as _shutil
+    if _shutil.which("rpgkit-mcp") is None or _shutil.which("rpgkit") is None:
+        reinstall_cmd: Optional[list[str]] = _upgrade_command(_detect_install_method())
+        # ``--force`` reinstalls in place which fixes most PATH issues
+        # caused by partial installs / corrupted shim links.
+        if reinstall_cmd and reinstall_cmd[:3] == ["uv", "tool", "upgrade"]:
+            reinstall_hint = "uv tool install rpgkit-cli --force"
+        elif reinstall_cmd and reinstall_cmd[:2] == ["pipx", "upgrade"]:
+            reinstall_hint = "pipx install rpgkit-cli --force"
+        elif reinstall_cmd:
+            reinstall_hint = " ".join(reinstall_cmd)
+        else:
+            reinstall_hint = "uv tool install rpgkit-cli --force  # or your installer's equivalent"
+        console.print()
+        path_panel = Panel(
+            "[yellow]Warning:[/yellow] [cyan]rpgkit[/cyan] / [cyan]rpgkit-mcp[/cyan] "
+            "not found on PATH.\n\n"
+            "Git hooks and the MCP server invoke these commands; they will "
+            "fail until PATH is fixed.\n\n"
+            "[bold]Fix:[/bold]\n"
+            "  - Linux/macOS: add [cyan]~/.local/bin[/cyan] to PATH in your shell rc\n"
+            "  - Windows:     add [cyan]%USERPROFILE%\\.local\\bin[/cyan] to PATH\n"
+            f"  - Or reinstall: [cyan]{reinstall_hint}[/cyan]",
+            title="[red]PATH check[/red]",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+        console.print(path_panel)
+
     # Show git error details if initialization failed
     if git_error_message:
         console.print()
@@ -3686,7 +4142,7 @@ def init(
         console.print(security_notice)
 
     # Pre-create runtime directories so early pipeline prompts that redirect
-    # to .rpgkit/logs/<stage>.log don't fail with "No such file or directory".
+    # to ~/.rpgkit/workspaces/<workspace-id>/logs/<stage>.log don't fail with "No such file or directory".
     ensure_rpgkit_runtime_dirs(project_path)
 
     steps_lines = []
@@ -3713,18 +4169,6 @@ def init(
         )
         step_num += 1
 
-    venv_path = project_path / ".venv_rpgkit"
-    if os.name == "nt":
-        activate_cmd = r".venv_rpgkit\Scripts\activate"
-    else:
-        activate_cmd = "source .venv_rpgkit/bin/activate"
-    steps_lines.append(
-        f"{step_num}. Activate the RPG-Kit Python environment: "
-        f"[cyan]{activate_cmd}[/cyan]"
-    )
-
-    step_num += 1
-
     steps_lines.append(f"{step_num}. Start using slash commands with your AI agent:")
 
     steps_lines.extend([
@@ -3745,8 +4189,9 @@ def init(
 
     step_num += 1
     steps_lines.append(
-        f"{step_num}. You can inspect each step's output under [cyan].rpgkit/data/[/cyan], "
-        f"and review detailed execution trajectories in [cyan].rpgkit/data/trajectory/[/cyan]."
+        f"{step_num}. You can inspect each step's output under [cyan]~/.rpgkit/workspaces/<workspace-id>/data/[/cyan], "
+        f"and review detailed execution trajectories under [cyan]~/.rpgkit/workspaces/<workspace-id>/data/trajectory/[/cyan]. "
+        f"Run [cyan]rpgkit version[/cyan] from inside the workspace to see the resolved Data / Logs / Inner-git paths."
     )
 
     step_num += 1
@@ -3760,9 +4205,9 @@ def init(
     # the requirement loud-and-clear here so users don't hit the silent
     # "rpg_unavailable" payload on their first /rpgkit.* call.
     steps_lines.append(
-        f"   [yellow]Note:[/] the MCP tools query [cyan].rpgkit/data/rpg.json[/], which is "
-        f"created by the encoder. For existing codebases, run [cyan]/rpgkit.encode[/] "
-        f"once now to populate it; the post-commit hook keeps it in sync afterwards."
+        "   [yellow]Note:[/] the MCP tools query [cyan]rpg.json[/] in the workspace's home-dir "
+        "store, which is created by the encoder. For existing codebases, run [cyan]/rpgkit.encode[/] "
+        "once now to populate it; the post-commit hook keeps it in sync afterwards."
     )
 
     steps_panel = Panel(
@@ -3787,6 +4232,31 @@ def init(
         console.print()
         console.print(permissions_hint)
 
+    # Initialise the private snapshot repo inside .rpgkit/.  Done BEFORE
+    # the optional initial encode so the encoder's output, if it runs,
+    # becomes a fresh commit on top of the [init] baseline — a useful
+    # diff target.
+    if not no_rpgkit_git:
+        from . import _inner_git
+        from importlib.metadata import version as _pkg_version, PackageNotFoundError
+        try:
+            ver = _pkg_version("rpgkit-cli")
+        except PackageNotFoundError:
+            ver = "dev"
+        channel = "bundle"
+        script_label = script_type if script_type else "sh"
+        ai_label = selected_ai if selected_ai else "?"
+        if _inner_git.ensure_inner_git(
+            project_path,
+            initial_msg=f"[init] v{ver} \u2014 {ai_label}/{script_label}, {channel} channel",
+        ):
+            console.print(
+                "[dim]Inner snapshot repo initialised at "
+                "[cyan]~/.rpgkit/workspaces/<workspace-id>/.git[/cyan] \u2014 "
+                "run [cyan]rpgkit version[/cyan] for the exact path "
+                "and a ready-to-paste `git -C` invocation.[/dim]"
+            )
+
     # Final step: optionally build the initial RPG by running the
     # encoder.  Skipped silently for empty workspaces / non-tty / when
     # the user passes --no-encode.
@@ -3803,36 +4273,47 @@ def update(
     script_type: str = typer.Option(
         None, "--script", help="Script type to use: sh or ps"
     ),
-    skip_tls: bool = typer.Option(
-        False, "--skip-tls", help="Skip SSL/TLS verification (not recommended)"
-    ),
     debug: bool = typer.Option(
         False,
         "--debug",
-        help="Show verbose diagnostic output for network and extraction failures",
-    ),
-    github_token: str = typer.Option(
-        None,
-        "--github-token",
-        help="GitHub token to use for API requests (or set GH_TOKEN or GITHUB_TOKEN environment variable)",
-    ),
-    pre: bool = typer.Option(
-        False,
-        "--pre",
-        help="Download the latest pre-release (dev build) instead of the latest stable release",
-    ),
-    source: Optional[Path] = typer.Option(
-        None,
-        "--source",
-        help=(
-            "Use a local RPG-Kit source checkout to build and install the "
-            "template package instead of downloading a release asset."
-        ),
+        help="Show verbose diagnostic output",
     ),
     no_mcp: bool = typer.Option(
         False,
         "--no-mcp",
         help="Skip MCP server registration (rpg-tools won't be exposed to the AI agent)",
+    ),
+    no_copilot_cli_mcp: bool = typer.Option(
+        False,
+        "--no-copilot-cli-mcp",
+        help=(
+            "When --ai copilot is selected, skip also registering "
+            "rpg-tools globally in ~/.copilot/mcp-config.json.  The "
+            "Copilot CLI does not read workspace .vscode/mcp.json, so "
+            "this global registration is what makes `copilot` find "
+            "rpg-tools.  Pass this flag if you manage your Copilot CLI "
+            "MCP config by hand."
+        ),
+    ),
+    no_upgrade: bool = typer.Option(
+        False,
+        "--no-upgrade",
+        help=(
+            "Skip the default-on CLI self-upgrade step.  Use when offline, "
+            "on a version-pinned CI runner, or when you've just "
+            "installed the CLI manually."
+        ),
+    ),
+    no_rpgkit_git: bool = typer.Option(
+        False,
+        "--no-rpgkit-git",
+        help=(
+            "Skip backfilling the private snapshot repo at .rpgkit/.git "
+            "for older workspaces that don't have one yet.  Default is ON: "
+            "if the inner repo is missing, `rpgkit update` creates it and "
+            "commits a catch-up snapshot.  Pre-existing inner repos are "
+            "never touched."
+        ),
     ),
 ):
     """Update RPG-Kit template files in an existing project to the latest version.
@@ -3847,8 +4328,7 @@ def update(
     Examples:
         rpgkit update
         rpgkit update --ai claude
-        rpgkit update --pre
-        rpgkit update --github-token $GITHUB_TOKEN
+        rpgkit update --no-upgrade
     """
     show_banner()
 
@@ -3900,9 +4380,20 @@ def update(
                 f"Choose from: {', '.join(SCRIPT_TYPE_CHOICES.keys())}"
             )
             raise typer.Exit(1)
+        # PowerShell support is planned but not yet wired into the
+        # bundled templates / pipeline scripts.  Reject explicit
+        # --script ps with a friendly message so users aren't surprised
+        # by missing files later.
+        if script_type == "ps":
+            console.print(
+                "[yellow]PowerShell (--script ps) is not yet supported and will "
+                "be added in a future release. Please use --script sh for now.[/yellow]"
+            )
+            raise typer.Exit(1)
         selected_script = script_type
     else:
-        default_script = "ps" if os.name == "nt" else "sh"
+        # Default to sh on every platform until PowerShell templates land.
+        default_script = "sh"
         if sys.stdin.isatty():
             selected_script = select_with_arrows(
                 SCRIPT_TYPE_CHOICES,
@@ -3914,12 +4405,123 @@ def update(
 
     console.print(f"[cyan]Selected AI assistant:[/cyan] {selected_ai}")
     console.print(f"[cyan]Selected script type:[/cyan] {selected_script}")
-    if source:
-        console.print(f"[cyan]Template source:[/cyan] {source}")
-        if pre:
+
+    # Pre-update CLI upgrade -------------------------------------------------
+    #
+    # By default, ``rpgkit update`` first runs the appropriate upgrade
+    # command (``uv tool upgrade rpgkit-cli`` for uv installs etc.) so
+    # the workspace's prompts/scripts/templates always match the
+    # *latest* released version of the CLI.  Without this, users who
+    # never re-install the CLI would silently drift behind upstream.
+    #
+    # We auto-upgrade only when:
+    #   * the install method has a known upgrade command (uv, pipx, pip…)
+    #     AND
+    #   * the install source is remote (git URL or PyPI), meaning the
+    #     user isn't actively developing the CLI from a local checkout.
+    #
+    # ``--no-upgrade`` skips this step (offline / pinned CI / freshly
+    # re-installed manually).
+    #
+    # After a successful upgrade we ``os.execvp`` the (now-upgraded)
+    # rpgkit binary so the rest of update runs against the freshly
+    # installed code + assets.  Mixing old in-memory logic with new
+    # on-disk core_pack/ used to cause logic vs assets drift bugs.
+    #
+    # Loop guard: ``RPGKIT_UPGRADE_DONE`` is set on the re-exec'd
+    # process's environment.  When present, this block skips the
+    # upgrade attempt unconditionally so an idempotent ``uv tool
+    # upgrade`` (which returns 0 even when there's nothing to upgrade)
+    # doesn't loop forever.
+    _UPGRADE_DONE_ENV = "RPGKIT_UPGRADE_DONE"
+    already_upgraded = bool(os.environ.get(_UPGRADE_DONE_ENV))
+
+    method = _detect_install_method()
+    source = _install_source()
+    cmd = _upgrade_command(method)
+
+    if already_upgraded:
+        do_upgrade = False
+        skip_reason = ""  # silent — internal marker, not user-visible
+    elif no_upgrade:
+        do_upgrade = False
+        skip_reason = "--no-upgrade"
+    elif cmd is None:
+        do_upgrade = False
+        skip_reason = (
+            f"install method '{method}' has no auto-upgrade path "
+            f"(upgrade manually)"
+        )
+    elif source not in _AUTO_UPGRADE_SOURCES:
+        do_upgrade = False
+        skip_reason = (
+            f"local/dev install (source={source!r}); skipping auto-upgrade."
+        )
+    else:
+        do_upgrade = True
+        skip_reason = ""
+
+    if do_upgrade:
+        console.print(
+            f"[cyan]Upgrading rpgkit-cli via {method} (source={source})...[/cyan]"
+        )
+        try:
+            rc = subprocess.call(cmd)  # type: ignore[arg-type]
+        except FileNotFoundError:
+            # Upgrade tool (uv, pipx, pip) not on PATH — surface, then
+            # carry on with the current build.  Stripping the upgrade
+            # is a worse user experience than failing fast here would
+            # be, but ``rpgkit update`` is "make my workspace match the
+            # installed CLI", and the installed CLI is still functional.
             console.print(
-                "[yellow]Warning:[/yellow] --pre is ignored when --source is provided"
+                f"[yellow]Upgrade tool {cmd[0]!r} not found on PATH; "
+                f"continuing with currently installed version.[/yellow]"
             )
+            rc = -1
+        except Exception as exc:  # noqa: BLE001
+            console.print(
+                f"[yellow]CLI upgrade raised an unexpected error "
+                f"({type(exc).__name__}: {exc}); continuing with "
+                f"currently installed version.[/yellow]"
+            )
+            rc = -1
+
+        if rc == 0:
+            # Re-exec the upgraded binary so the rest of update runs
+            # against the freshly-installed code + assets.  Set the
+            # loop-guard env var so the re-exec'd process doesn't
+            # immediately try to upgrade again.
+            new_argv = list(sys.argv)
+            rpgkit_bin = shutil.which("rpgkit") or new_argv[0]
+            console.print(
+                "[cyan]CLI upgrade complete; re-exec'ing to apply "
+                "new templates...[/cyan]"
+            )
+            try:
+                os.environ[_UPGRADE_DONE_ENV] = "1"
+                os.execvp(rpgkit_bin, [rpgkit_bin, *new_argv[1:]])
+            except OSError as exc:
+                # execvp failed — fall back to running the update
+                # in-process with the (now-on-disk) new code.  This
+                # mixes old in-memory logic with new assets, but
+                # that's strictly better than crashing here: the user
+                # already paid for the upgrade and wants the result.
+                console.print(
+                    f"[yellow]re-exec failed ({exc}); proceeding with "
+                    f"in-process update.[/yellow]"
+                )
+                os.environ.pop(_UPGRADE_DONE_ENV, None)
+        elif rc != -1:
+            console.print(
+                f"[yellow]CLI upgrade exited with code {rc}; "
+                f"continuing with currently installed version.[/yellow]"
+            )
+    elif skip_reason:
+        # Surface the reason only when the user explicitly opted out;
+        # the default-on skip paths (editable, no upgrade cmd) stay
+        # quiet for the 99% case where nothing to do.
+        if skip_reason == "--no-upgrade":
+            console.print(f"[dim]update: skipping CLI upgrade ({skip_reason}).[/dim]")
 
     # Build step tracker
     tracker = StepTracker("Update RPG-Kit Project")
@@ -3931,23 +4533,16 @@ def update(
     tracker.add("script-select", "Select script type")
     tracker.complete("script-select", selected_script)
     for key, label in [
-        (
-            "fetch",
-            "Build local template package"
-            if source
-            else "Fetch latest pre-release"
-            if pre
-            else "Fetch latest release",
-        ),
-        ("download", "Use local template package" if source else "Download template"),
+        ("fetch", "Install bundled templates"),
+        ("download", "Download template"),
         ("extract", "Extract template"),
         ("zip-list", "Archive contents"),
         ("extracted-summary", "Extraction summary"),
         ("chmod", "Ensure scripts executable"),
         ("gitignore", "Configure .gitignore"),
         ("mcp", "Configure MCP server"),
+        ("copilot-cli-mcp", "Register rpg-tools in ~/.copilot/mcp-config.json"),
         ("legacy-cleanup", "Remove obsolete persistent rules"),
-        ("venv", "Set up Python environment"),
         ("hooks", "Install auto-update hooks"),
         ("cleanup", "Cleanup"),
         ("final", "Finalize"),
@@ -3959,10 +4554,6 @@ def update(
     ) as live:
         tracker.attach_refresh(lambda: live.update(tracker.render()))
         try:
-            verify = not skip_tls
-            local_ssl_context = ssl_context if verify else False
-            local_client = httpx.Client(verify=local_ssl_context)
-
             download_and_extract_template(
                 project_path,
                 selected_ai,
@@ -3970,17 +4561,18 @@ def update(
                 True,  # is_current_dir — always merge/overwrite for update
                 verbose=False,
                 tracker=tracker,
-                client=local_client,
                 debug=debug,
-                github_token=github_token,
-                pre=pre,
-                source=source,
             )
 
-            ensure_executable_scripts(project_path, tracker=tracker)
+            # .rpgkit/.source is written by whichever provisioning path
+            # actually ran (_install_from_bundle / _download_and_extract_release_zip).
+
+            # Refresh .rpgkit/config.toml only when missing (preserves
+            # user customisations on re-update).
+            _write_workspace_config(project_path, selected_ai)
 
             # Pre-create runtime directories so stage prompts that redirect
-            # to .rpgkit/logs/<stage>.log don't fail when the folder is
+            # to ~/.rpgkit/workspaces/<workspace-id>/logs/<stage>.log don't fail when the folder is
             # missing (e.g. user removed it, or workspace was created by an
             # older rpgkit init that didn't pre-create logs/).
             ensure_rpgkit_runtime_dirs(project_path, tracker=tracker)
@@ -4002,6 +4594,17 @@ def update(
             else:
                 _generate_mcp_config(project_path, selected_ai, tracker=tracker)
 
+            # Global registration for Copilot CLI (see init for rationale).
+            if no_mcp:
+                pass
+            elif selected_ai != "copilot":
+                tracker.skip("copilot-cli-mcp", f"ai={selected_ai}")
+            elif no_copilot_cli_mcp:
+                tracker.skip("copilot-cli-mcp", "--no-copilot-cli-mcp flag")
+            else:
+                tracker.start("copilot-cli-mcp")
+                _register_copilot_cli_global_mcp(tracker=tracker)
+
             # Migrate workspaces created before C4: drop the auto-loaded
             # rpgkit-codegen.* persistent-instruction files.
             tracker.start("legacy-cleanup")
@@ -4016,8 +4619,6 @@ def update(
                     tracker.skip("legacy-cleanup", "none")
             except Exception as exc:
                 tracker.error("legacy-cleanup", str(exc))
-
-            setup_venv_rpgkit(project_path, tracker=tracker)
 
             # Re-install hooks so behavior fixes propagate to existing
             # workspaces.  Without this, the .git/hooks/* files stay
@@ -4065,23 +4666,441 @@ def update(
         f"[dim]Updated: scripts, templates, and {AGENT_CONFIG[selected_ai]['name']} "
         f"command definitions in [cyan]{project_path}[/cyan][/dim]"
     )
-    console.print()
-    venv_path = Path(project_path) / ".venv_rpgkit"
-    if venv_path.exists():
-        activate_cmd = (
-            r".venv_rpgkit\Scripts\activate"
-            if os.name == "nt"
-            else "source .venv_rpgkit/bin/activate"
-        )
-        console.print(
-            Panel(
-                "Activate the RPG-Kit Python environment before using slash commands:\n\n"
-                f"[cyan]{activate_cmd}[/cyan]",
-                title="[yellow]Environment Setup[/yellow]",
-                border_style="yellow",
-                padding=(1, 2),
+
+    # Backfill inner snapshot repo for workspaces created before
+    # this feature shipped.  Idempotent — does nothing if .rpgkit/.git
+    # already exists, and silently noops if --no-rpgkit-git was passed.
+    if not no_rpgkit_git:
+        from . import _inner_git
+        from importlib.metadata import version as _pkg_version, PackageNotFoundError
+        try:
+            ver = _pkg_version("rpgkit-cli")
+        except PackageNotFoundError:
+            ver = "dev"
+        if _inner_git.ensure_inner_git(
+            project_path,
+            initial_msg=f"[update] v{ver} \u2014 catch-up snapshot",
+        ):
+            console.print(
+                "[dim]Initialised inner snapshot repo at "
+                "[cyan]~/.rpgkit/workspaces/<workspace-id>/.git[/cyan] for this workspace.[/dim]"
             )
+
+
+@app.command(
+    context_settings={
+        "allow_extra_args": True,
+        "ignore_unknown_options": True,
+        # Disable click's auto-help so ``--help`` is forwarded to the
+        # target script.  Use ``rpgkit script`` (no args) or
+        # ``rpgkit --help script`` to see this command's own help.
+        "help_option_names": [],
+    },
+)
+def script(
+    ctx: typer.Context,
+    relpath: Optional[str] = typer.Argument(
+        None,
+        help="Script path relative to the packaged scripts directory "
+        "(e.g. 'smoke_test.py' or 'rpg_edit/validate.py'). "
+        "The '.py' suffix is optional.",
+    ),
+    list_all: bool = typer.Option(
+        False,
+        "--list",
+        help="List all available scripts and exit.",
+    ),
+    where: Optional[str] = typer.Option(
+        None,
+        "--where",
+        metavar="NAME",
+        help="Print the absolute filesystem path of NAME and exit.",
+    ),
+) -> None:
+    """Execute a bundled RPG-Kit pipeline script.
+
+    All arguments after ``<relpath>`` are forwarded verbatim to the
+    target script.  Standard input/output/error are inherited so the
+    child's behaviour matches direct invocation.
+
+    Examples::
+
+        rpgkit script smoke_test.py --json
+        rpgkit script rpg_edit/validate.py
+        rpgkit script --list
+        rpgkit script --where mcp_server.py
+    """
+    from . import _assets
+
+    if list_all:
+        for name in _assets.list_scripts():
+            console.print(name)
+        raise typer.Exit(0)
+
+    if where is not None:
+        path = _resolve_script_path(where)
+        if path is None:
+            console.print(f"[red]script not found: {where}[/red]")
+            raise typer.Exit(1)
+        # Print plain path (no markup) so it pipes cleanly into $(...)
+        print(str(path))
+        raise typer.Exit(0)
+
+    if not relpath:
+        console.print(
+            "[red]error:[/red] missing script path. "
+            "Use [cyan]rpgkit script --list[/cyan] to see available scripts."
         )
+        raise typer.Exit(2)
+
+    path = _resolve_script_path(relpath)
+    if path is None:
+        console.print(f"[red]script not found: {relpath}[/red]")
+        raise typer.Exit(1)
+
+    # Build child env: inherit, plus disable .pyc writes so the read-mostly
+    # tool-venv install dir doesn't accumulate __pycache__ noise.
+    env = os.environ.copy()
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+
+    # Tee stdout to a per-stage log file so the workspace has a persistent
+    # record of every script invocation.  The log path is resolved from
+    # _storage at run time; if the home-side dir doesn't exist yet (e.g.
+    # rpgkit init hasn't run), skip silently — no log is better than
+    # crashing.
+    log_path: Optional[Path] = None
+    from . import _inner_git as _ig
+    ws_root = _ig.find_workspace_root()
+    if ws_root is not None:
+        from . import _storage
+        logs_dir = _storage.workspace_logs_dir(ws_root)
+        if logs_dir.is_dir():
+            script_stem = path.stem  # e.g. "feature_build"
+            log_path = logs_dir / f"{script_stem}.log"
+
+    if log_path is not None:
+        log_fh = open(log_path, "a", encoding="utf-8")
+        cmd = [sys.executable, str(path), *ctx.args]
+        proc = subprocess.run(
+            cmd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        # Write captured output to both terminal and log file.
+        output = proc.stdout or b""
+        sys.stdout.buffer.write(output)
+        sys.stdout.buffer.flush()
+        try:
+            log_fh.write(output.decode("utf-8", errors="replace"))
+            log_fh.flush()
+        except OSError:
+            pass
+        finally:
+            log_fh.close()
+    else:
+        cmd = [sys.executable, str(path), *ctx.args]
+        proc = subprocess.run(cmd, env=env)
+
+    # Snapshot the current state of .rpgkit/ into the inner git
+    # repo so users can `git log` / `git diff` between pipeline stages.
+    # No-op (silently) when the script is read-only (check_*, *_validation),
+    # the inner repo is absent (--no-rpgkit-git on init), or git is busy.
+    #
+    # Use the *resolved* path (always carries .py) for the commit message
+    # so `rpgkit script smoke_test` and `rpgkit script smoke_test.py`
+    # produce identical history entries.
+    from . import _inner_git, _assets
+    ws_root = _inner_git.find_workspace_root()
+    if ws_root is not None:
+        try:
+            commit_relpath = str(path.relative_to(_assets.scripts_dir())).replace("\\", "/")
+        except ValueError:
+            commit_relpath = relpath.replace("\\", "/")
+        _inner_git.auto_commit_after_script(
+            ws_root,
+            commit_relpath,
+            list(ctx.args),
+            proc.returncode,
+        )
+
+    raise typer.Exit(proc.returncode)
+
+
+def _resolve_script_path(relpath: str) -> Optional[Path]:
+    """Resolve ``relpath`` against the packaged scripts dir.
+
+    Rejects path-traversal and absolute paths; appends ``.py`` when no
+    suffix is given.  Returns ``None`` if the resolved path is not a
+    regular file inside :func:`_assets.scripts_dir`.
+    """
+    from . import _assets
+
+    # Normalise separators for cross-platform invocation
+    rel = relpath.replace("\\", "/")
+    # Security: reject parent-traversal and absolute paths
+    if rel.startswith("/") or ".." in rel.split("/"):
+        return None
+    p = Path(rel)
+    if p.is_absolute():
+        return None
+    if p.suffix == "":
+        p = p.with_suffix(".py")
+    root = _assets.scripts_dir()
+    candidate = (root / p).resolve()
+    try:
+        candidate.relative_to(root.resolve())
+    except ValueError:
+        # Resolved outside the scripts root (e.g. via symlink) — refuse
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
+
+
+# ---------------------------------------------------------------------------
+# Git-hook dispatch: ``rpgkit hook <name>``
+# ---------------------------------------------------------------------------
+#
+# Python entry-point for git hooks.  The on-disk hook files in
+# ``.git/hooks/`` are short shell stubs that ``exec`` this command;
+# path resolution, logging, locking, and detach logic live here so they
+# can be updated by upgrading the CLI rather than reinstalling hooks.
+
+_HOOK_ENV_NAME = "RPGKIT_HOOK"
+_HOOK_ENV_SHA = "RPGKIT_HOOK_SHA"
+_HOOK_LOG_FILENAME = "hooks.log"
+_HOOK_BACKGROUND_LOG = "update_rpg.log"
+_HOOK_LOCK_DIRNAME = ".update_rpg.lock"
+_HOOK_LOCK_STALE_SECONDS = 60 * 60  # 60 minutes -- matches the old shell impl
+
+
+def _hook_log_line(log_path: Path, msg: str) -> None:
+    """Append a timestamped line to the hook log.  Best-effort."""
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+            fh.write(f"[{ts}] {msg}\n")
+    except OSError:
+        # Logging is observability; we never fail a hook because we
+        # couldn't write a line.
+        pass
+
+
+def _short_head_sha(workspace: Path) -> str:
+    """Return ``git rev-parse --short HEAD`` for ``workspace`` or ``"?"``."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(workspace), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            return (r.stdout or "").strip() or "?"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "?"
+
+
+def _hook_run_foreground(
+    workspace: Path,
+    log_path: Path,
+    env: Dict[str, str],
+    script_args: List[str],
+    label: str,
+) -> int:
+    """Run ``rpgkit script <script_args>`` and tee output into ``log_path``."""
+    _hook_log_line(log_path, f"{label}: start ({' '.join(script_args)})")
+    try:
+        with open(log_path, "a", encoding="utf-8") as fh:
+            proc = subprocess.run(
+                ["rpgkit", "script", *script_args],
+                cwd=str(workspace),
+                env=env,
+                stdout=fh, stderr=subprocess.STDOUT,
+                timeout=300,
+            )
+        _hook_log_line(log_path, f"{label}: done (exit {proc.returncode})")
+        return proc.returncode
+    except (OSError, subprocess.SubprocessError) as exc:
+        _hook_log_line(log_path, f"{label}: ERROR {exc!r}")
+        return -1
+
+
+def _hook_spawn_background(
+    workspace: Path,
+    home_dir: Path,
+    hook_log: Path,
+    env: Dict[str, str],
+) -> None:
+    """Acquire a directory lock and detach ``update_graphs.py update-rpg``.
+
+    The lock is a *directory* (``mkdir`` is the only POSIX-atomic
+    exclusive-create primitive); a directory older than
+    :data:`_HOOK_LOCK_STALE_SECONDS` is treated as orphaned (worker
+    killed by OOM / reboot / SIGKILL) and removed before re-trying.
+    """
+    lock_dir = home_dir / "logs" / _HOOK_LOCK_DIRNAME
+    bg_log = home_dir / "logs" / _HOOK_BACKGROUND_LOG
+
+    # Stale-lock recovery -- match the 60-minute window the shell hook used.
+    try:
+        if lock_dir.is_dir():
+            age = time.time() - lock_dir.stat().st_mtime
+            if age > _HOOK_LOCK_STALE_SECONDS:
+                shutil.rmtree(lock_dir, ignore_errors=True)
+                _hook_log_line(hook_log, f"phase2: removed stale lock (age={age:.0f}s)")
+    except OSError:
+        pass
+
+    # Try to acquire.
+    try:
+        lock_dir.mkdir(parents=False, exist_ok=False)
+    except FileExistsError:
+        _hook_log_line(hook_log, "phase2: skipped (another worker holds the lock)")
+        return
+    except OSError as exc:
+        _hook_log_line(hook_log, f"phase2: lock acquire failed: {exc!r}")
+        return
+
+    # Background worker: run update-rpg, then release the lock.  We
+    # cannot use ``Popen`` alone because nothing would ``rmdir`` the
+    # lock after the worker completes; a tiny ``sh -c`` wrapper does
+    # the cleanup deterministically.
+    #
+    # ``start_new_session=True`` is the cross-platform equivalent of
+    # ``nohup``/``setsid`` -- the child survives the hook's exit.
+    bg_log.parent.mkdir(parents=True, exist_ok=True)
+    lock_q = shlex.quote(str(lock_dir))
+    log_q = shlex.quote(str(bg_log))
+    workspace_q = shlex.quote(str(workspace))
+    shell_cmd = (
+        f"cd {workspace_q}; sleep 2; "
+        f"rpgkit script update_graphs.py update-rpg --json >> {log_q} 2>&1; "
+        f"rmdir {lock_q}"
+    )
+    # Strip GIT_INDEX_FILE / GIT_DIR which git sets during hooks -
+    # if they leak into the worker, ``git worktree add`` fails with
+    # cryptic index errors.
+    worker_env = {k: v for k, v in env.items() if k not in ("GIT_INDEX_FILE", "GIT_DIR")}
+    try:
+        subprocess.Popen(
+            ["sh", "-c", shell_cmd],
+            cwd=str(workspace),
+            env=worker_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _hook_log_line(hook_log, f"phase2: dispatched -> {bg_log}")
+    except OSError as exc:
+        _hook_log_line(hook_log, f"phase2: spawn failed: {exc!r}")
+        # Release the lock so the next commit can retry.
+        try:
+            lock_dir.rmdir()
+        except OSError:
+            pass
+
+
+@app.command(
+    "hook",
+    hidden=True,
+    help="Internal git-hook dispatcher (called from .git/hooks/*).",
+)
+def hook(name: str = typer.Argument(..., help="Hook name: post-commit | post-merge")) -> None:
+    """Dispatch from ``.git/hooks/<name>`` to the matching Python handler.
+
+    Resolves the current workspace via the standard cwd-walk, attaches
+    a hook log under ``~/.rpgkit/workspaces/<workspace-id>/logs/hooks.log``,
+    and runs the per-hook orchestration.  Every failure path is
+    swallowed (logged, never raised) so a misbehaving hook never blocks
+    the user's git operation.
+
+    Supported hooks: ``post-commit`` and ``post-merge``. The dispatcher
+    also accepts ``pre-commit`` as a deliberate no-op for backward
+    compatibility — old workspaces whose hook file still calls
+    ``rpgkit hook pre-commit`` should be cleaned up on the next
+    ``rpgkit init`` / ``rpgkit update`` run, which strips the block.
+
+    All ``rpgkit script`` subprocess invocations inherit two env vars:
+
+      * ``RPGKIT_HOOK`` -- the hook name (``post-commit`` etc.)
+      * ``RPGKIT_HOOK_SHA`` -- short SHA of the user-facing commit
+
+    The inner-git snapshot's commit message picks these up
+    (:func:`rpgkit_cli._inner_git._build_message`) so ``git log`` in the
+    home-side repo reads as a timeline of *user activity*, e.g.::
+
+        [hook:post-commit @ a1b2c3d] sync
+        [hook:post-merge  @ 9f8e7d6] sync
+    """
+    from . import _storage
+
+    try:
+        ws = _storage.find_workspace_root_from(Path.cwd())
+        if ws is None:
+            # Not in an rpgkit workspace -- silently exit success;
+            # the hook may be running in a repo that was provisioned
+            # then un-init'd, and we never want to block git.
+            raise typer.Exit(0)
+
+        home_dir = _storage.home_workspace_dir(ws)
+        log_path = _storage.workspace_logs_dir(ws) / _HOOK_LOG_FILENAME
+        sha = _short_head_sha(ws)
+
+        env = os.environ.copy()
+        env[_HOOK_ENV_NAME] = name
+        env[_HOOK_ENV_SHA] = sha
+        # Ensure ``rpgkit`` itself is on PATH when the hook is fired
+        # from a GUI editor that lacks the user's interactive shell PATH.
+        local_bin = str(Path.home() / ".local" / "bin")
+        if local_bin not in env.get("PATH", ""):
+            env["PATH"] = local_bin + os.pathsep + env.get("PATH", "")
+
+        _hook_log_line(log_path, f"== {name} fired @ {sha} (ws={ws})")
+
+        if name == "pre-commit":
+            # Retired: pre-commit is now a deliberate no-op for backward
+            # compatibility with workspaces whose stub hasn't been
+            # stripped yet. Just log and exit success so git proceeds.
+            _hook_log_line(log_path, "pre-commit hook is a no-op (retired)")
+        elif name == "post-merge":
+            _hook_run_foreground(
+                ws, log_path, env,
+                ["update_graphs.py", "sync"],
+                "sync",
+            )
+        elif name == "post-commit":
+            # Phase 1: synchronous meta.git advance (fast, ~50ms).
+            _hook_run_foreground(
+                ws, log_path, env,
+                ["update_graphs.py", "sync"],
+                "phase1-sync",
+            )
+            # Phase 2: detached background LLM-driven RPG update.
+            _hook_spawn_background(ws, home_dir, log_path, env)
+        else:
+            _hook_log_line(log_path, f"unknown hook name: {name!r}")
+            raise typer.Exit(0)
+
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        # Last-ditch swallow: anything reaching here means our hook
+        # dispatcher itself is broken, but a broken hook must not
+        # break ``git commit`` -- log and exit cleanly.
+        try:
+            ws = _storage.find_workspace_root_from(Path.cwd())
+            if ws is not None:
+                _hook_log_line(
+                    _storage.workspace_logs_dir(ws) / _HOOK_LOG_FILENAME,
+                    f"FATAL in hook dispatcher: {exc!r}",
+                )
+        except Exception:
+            pass
+        raise typer.Exit(0)
+
+    raise typer.Exit(0)
+
 
 @app.command()
 def check():
@@ -4126,7 +5145,12 @@ def check():
 
 @app.command()
 def version():
-    """Display version and system information."""
+    """Display version and system information.
+
+    Also fetches the latest release tag from GitHub and reports whether
+    the locally installed CLI is up to date, behind, or ahead (dev
+    build).  Network failures are swallowed and surface as "offline".
+    """
     show_banner()
 
     # Get CLI version from package metadata
@@ -4148,8 +5172,9 @@ def version():
     # Fetch latest template release version
     repo_owner, repo_name = _get_repo_info()
 
-    template_version = "unknown"
+    latest_version = "unknown"
     release_date = "unknown"
+    fetch_error: str | None = None
 
     try:
         release_data = _fetch_latest_rpgkit_release(
@@ -4158,7 +5183,7 @@ def version():
             client,
             timeout=10,
         )
-        template_version = _format_rpgkit_version(release_data.get("tag_name", "unknown"))
+        latest_version = _format_rpgkit_version(release_data.get("tag_name", "unknown"))
         release_date = release_data.get("published_at", "unknown")
         if release_date != "unknown":
             # Format the date nicely
@@ -4167,21 +5192,111 @@ def version():
                 release_date = dt.strftime("%Y-%m-%d")
             except Exception:
                 pass
-    except Exception:
-        pass
+    except Exception as exc:
+        fetch_error = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+
+    # ------------------------------------------------------------------
+    # Compute the status hint: up-to-date / outdated / ahead / offline.
+    # Uses ``packaging.version`` (stdlib-ish — ships with setuptools and
+    # is a transitive dep of pip itself) so PEP 440 pre-release / dev
+    # suffixes are compared correctly.  Falls back to a plain string
+    # comparison when ``packaging`` is unavailable.
+    # ------------------------------------------------------------------
+    status_label = "[dim]unknown[/dim]"
+    status_hint: str | None = None
+
+    if fetch_error is not None:
+        status_label = "[yellow]offline[/yellow]"
+        status_hint = (
+            f"Could not query GitHub for the latest release: {fetch_error}. "
+            "Local install is still usable; rerun `rpgkit version` when "
+            "you have network access to compare."
+        )
+    elif cli_version != "unknown" and latest_version != "unknown":
+        try:
+            from packaging.version import Version as _Ver
+
+            local_v = _Ver(cli_version)
+            remote_v = _Ver(latest_version)
+        except Exception:
+            local_v = cli_version
+            remote_v = latest_version
+
+        if local_v == remote_v:
+            status_label = "[green]up to date[/green]"
+        elif local_v < remote_v:
+            status_label = f"[yellow]outdated → {latest_version}[/yellow]"
+            status_hint = (
+                f"A newer release ([cyan]{latest_version}[/cyan]) is "
+                f"available.  Upgrade with one of:\n"
+                f"  [cyan]uv tool upgrade rpgkit-cli[/cyan]\n"
+                f"  [cyan]pipx upgrade rpgkit-cli[/cyan]\n"
+                f"  [cyan]pip install -U rpgkit-cli[/cyan]\n"
+                f"After upgrading, run [cyan]rpgkit update[/cyan] in each "
+                f"existing workspace to apply the new prompts."
+            )
+        else:
+            status_label = f"[cyan]ahead of release ({latest_version})[/cyan]"
+            status_hint = (
+                f"Local CLI ({cli_version}) is newer than the latest "
+                f"published release ({latest_version}) — typically a dev "
+                f"build from git.  No action needed."
+            )
 
     info_table = Table(show_header=False, box=None, padding=(0, 2))
     info_table.add_column("Key", style="cyan", justify="right")
     info_table.add_column("Value", style="white")
 
     info_table.add_row("CLI Version", cli_version)
-    info_table.add_row("Template Version", template_version)
+    info_table.add_row("Latest Release", latest_version)
     info_table.add_row("Released", release_date)
+    info_table.add_row("Status", status_label)
     info_table.add_row("", "")
     info_table.add_row("Python", platform.python_version())
     info_table.add_row("Platform", platform.system())
     info_table.add_row("Architecture", platform.machine())
     info_table.add_row("OS Version", platform.version())
+
+    # Surface the per-workspace home-side storage when
+    # invoked from inside an rpgkit workspace.  Without this the user
+    # has no obvious way to find their generated artefacts / logs after
+    # we moved them out of the repo tree into ``~/.rpgkit/workspaces/
+    # <workspace-id>/`` — they'd have to derive the workspace id themselves.
+    try:
+        from . import _inner_git
+        ws = _inner_git.find_workspace_root()
+        if ws is not None:
+            home_dir = _storage.home_workspace_dir(ws)
+            data_dir = _storage.workspace_data_dir(ws)
+            logs_dir = _storage.workspace_logs_dir(ws)
+            # Annotate each row when the dir doesn't exist yet so the
+            # user doesn't mistake a computed path for a real artefact.
+            # Important after partial cleanup or before the first
+            # ``rpgkit init`` populates the home-side store — we used
+            # to print non-existent paths as if they were live.
+            def _tag(p: Path) -> str:
+                return str(p) if p.exists() else f"{p}  [dim](not created yet)[/dim]"
+
+            info_table.add_row("", "")
+            info_table.add_row("Workspace", str(ws))
+            info_table.add_row("Data", _tag(data_dir))
+            info_table.add_row("Logs", _tag(logs_dir))
+            # Inner-git: distinguish absent (no .git dir) from empty
+            # (.git exists but zero commits).  snapshot_count returns
+            # None for both, so probe has_inner_git directly.
+            if not home_dir.exists():
+                inner_git_value = f"{home_dir}  [dim](home-side dir not created — run `rpgkit init` here)[/dim]"
+            elif not _inner_git.has_inner_git(ws):
+                inner_git_value = f"{home_dir}  [dim](no inner-git repo)[/dim]"
+            else:
+                count = _inner_git.snapshot_count(ws)
+                if count is None or count == 0:
+                    inner_git_value = f"{home_dir}  [dim](no snapshots yet)[/dim]"
+                else:
+                    inner_git_value = f"{home_dir}  [dim]({count} snapshots — git -C {home_dir} log)[/dim]"
+            info_table.add_row("Inner git", inner_git_value)
+    except Exception:
+        pass
 
     panel = Panel(
         info_table,
@@ -4191,6 +5306,18 @@ def version():
     )
 
     console.print(panel)
+    if status_hint:
+        console.print()
+        console.print(
+            Panel(
+                status_hint,
+                title="[bold]Upgrade tip[/bold]",
+                border_style="yellow"
+                if "outdated" in status_label or "offline" in status_label
+                else "cyan",
+                padding=(1, 2),
+            )
+        )
     console.print()
 
 

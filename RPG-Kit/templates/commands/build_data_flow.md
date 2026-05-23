@@ -22,7 +22,7 @@ Unless it is explicitly empty, you may assume it is always available as `$ARGUME
 
 ### Step 1: Pre-check
 
-Run the script `python3 .rpgkit/scripts/check_data_flow.py` to verify the current state.
+Run the script `rpgkit script check_data_flow.py` to verify the current state.
 
 1. Inspect the `state` field in the output:
 
@@ -69,7 +69,7 @@ Run the script `python3 .rpgkit/scripts/check_data_flow.py` to verify the curren
 1. Display the following prompt and wait for user confirmation:
 
    ```text
-   Description: Run the script `.rpgkit/scripts/build_data_flow.py` to:
+   Description: Run the script `rpgkit script build_data_flow.py` to:
      - Design inter-component data flow as a DAG
      - Generate subtree processing order
    
@@ -81,14 +81,11 @@ Run the script `python3 .rpgkit/scripts/check_data_flow.py` to verify the curren
 2. Execute the following command with the selected iteration count:
 
    ```bash
-   python3 .rpgkit/scripts/build_data_flow.py --max-iterations <default_or_user_defined> > .rpgkit/logs/build_data_flow.log 2>&1
+   rpgkit script build_data_flow.py --max-iterations <default_or_user_defined>
    ```
 
-   Then print the output by:
-
-   ```bash
-   cat .rpgkit/logs/build_data_flow.log
-   ```
+   The script writes a structured log automatically;
+   stdout carries the summary you need below.
 
 3. Upon successful completion, display:
 
@@ -108,7 +105,7 @@ Run the script `python3 .rpgkit/scripts/check_data_flow.py` to verify the curren
 Run the validation script:
 
 ```bash
-python3 .rpgkit/scripts/check_data_flow.py --verbose
+rpgkit script check_data_flow.py --verbose
 ```
 
 Display the validation results to the user:
@@ -128,7 +125,7 @@ Display the validation results to the user:
 Run the visualization script:
 
 ```bash
-python3 .rpgkit/scripts/generate_viz.py
+rpgkit script generate_viz.py
 ```
 
 Report:

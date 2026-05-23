@@ -7,7 +7,6 @@ __pycache__/
 # --- RPG-Kit generated data & temp ---
 .rpgkit/data/
 .rpgkit/tmp/
-.rpgkit/scripts/**/__pycache__/
 
 # --- Logs ---
 *.log
@@ -227,6 +226,9 @@ plans/
 
 # RPG-Kit ignores (managed by `rpgkit init/update`)
 .rpgkit/
+# But DO commit the workspace AI config so collaborators get a sane default.
+# Plan: plans/01-package-bundle-and-ai-config.md decision 15.
+!.rpgkit/config.toml
 .vscode/mcp.json
 .vscode/tasks.json
 .mcp.json

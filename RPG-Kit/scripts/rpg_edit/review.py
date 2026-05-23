@@ -6,7 +6,7 @@ actually work correctly. The review scope is driven by impact analysis
 data (callers, affected_files), NOT a full global review.
 
 Usage:
-    python3 .rpgkit/scripts/rpg_edit/review.py \
+    rpgkit script rpg_edit/review.py \
       --plan .rpgkit/data/rpg_edit_plan.json \
       --impact .rpgkit/data/rpg_edit_impact.json \
       --json
@@ -34,7 +34,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from common.paths import WORKSPACE_ROOT, REPO_DIR  # noqa: E402
+from common.paths import REPO_DIR, cmd_for, RPG_EDIT_PLAN_FILE, RPG_EDIT_IMPACT_FILE  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -105,8 +105,8 @@ interact through the browser or GUI.
 For **web apps**, use `inspect` on EVERY affected route to capture
 screenshots and saved HTML:
 ```bash
-python $BROWSER_TOOL inspect http://localhost:<PORT>/
-python $BROWSER_TOOL inspect http://localhost:<PORT>/<affected_route>
+$BROWSER_TOOL inspect http://localhost:<PORT>/
+$BROWSER_TOOL inspect http://localhost:<PORT>/<affected_route>
 ```
 Read the saved HTML files to understand the full page content, CSS layout,
 and element structure. Check for:
@@ -119,7 +119,7 @@ and element structure. Check for:
 
 Don't just view pages — **interact** with them like a real user:
 ```bash
-python $BROWSER_TOOL run-script http://localhost:<PORT>/<page> --script '
+$BROWSER_TOOL run-script http://localhost:<PORT>/<page> --script '
 page.click("a:has-text(\\"Some Link\\")")
 page.wait_for_load_state("networkidle")
 '
@@ -128,10 +128,10 @@ After each interaction, read the saved [After] HTML to verify the result.
 
 For **GUI apps**, use the GUI tool:
 ```bash
-python $GUI_TOOL start-display
-python $GUI_TOOL launch "python main.py" --wait 3
-python $GUI_TOOL status
-python $GUI_TOOL screenshot
+$GUI_TOOL start-display
+$GUI_TOOL launch "python main.py" --wait 3
+$GUI_TOOL status
+$GUI_TOOL screenshot
 ```
 Click every relevant button, fill forms, and screenshot after each action.
 
@@ -340,11 +340,12 @@ def build_impact_review_prompt(
         pattern = " or ".join(test_patterns)
         pytest_cmd += f' -k "{pattern}" --timeout=30'
 
-    # Use absolute paths so the prompt is cwd-agnostic.
-    tools_dir = WORKSPACE_ROOT / ".rpgkit" / "scripts" / "tools"
-    browser_tool = str(tools_dir / "browser.py")
-    gui_tool = str(tools_dir / "gui.py")
-    smoke_test_cmd = f"python3 {WORKSPACE_ROOT}/.rpgkit/scripts/smoke_test.py --json"
+    # Tool invocations route through the global ``rpgkit`` CLI (the
+    # scripts no longer live in the workspace).  See ``rpgkit script``
+    # in docs/cli-reference.md.
+    browser_tool = cmd_for("tools/browser.py")
+    gui_tool = cmd_for("tools/gui.py")
+    smoke_test_cmd = f"{cmd_for('smoke_test.py')} --json"
 
     # Start instructions depend on project type
     start_instructions = (
@@ -546,10 +547,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Impact-scoped review for rpg_edit changes"
     )
-    parser.add_argument("--plan", type=Path, required=True,
-                        help="Path to rpg_edit_plan.json")
-    parser.add_argument("--impact", type=Path, default=None,
-                        help="Path to rpg_edit_impact.json")
+    parser.add_argument("--plan", type=Path, default=RPG_EDIT_PLAN_FILE,
+                        help="Path to rpg_edit_plan.json (default: %(default)s)")
+    parser.add_argument("--impact", type=Path, default=RPG_EDIT_IMPACT_FILE,
+                        help="Path to rpg_edit_impact.json (default: %(default)s)")
     parser.add_argument("--repo", type=Path, default=None,
                         help="Repository root path")
     parser.add_argument("--max-iterations", type=int, default=3,
@@ -566,7 +567,6 @@ def main():
     )
 
     # Capture log records for post-mortem inspection of rpg_edit issues.
-    # See plans/20260508-1-rpgkit-optimization*.md § E1.
     from common.logging_setup import setup_file_logging
     setup_file_logging("rpg_edit")
 

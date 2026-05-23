@@ -41,7 +41,7 @@ The text after `/rpgkit.rpg_edit` is the edit instruction, available as `$ARGUME
 ### Step 1: Pre-check
 
 ```bash
-python3 .rpgkit/scripts/rpg_edit/validate.py --json
+rpgkit script rpg_edit/validate.py --json
 ```
 
 Inspect the `type` field:
@@ -52,7 +52,7 @@ Inspect the `type` field:
 ### Step 2: Locate Target Nodes
 
 ```bash
-python3 .rpgkit/scripts/rpg_edit/locate.py --query "$ARGUMENTS" --json
+rpgkit script rpg_edit/locate.py --query "$ARGUMENTS" --json
 ```
 
 > **Note:** If `$ARGUMENTS` contains double quotes, escape them before passing.
@@ -75,13 +75,16 @@ plus a `tree_summary` showing the full RPG structure for orientation.
 
 ### Step 3: Analyze Impact
 
-For each selected node, run impact analysis and save the output:
+For each selected node, run impact analysis and persist the result so
+the Step 5d review step can pick it up automatically:
 
 ```bash
-python3 .rpgkit/scripts/rpg_edit/impact.py --node-id <id1> [--node-id <id2> ...] --json | tee .rpgkit/data/rpg_edit_impact.json
+rpgkit script rpg_edit/impact.py --node-id <id1> [--node-id <id2> ...] --json --save
 ```
 
-Read the output to inform the EditPlan. Do NOT present it separately — incorporate the results directly into Step 4.
+The `--save` flag persists `rpg_edit_impact.json` for downstream stages;
+stdout still carries the JSON for you to read. Do NOT present it
+separately — incorporate the results directly into Step 4.
 
 ### Step 3.5: Visual Reconnaissance (optional, before EditPlan)
 
@@ -104,7 +107,7 @@ If no keyword matches, skip directly to Step 4.
 **Step 3.5a — Probe tool availability (≤ 5s):**
 
 ```bash
-python3 .rpgkit/scripts/tools/browser.py check >/dev/null 2>&1 \
+rpgkit script tools/browser.py check >/dev/null 2>&1 \
     && BROWSER_OK=1 || BROWSER_OK=0
 ```
 
@@ -126,7 +129,7 @@ Step 4.
 **Step 3.5c — Run inspect:**
 
 ```bash
-python3 .rpgkit/scripts/tools/browser.py inspect <url>
+rpgkit script tools/browser.py inspect <url>
 ```
 
 The command prints paths to the saved HTML and screenshot. Read the
@@ -161,7 +164,7 @@ assumptions from node names. Poor plans come from skipping this step.
    was skipped but the app is running, take a screenshot now:
 
    ```bash
-   python3 .rpgkit/scripts/tools/browser.py inspect http://localhost:<PORT>/
+   rpgkit script tools/browser.py inspect http://localhost:<PORT>/
    ```
 
 4. **Collect all files that need changes** — not just the ones from
@@ -197,10 +200,12 @@ in `code_changes`:
 - [ ] Each `description` references specific functions/classes/lines found in the code
 - [ ] No generic descriptions like "update styles" — cite exact CSS properties or function names
 
-Save to `.rpgkit/data/rpg_edit_plan.json` via shell (do NOT use the Write tool for `.rpgkit/` paths):
+Save the plan via the dedicated helper, which persists
+`rpg_edit_plan.json` for downstream stages and prints the absolute
+path on stdout. Do NOT use the Write tool for `.rpgkit/` paths:
 
 ```bash
-cat > .rpgkit/data/rpg_edit_plan.json << 'PLAN_EOF'
+cat << 'PLAN_EOF' | rpgkit script rpg_edit/save_plan.py
 <paste the JSON here>
 PLAN_EOF
 ```
@@ -263,11 +268,12 @@ do **not** silently `git stash`, as that would hide their work.
 **Step 5b — Update RPG feature graph:**
 
 ```bash
-python3 .rpgkit/scripts/rpg_edit/apply.py --plan .rpgkit/data/rpg_edit_plan.json --phase rpg-only --json
+rpgkit script rpg_edit/apply.py --phase rpg-only --json
 ```
 
-This applies `feature_changes` to the RPG and saves it. The RPG now reflects the target state.
-Note the `backup_timestamp` from the output — you'll need it in Step 5c and on rollback.
+This applies `feature_changes` to the RPG and saves it (reading the plan
+from the default home-dir location). Note the `backup_timestamp` from
+the output — you'll need it in Step 5c and on rollback.
 
 **Step 5c — Apply code changes via dedicated SubAgent + refresh dep_graph + commit on the branch:**
 
@@ -277,15 +283,15 @@ mode, and the driver script creates a single commit on the current branch
 (even when multiple SubAgent iterations are needed).
 
 ```bash
-python3 .rpgkit/scripts/rpg_edit/code.py \
-  --plan .rpgkit/data/rpg_edit_plan.json \
-  --json | tee .rpgkit/data/rpg_edit_code_result.json
+rpgkit script rpg_edit/code.py --json
 ```
 
 Inspect the result `success` field:
 
 - `true`: code applied, single commit made on the branch (SHA in `commit_sha`).
-  Continue to refresh dep_graph below.
+  The full result JSON is on stdout; the script also persists
+  `rpg_edit_code_result.json` for later inspection. Continue to refresh
+  dep_graph below.
 - `false`: report `last_error` to user, do NOT refresh dep_graph,
   leave the rpg-edit branch for inspection.
 
@@ -293,9 +299,8 @@ If success, refresh the dep_graph and amend the existing commit so that
 code + dep_graph land together:
 
 ```bash
-python3 .rpgkit/scripts/rpg_edit/apply.py \
-  --plan .rpgkit/data/rpg_edit_plan.json \
-  --phase dep-refresh --backup-ts <timestamp_from_5b> --json
+rpgkit script rpg_edit/apply.py --phase dep-refresh \
+    --backup-ts <timestamp_from_5b> --json
 
 git add -A && git commit --amend --no-edit
 ```
@@ -305,19 +310,17 @@ git add -A && git commit --amend --no-edit
 1. **Smoke test** — verify imports and entry point:
 
 ```bash
-python3 .rpgkit/scripts/smoke_test.py --json
+rpgkit script smoke_test.py --json
 ```
 
 1. **Impact review** — run targeted tests and verify affected functionality:
 
 ```bash
-python3 .rpgkit/scripts/rpg_edit/review.py \
-  --plan .rpgkit/data/rpg_edit_plan.json \
-  --impact .rpgkit/data/rpg_edit_impact.json \
-  --json
+rpgkit script rpg_edit/review.py --json
 ```
 
-The review script automatically:
+The review script reads the plan and impact JSON from their default
+home-dir locations and automatically:
 
 - Derives test patterns from `code_changes` in the plan
 - Runs pytest on matching test files
@@ -354,7 +357,7 @@ visible in `git log --graph`.
   > Merged `rpg-edit/<short-id>` into `main` (commit `<merge-SHA>`).
   > To revert later:
   > - Code:  `git revert -m 1 <merge-SHA>`
-  > - Graphs: `python3 .rpgkit/scripts/rpg_edit/apply.py --rollback <timestamp> --json`
+  > - Graphs: `rpgkit script rpg_edit/apply.py --rollback <timestamp> --json`
 
   If the review output contained `suggestions`, append:
 
@@ -378,7 +381,7 @@ visible in `git log --graph`.
   > `main` is clean.  Choose one of:
   > - Inspect:  `git diff main rpg-edit/<short-id>`
   > - Discard code + graphs together:
-  >     `python3 .rpgkit/scripts/rpg_edit/apply.py --rollback <timestamp> --rollback-branch rpg-edit/<short-id> --json`
+  >     `rpgkit script rpg_edit/apply.py --rollback <timestamp> --rollback-branch rpg-edit/<short-id> --json`
   > - Discard code only:  `git branch -D rpg-edit/<short-id>`
   > - Continue editing on the branch and re-run from Step 5d.
 

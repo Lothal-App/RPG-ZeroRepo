@@ -10,7 +10,7 @@ name: rpgkit.feature_refactor
 1. Run the validation script to verify input and check output file status:
 
    ```bash
-   python3 .rpgkit/scripts/feature_refactor_validation.py
+   rpgkit script feature_refactor_validation.py
    ```
 
    The script outputs a JSON object. Determine the next action based on the `status` and `action` fields:
@@ -33,7 +33,7 @@ name: rpgkit.feature_refactor
    1. Must display the following information and prompt the user to confirm the maximum number of iterations (default: 10).
 
       ```markdown
-      **description**: Run the script `.rpgkit/scripts/feature_refactor.py` to perform a two-step process:
+      **description**: Run the script `rpgkit script feature_refactor.py` to perform a two-step process:
         - Step 1: Plan the structure and number of subtrees
         - Step 2: Iteratively assign features to the planned subtrees
       
@@ -47,14 +47,11 @@ name: rpgkit.feature_refactor
    2. Execute the following command with the selected max iteration count (default: 10 or user-defined):
 
       ```bash
-      python3 .rpgkit/scripts/feature_refactor.py --max-iterations <default_or_user_defined_iterations> > .rpgkit/logs/feature_refactor.log 2>&1
+      rpgkit script feature_refactor.py --max-iterations <default_or_user_defined_iterations>
       ```
 
-      Then print the output by:
-
-      ```bash
-      cat .rpgkit/logs/feature_refactor.log
-      ```
+      The script writes a structured log automatically;
+      stdout carries the summary you need below.
 
    3. Analyze and summarize the information printed during script execution, and present the results in a Markdown table format.
 

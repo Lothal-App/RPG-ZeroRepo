@@ -20,7 +20,7 @@ Unless it is explicitly empty, you may assume it is always available as `$ARGUME
 
 ### Step 1: Pre-check
 
-Run the script `python3 .rpgkit/scripts/check_base_classes.py` to verify the current state.
+Run the script `rpgkit script check_base_classes.py` to verify the current state.
 
 1. Inspect the `state` field in the output:
 
@@ -52,7 +52,7 @@ Run the script `python3 .rpgkit/scripts/check_base_classes.py` to verify the cur
 1. Display the following prompt and wait for user confirmation:
 
    ```text
-   Description: Run the script `.rpgkit/scripts/design_base_classes.py` to:
+   Description: Run the script `rpgkit script design_base_classes.py` to:
      - Design functional base classes (behavioral abstractions)
      - Design global data structures (shared data formats)
    
@@ -66,14 +66,11 @@ Run the script `python3 .rpgkit/scripts/check_base_classes.py` to verify the cur
 2. Execute the following command with the selected iteration count:
 
    ```bash
-   python3 .rpgkit/scripts/design_base_classes.py --max-iterations <default_or_user_defined> > .rpgkit/logs/design_base_classes.log 2>&1
+   rpgkit script design_base_classes.py --max-iterations <default_or_user_defined>
    ```
 
-   Then print the output by:
-
-   ```bash
-   cat .rpgkit/logs/design_base_classes.log
-   ```
+   The script writes a structured log automatically;
+   stdout carries the summary the next step needs.
 
 3. Upon successful completion, display:
 
@@ -95,7 +92,7 @@ Run the script `python3 .rpgkit/scripts/check_base_classes.py` to verify the cur
 Run the validation script:
 
 ```bash
-python3 .rpgkit/scripts/check_base_classes.py --verbose
+rpgkit script check_base_classes.py --verbose
 ```
 
 Display the validation results to the user:

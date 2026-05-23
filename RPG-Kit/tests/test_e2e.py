@@ -728,12 +728,6 @@ class TestE2EFullPipeline:
 class TestE2ECLISimulation:
     """Simulate CLI-like invocations end-to-end."""
 
-    def test_cli_encode_helpers(self, sample_repo, tmp_path):
-        """RPG_FILE path constant points to correct location."""
-        from common.paths import RPG_FILE
-
-        assert str(RPG_FILE).endswith(os.path.join(".rpgkit", "data", "rpg.json"))
-
     def test_cli_rpg_stats(self, encoded_rpg):
         """check_encode.get_rpg_stats produces valid statistics from encoded RPG data."""
         from rpg_encoder.check_encode import get_rpg_stats

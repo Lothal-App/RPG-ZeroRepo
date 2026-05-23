@@ -37,7 +37,7 @@ The text typed by the user after `/rpgkit.feature_edit` **is the edit instructio
 Execute from repository root:
 
 ```bash
-python3 .rpgkit/scripts/feature_edit_validation.py --edit_instruction "$ARGUMENTS"
+rpgkit script feature_edit_validation.py --edit_instruction "$ARGUMENTS"
 ```
 
 **Important:** If `$ARGUMENTS` contains a double quote (`"`), it MUST be escaped before being passed to the script.
@@ -73,7 +73,7 @@ Inspect the `type` field in the output:
 Display the following prompt and wait for user confirmation:
 
 ```markdown
-The script `.rpgkit/scripts/feature_edit.py` will be executed to edit the feature tree based on your instructions.
+The script `rpgkit script feature_edit.py` will be executed to edit the feature tree based on your instructions.
 
 **File:** `.rpgkit/data/feature_tree.json`
 
@@ -96,14 +96,11 @@ Please confirm to proceed:
 Execute the following command:
 
 ```bash
-python3 .rpgkit/scripts/feature_edit.py > .rpgkit/logs/feature_edit.log 2>&1
+rpgkit script feature_edit.py
 ```
 
-Then print the output by:
-
-```bash
-cat .rpgkit/logs/feature_edit.log
-```
+The script writes a structured log automatically; stdout
+carries the summary you need below.
 
 ### Step 4: Summarize Results
 

@@ -2,6 +2,8 @@
 
 This document covers RPG-Kit configuration that is useful after installation: AI assistant setup, MCP registration, auto-approval, hooks, and initial encoding.
 
+> **Data paths.** References below such as `.rpgkit/data/rpg.json` and `.rpgkit/logs/...` are logical names. Runtime files actually live under `~/.rpgkit/workspaces/<workspace-id>/{data,logs}/` so they stay outside your git repo, where `<workspace-id>` is the slug-based workspace identifier used by the home-side store (with an optional `-<hash6>` suffix when needed). Reports stay in the workspace at `<workspace>/.rpgkit/reports/`. The MCP server, hooks, and pipeline scripts all resolve the home-dir location automatically from the workspace root. Run `rpgkit version` from inside the workspace to see the resolved Data / Logs paths; see [project-structure.md](project-structure.md) for the full layout.
+
 ## AI Assistant CLI Requirements
 
 RPG-Kit slash commands are executed by an AI coding agent. Before running `rpgkit init`, install and authenticate at least one supported AI assistant CLI.
@@ -20,6 +22,55 @@ rpgkit check
 ```
 
 If the selected AI assistant is not found, install and authenticate it, then rerun `rpgkit init` or `rpgkit update`.
+
+## Workspace Configuration (`.rpgkit/config.toml`)
+
+Since `0.1.3`, every workspace owns a `.rpgkit/config.toml` file that records which AI CLI command the pipeline scripts should invoke. This decouples the scripts from a single AI at packaging time — the same packaged scripts now serve any AI you pick.
+
+```toml
+# .rpgkit/config.toml
+[rpgkit]
+ai_cli_cmd = "claude"
+```
+
+The file is created automatically by `rpgkit init --ai <agent>`. Edit it any time to switch the workspace to a different AI; no need to re-run `init`.
+
+### Resolution priority
+
+When a pipeline script (or a hook, or the MCP server) needs to invoke the AI CLI, it resolves the command via the following chain. The first non-empty value wins:
+
+| # | Source | Use case |
+| - | ------ | -------- |
+| P1 | `LLMClient(tool="...")` constructor argument | Programmatic override (rare) |
+| P2 | `RPGKIT_AI_CLI_CMD` environment variable | CI runs, one-off experiments |
+| P3 | `.rpgkit/config.toml` `[rpgkit].ai_cli_cmd` | Normal default (per workspace) |
+| P4 | Release-zip baked-in literal | Legacy workspaces provisioned before v0.1.4 |
+
+If all four resolve to empty, the next `LLMClient.generate()` call raises a `RuntimeError` instructing the user to run `rpgkit init` or set the env var.
+
+### Supported AI CLI commands
+
+The values written to `ai_cli_cmd` mirror the per-AI substitutions performed by the GitHub release-zip CI:
+
+| `--ai` value | `ai_cli_cmd` |
+| ------------ | ------------ |
+| `copilot` | `copilot` |
+| `claude` | `claude` |
+| `gemini` | `gemini -p` |
+| `qwen` | `qwen -p` |
+| `cursor-agent` | `agent -p` |
+| `auggie` | `augment -p` |
+| `codex` | `codex exec` |
+| `codebuddy` | `codebuddy -p` |
+| `qoder` | `qodercli -p` |
+| `opencode` | `opencode run` |
+| `amp` | `amp --execute` |
+
+Only `copilot` and `claude` are currently verified end-to-end; the others are scaffolded but may need integration adjustments.
+
+### Other config keys
+
+The `[rpgkit]` table currently holds only `ai_cli_cmd`. Future releases will add timeouts, retry budgets, and model overrides under the same namespace; older keys remain forward-compatible.
 
 ## Initialization Options
 
@@ -167,29 +218,11 @@ Run `rpgkit update` from the project root to refresh scripts, command definition
 ```bash
 rpgkit update
 rpgkit update --ai claude
-rpgkit update --pre
+rpgkit update --no-upgrade
 rpgkit update --no-mcp
 ```
 
 `rpgkit update` auto-detects the existing assistant configuration when possible.
-
-## Network and Release Options
-
-```bash
-rpgkit init my-project --github-token $GITHUB_TOKEN
-rpgkit init my-project --pre
-rpgkit init my-project --skip-tls
-rpgkit init my-project --debug
-```
-
-| Option | Description |
-| ------ | ----------- |
-| `--github-token <token>` | Uses a GitHub token for API requests, useful for private repos or rate limits |
-| `--pre` | Downloads the latest pre-release template instead of the latest stable release |
-| `--skip-tls` | Skips SSL/TLS verification; use only for constrained environments |
-| `--debug` | Prints verbose diagnostic output for network and extraction failures |
-
-`GH_TOKEN` and `GITHUB_TOKEN` are also recognized for GitHub API requests.
 
 ## Troubleshooting
 
@@ -234,14 +267,14 @@ If the graph is corrupted or too stale, run `/rpgkit.encode` for a full rebuild.
 
 ### Template download hits rate limits or private repo access errors
 
-Use a token:
+As of v0.1.4 `rpgkit init` and `rpgkit update` no longer fetch templates
+from GitHub releases — templates are bundled inside the installed
+`rpgkit-cli` wheel, so this class of error should no longer occur during
+provisioning.  To pick up newer templates, upgrade the CLI itself:
 
 ```bash
-rpgkit init my-project --github-token $GITHUB_TOKEN
+uv tool upgrade rpgkit-cli
 ```
 
-or set an environment variable:
-
-```bash
-export GH_TOKEN=your_token
-```
+`rpgkit update` does this automatically by default; pass `--no-upgrade`
+to opt out.

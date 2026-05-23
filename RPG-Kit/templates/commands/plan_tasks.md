@@ -1,5 +1,5 @@
 ---
-mode: agent
+name: rpgkit.plan_tasks
 description: Plan implementation tasks from interface definitions
 ---
 
@@ -14,7 +14,7 @@ Create implementation tasks from the interface definitions.
 Run the check script to determine current state:
 
 ```bash
-python3 .rpgkit/scripts/check_tasks.py --json
+rpgkit script check_tasks.py --json
 ```
 
 **If type is "error"**:
@@ -60,14 +60,11 @@ python3 .rpgkit/scripts/check_tasks.py --json
 Run the task planner:
 
 ```bash
-python3 .rpgkit/scripts/plan_tasks.py > .rpgkit/logs/plan_tasks.log 2>&1
+rpgkit script plan_tasks.py
 ```
 
-Then print the output by:
-
-```bash
-cat .rpgkit/logs/plan_tasks.log
-```
+The script writes a structured log automatically; stdout carries the
+summary you need below.
 
 This will:
 
@@ -84,7 +81,7 @@ This will:
 After generation, run the check script again:
 
 ```bash
-python3 .rpgkit/scripts/check_tasks.py --json
+rpgkit script check_tasks.py --json
 ```
 
 Verify:

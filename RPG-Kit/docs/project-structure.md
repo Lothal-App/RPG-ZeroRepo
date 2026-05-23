@@ -4,9 +4,9 @@
 
 RPG-Kit installs alongside your project code: the directory you run `rpgkit init` in, also called the workspace root, **is** the project repository root. There is no separate `repo/` subdirectory. This means:
 
-- `rpgkit init my-project` creates `my-project/` containing both your source code (`src/`, `tests/`, `docs/`) and RPG-Kit's runtime files (`.rpgkit/`, `.claude/`, `.github/`, `.vscode/`, depending on the selected agent).
+- `rpgkit init my-project` creates `my-project/` containing both your source code (`src/`, `tests/`, `docs/`) and RPG-Kit's in-workspace configuration files (`.rpgkit/config.toml`, `.claude/`, `.github/`, `.vscode/`, depending on the selected agent).
 - `rpgkit init --here` inside an existing git repository adds RPG-Kit on top of the existing code without moving the repository.
-- A single `.git` repository tracks user-owned code and any RPG-Kit files the user chooses to commit. Runtime data under `.rpgkit/data/` is gitignored by default.
+- A single `.git` repository tracks user-owned code and any RPG-Kit files the user chooses to commit. **Runtime data, logs, and the inner-git snapshot repo all live outside the workspace** under `~/.rpgkit/workspaces/<workspace-id>/`, so generated artefacts don't pollute your repo or accidentally get committed. Only a small set of user-facing files (`.rpgkit/config.toml`, `.rpgkit/reports/*.html`) stay inside the workspace.
 
 ## After `rpgkit init`
 
@@ -40,58 +40,58 @@ my-project/
 │   ├── mcp.json                        # MCP server registration
 │   └── tasks.json                      # Optional workspace tasks
 └── .rpgkit/
-    ├── scripts/                        # Pipeline scripts and support packages
-    │   ├── feature_spec_to_json.py      # Feature specification
-    │   ├── feature_build.py
-    │   ├── feature_build_validation.py
-    │   ├── feature_refactor.py
-    │   ├── feature_refactor_validation.py
-    │   ├── feature_edit.py
-    │   ├── feature_edit_validation.py
-    │   ├── build_skeleton.py            # RPG construction
-    │   ├── check_skeleton.py
-    │   ├── summary_skeleton.py
-    │   ├── build_data_flow.py
-    │   ├── check_data_flow.py
-    │   ├── generate_viz.py
-    │   ├── design_base_classes.py
-    │   ├── check_base_classes.py
-    │   ├── design_interfaces.py
-    │   ├── check_interfaces.py
-    │   ├── plan_tasks.py
-    │   ├── check_tasks.py
-    │   ├── init_codebase.py             # Code generation
-    │   ├── run_batch.py                 # TDD batch executor, final test, global review
-    │   ├── check_code_gen.py
-    │   ├── update_graphs.py             # Incremental RPG and dependency graph updates
-    │   ├── mcp_server.py                # rpg-tools MCP server
-    │   ├── code_gen/                    # Code generation subpackage
-    │   ├── common/                      # Shared utilities and path definitions
-    │   ├── feature/                     # Feature processing
-    │   ├── func_design/                 # Function/interface design agents
-    │   ├── skeleton/                    # Skeleton building
-    │   ├── rpg/                         # RPG models, services, graph query engine
-    │   ├── rpg_edit/                    # Surgical RPG/code edit pipeline
-    │   └── rpg_encoder/                 # Reverse encoder
-    │       ├── check_encode.py          # Pre-check rpg.json state
-    │       ├── run_encode.py            # Full encode
-    │       ├── run_update_rpg.py        # Incremental update implementation
-    │       ├── rpg_encoding.py          # RPG encoding pipeline
-    │       ├── rpg_evolution.py         # Incremental RPG evolution
-    │       ├── semantic_parsing.py      # Semantic feature extraction
-    │       └── refactor_tree.py         # Feature tree refactoring
-    ├── data/                            # Runtime artifacts, populated by commands
-    ├── logs/                            # Per-stage logs
-    └── reports/                         # Review and diagnostic reports when generated
+│   ├── config.toml                     # Workspace AI / config (committed). See docs/configuration.md
+│   ├── .source                         # Provisioning channel marker: "bundle" or "legacy"
+│   └── reports/                        # User-facing HTML reports (rpg.html, review HTML, ...)
+└── .git/                               # Your existing git repo
+    └── hooks/                          # Installed by `rpgkit init`
+        ├── post-commit                 # Single line: `rpgkit hook post-commit`
+        └── post-merge                  # Single line: `rpgkit hook post-merge`
 ```
+
+### Out-of-workspace runtime store
+
+Starting from the global-install layout, all runtime state lives under your home directory, keyed by a path-derived **slug** (the workspace's absolute path, lowercased, with non-alphanumeric runs collapsed to `-`):
+
+```text
+~/.rpgkit/workspaces/<workspace-id>/
+├── .git/        # Inner-git snapshot repo (per-stage auto-commits)
+├── .gitignore   # Excludes logs/copilot/ only — other logs are tracked for debug
+├── .meta.toml   # Back-pointer to the workspace path + metadata
+├── data/        # Runtime artifacts (rpg.json, dep_graph.json, ...)
+└── logs/        # Per-stage logs (tracked by inner-git; LLM session traces under logs/copilot/ are excluded)
+```
+
+Reports (`rpg.html`, review HTML, …) stay **inside** the workspace at `<workspace>/.rpgkit/reports/` because they are small, user-facing artefacts that benefit from sitting next to the code (and may be committed).
+
+`<workspace-id>` is normally the slug itself (e.g. `home-hys-projects-myrepo`); paths whose slug exceeds 200 characters are truncated and given a 6-char base36 SHA-256 suffix so the directory name fits comfortably under POSIX `NAME_MAX` (255). Same shape as Claude Code's `~/.claude/projects/`. Moving or renaming the workspace yields a different id, so each clone has independent state. Run `rpgkit version` from inside the workspace to see the resolved paths (the **Data**, **Logs**, and **Inner git** lines). For backward compatibility, workspaces created before 0.1.4 (which used a 12-hex-char SHA-256 hash directory) continue to resolve correctly.
+
+> Pipeline scripts (formerly materialised into `.rpgkit/scripts/`) now live inside the installed `rpgkit-cli` wheel under `rpgkit_cli/core_pack/scripts/` and are invoked via the global [`rpgkit script <name>`](cli-reference.md) command. They are no longer copied into each workspace, so `rpgkit init` produces a much smaller footprint and a single source of truth per CLI install.
 
 The agent configuration directory varies by the selected AI assistant and release package. For the verified CLI path, `--ai claude` installs `.claude/commands/`, while `--ai copilot` installs `.github/agents/`, `.github/prompts/`, and `.vscode/mcp.json`.
 
-Command definitions are installed into the AI-agent-specific folder. Normal users should not need to edit `.rpgkit/scripts/` or `.rpgkit/data/` manually.
+Command definitions are installed into the AI-agent-specific folder. Normal users should not need to inspect `~/.rpgkit/workspaces/<workspace-id>/data/` directly—run `rpgkit version` from the workspace to see all relevant paths.
+
+### Quick reference: where does each file live?
+
+| Artefact | Location |
+|---|---|
+| Your source code | `<workspace>/` |
+| Workspace AI config | `<workspace>/.rpgkit/config.toml` |
+| User-facing HTML reports (`rpg.html`, …) | `<workspace>/.rpgkit/reports/` |
+| Agent command definitions | `<workspace>/.claude/` or `<workspace>/.github/` |
+| MCP / VS Code config | `<workspace>/.vscode/` |
+| Git hooks (`post-commit`, `post-merge`) | `<workspace>/.git/hooks/` |
+| Generated data (`rpg.json`, `dep_graph.json`, …) | `~/.rpgkit/workspaces/<workspace-id>/data/` |
+| Per-stage logs | `~/.rpgkit/workspaces/<workspace-id>/logs/` |
+| Inner-git snapshot repo | `~/.rpgkit/workspaces/<workspace-id>/.git/` |
+| Pipeline scripts (read-only) | inside the installed `rpgkit-cli` wheel |
+
+To see the resolved paths for the current workspace, run `rpgkit version` from anywhere inside it.
 
 ## Generated Data Files
 
-As you run `/rpgkit.*` commands, `.rpgkit/data/` is progressively populated:
+As you run `/rpgkit.*` commands, `~/.rpgkit/workspaces/<workspace-id>/data/` is progressively populated (paths below are shown relative to that directory):
 
 | Generated file | Command | Description |
 | -------------- | ------- | ----------- |
@@ -144,11 +144,13 @@ Typical producers and updaters:
 
 ## Runtime Logs and Reports
 
-Runtime logs are written under `.rpgkit/logs/`, for example:
+Runtime logs are written under `~/.rpgkit/workspaces/<workspace-id>/logs/`, for example:
 
-- `.rpgkit/logs/encode.log`
-- `.rpgkit/logs/update_rpg.log`
-- `.rpgkit/logs/feature_build.log`
-- `.rpgkit/logs/build_data_flow.log`
+- `~/.rpgkit/workspaces/<workspace-id>/logs/encode.log`
+- `~/.rpgkit/workspaces/<workspace-id>/logs/update_rpg.log`
+- `~/.rpgkit/workspaces/<workspace-id>/logs/feature_build.log`
+- `~/.rpgkit/workspaces/<workspace-id>/logs/build_data_flow.log`
 
-Execution traces are written under `.rpgkit/data/trajectory/`. Review or diagnostic artifacts may be written under `.rpgkit/reports/` when a command generates them.
+Execution traces are written under `~/.rpgkit/workspaces/<workspace-id>/data/trajectory/`. Review or diagnostic artifacts may be written under `<workspace>/.rpgkit/reports/` when a command generates them.
+
+To discover the home-side paths (data / logs / inner-git) for the current workspace, run `rpgkit version` from anywhere inside it—the relevant lines are labelled **Workspace**, **Data**, **Logs**, and **Inner git**.

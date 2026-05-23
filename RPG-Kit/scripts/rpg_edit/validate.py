@@ -25,7 +25,6 @@ def main():
     args = parser.parse_args()
 
     # Capture log records for post-mortem inspection of rpg_edit issues.
-    # See plans/20260508-1-rpgkit-optimization*.md § E1.
     from common.logging_setup import setup_file_logging
     setup_file_logging("rpg_edit")
 
@@ -48,7 +47,7 @@ def main():
     if not has_dep_graph and not args.dep_graph.exists():
         result = {"type": "error", "error_code": "dep_graph_not_found",
                   "message": f"dep_graph.json not found: {args.dep_graph}. "
-                             "Run `python3 .rpgkit/scripts/update_graphs.py sync` "
+                             "Run `rpgkit script update_graphs.py sync` "
                              "to build it from the current code."}
         print(json.dumps(result) if args.json else f"Error: {result['message']}")
         return 1
