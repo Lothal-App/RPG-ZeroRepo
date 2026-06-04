@@ -133,15 +133,9 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=Coder
 4. फॉरवर्ड पाइपलाइन चलाएँ:
 
    ```text
-   /cmind.feature_spec <feature description>
-   /cmind.feature_build
-   /cmind.feature_refactor
+   /cmind.feature_construct <feature description>
    [Optional] /cmind.feature_edit <edit instructions>
-   /cmind.build_skeleton
-   /cmind.build_data_flow
-   /cmind.design_base_classes
-   /cmind.design_interfaces
-   /cmind.plan_tasks
+   /cmind.plan
    /cmind.code_gen
    [Optional] /cmind.rpg_edit <edit instructions>
    ```
@@ -149,8 +143,8 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=Coder
 > [!IMPORTANT]
 > **हर Coding Agent का इनवोकेशन थोड़ा अलग होता है**:
 >
-> - **Claude Code**: चैट में सीधे `/cmind.feature_spec ...` टाइप करें — slash command पहचाने जाते हैं और संबंधित workflow ट्रिगर हो जाता है।
-> - **GitHub Copilot CLI**: slash command समर्थित नहीं हैं (कस्टम agent समर्थित हैं), इसलिए पहले `/agent cmind.feature_spec` से लक्ष्य agent पर स्विच करें, फिर `start` टाइप करके इसका अंतर्निहित workflow चलाएँ।
+> - **Claude Code**: चैट में सीधे `/cmind.feature_construct ...` टाइप करें — slash command पहचाने जाते हैं और संबंधित workflow ट्रिगर हो जाता है।
+> - **GitHub Copilot CLI**: slash command समर्थित नहीं हैं (कस्टम agent समर्थित हैं), इसलिए पहले `/agent cmind.feature_construct` से लक्ष्य agent पर स्विच करें, फिर `start` टाइप करके इसका अंतर्निहित workflow चलाएँ।
 
 CoderMind क्रमिक रूप से `~/.cmind/workspaces/<workspace-id>/data/rpg.json` बनाता है और इसका उपयोग आवश्यकताओं, प्लानिंग आउटपुट, जनरेटेड कोड और dependency जानकारी को संरेखित रखने के लिए करता है। आपके वर्कस्पेस की स्रोत फ़़ाइलें दूषित नहीं होंगी।
 
@@ -192,7 +186,7 @@ CoderMind क्रमिक रूप से `~/.cmind/workspaces/<workspace-id
 
 ```text
 my-project/
-├── docs/                 # /cmind.feature_spec के लिए वैकल्पिक आवश्यकता दस्तावेज़
+├── docs/                 # /cmind.feature_construct के लिए वैकल्पिक आवश्यकता दस्तावेज़
 ├── .github/ or .claude/  # Coding Agent कमांड परिभाषाएँ और सेटिंग्स
 ├── .vscode/              # लागू होने पर Copilot/VS Code MCP कॉन्फ़िगरेशन
 ├── .cmind/              # जनरेटेड रिपोर्ट और कॉन्फ़िगरेशन फ़ाइलें
@@ -241,7 +235,7 @@ cmind update
 
 ## आगामी सुविधाएँ
 
-- **सरल जनरेशन कमांड्स:** वर्तमान बहु-चरण जनरेशन प्रवाह को कम कमांड्स में मर्ज किया जाएगा, जैसे `/cmind.generate_repo`, `/cmind.generate_feature` और `/cmind.plan`।
+- **सरल जनरेशन कमांड्स:** वर्तमान बहु-चरण जनरेशन प्रवाह को कम कमांड्स में मर्ज किया जाएगा, जैसे `/cmind.generate_repo` और `/cmind.generate_feature`। `/cmind.plan` 0.1.4 में रिलीज़ हो चुका है।
 - **बहु-भाषा समर्थन:** Go, C++, Rust, JavaScript/TypeScript और अन्य के लिए समर्थन जोड़ा जाएगा।
 - **अधिक प्लेटफ़ॉर्म एकीकरण:** विभिन्न सिस्टम्स पर विभिन्न AI कोडिंग एजेंट्स के लिए CLI और VS Code एक्सटेंशन वर्कफ़्लो में CoderMind समर्थन।
 

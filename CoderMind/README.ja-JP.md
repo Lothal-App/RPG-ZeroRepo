@@ -133,15 +133,9 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=Coder
 4. フォワードパイプラインを実行します:
 
    ```text
-   /cmind.feature_spec <feature description>
-   /cmind.feature_build
-   /cmind.feature_refactor
+   /cmind.feature_construct <feature description>
    [Optional] /cmind.feature_edit <edit instructions>
-   /cmind.build_skeleton
-   /cmind.build_data_flow
-   /cmind.design_base_classes
-   /cmind.design_interfaces
-   /cmind.plan_tasks
+   /cmind.plan
    /cmind.code_gen
    [Optional] /cmind.rpg_edit <edit instructions>
    ```
@@ -149,8 +143,8 @@ uvx --from "git+https://github.com/microsoft/RPG-ZeroRepo.git#subdirectory=Coder
 > [!IMPORTANT]
 > **コーディングエージェントごとに呼び出し方が異なります**：
 >
-> - **Claude Code**：チャットにそのまま `/cmind.feature_spec ...` と入力します。slash command が認識され、対応する workflow がトリガーされます。
-> - **GitHub Copilot CLI**：slash command はサポートされません（カスタム agent はサポート）。まず `/agent cmind.feature_spec` で目的の agent に切り替え、その後 `start` と入力して内蔵の workflow を実行します。
+> - **Claude Code**：チャットにそのまま `/cmind.feature_construct ...` と入力します。slash command が認識され、対応する workflow がトリガーされます。
+> - **GitHub Copilot CLI**：slash command はサポートされません（カスタム agent はサポート）。まず `/agent cmind.feature_construct` で目的の agent に切り替え、その後 `start` と入力して内蔵の workflow を実行します。
 
 CoderMind は `~/.cmind/workspaces/<workspace-id>/data/rpg.json` を段階的に作成し、それを使って要件・計画成果物・生成コード・依存情報を整合した状態に保ちます。ワークスペースのソースファイルは汚染されません。
 
@@ -192,7 +186,7 @@ CoderMind は `~/.cmind/workspaces/<workspace-id>/data/rpg.json` を段階的に
 
 ```text
 my-project/
-├── docs/                 # /cmind.feature_spec 用の任意の要件ドキュメント
+├── docs/                 # /cmind.feature_construct 用の任意の要件ドキュメント
 ├── .github/ or .claude/  # Coding Agent のコマンド定義と設定
 ├── .vscode/              # 該当する場合の Copilot/VS Code MCP 設定
 ├── .cmind/              # 生成されたレポートと設定ファイル
@@ -241,7 +235,7 @@ cmind update
 
 ## 今後の機能
 
-- **よりシンプルな生成コマンド:** 現在の多段階の生成フローを、`/cmind.generate_repo`、`/cmind.generate_feature`、`/cmind.plan` などのより少ないコマンドにまとめます。
+- **よりシンプルな生成コマンド:** 現在の多段階の生成フローを、`/cmind.generate_repo` や `/cmind.generate_feature` などのより少ないコマンドにまとめます。`/cmind.plan` は 0.1.4 でリリース済みです。
 - **多言語サポート:** Go、C++、Rust、JavaScript/TypeScript などのサポートを追加します。
 - **より多くのプラットフォーム連携:** さまざまなシステム上の異なる AI コーディングエージェントについて、CLI と VS Code 拡張ワークフローを横断して CoderMind をサポートします。
 

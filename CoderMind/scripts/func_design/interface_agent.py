@@ -83,6 +83,26 @@ class FileImplementationGraph(BaseModel):
 # Dependency Collector
 # ============================================================================
 
+def _dedup_edges_in_place(edges: List[Dict[str, Any]], key_fields: Tuple[str, ...]) -> int:
+    """Remove duplicate edges in place (first-seen wins). Returns count removed.
+
+    Edges are identified by the tuple of values for ``key_fields``. The first
+    occurrence is kept (preserving earliest ``generator`` provenance).
+    """
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for e in edges:
+        key = tuple(e.get(f) for f in key_fields)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(e)
+    removed = len(edges) - len(deduped)
+    if removed:
+        edges[:] = deduped  # mutate in place to keep shared references valid
+    return removed
+
+
 class DependencyCollector:
     """Collect fine-grained dependencies discovered during interface design.
     
@@ -116,7 +136,17 @@ class DependencyCollector:
         source_file: str,
         parent_file: Optional[str] = None
     ):
-        """Add an inheritance relationship (child extends parent)."""
+        """Add an inheritance relationship (child extends parent).
+
+        Duplicate (child, parent, source_file, parent_file) entries are
+        skipped so repeated calls from AST + LLM paths don't double-count.
+        """
+        for existing in self.inheritance_edges:
+            if (existing.get("child") == child_class
+                and existing.get("parent") == parent_class
+                and existing.get("source_file") == source_file
+                and existing.get("parent_file") == parent_file):
+                return
         self.inheritance_edges.append({
             "child": child_class,
             "parent": parent_class,
@@ -134,14 +164,25 @@ class DependencyCollector:
         callee_file: Optional[str] = None
     ):
         """Add an invocation relationship (caller calls callee).
-        
+
         Self-calls (same bare name + same or unknown file) are silently skipped.
+        Duplicate edges (same caller/callee/files) are also skipped so
+        callers can safely invoke this from multiple paths (AST inspection,
+        LLM declarations, global-review fixes) without inflating counts.
         """
         # --- self-call filter ---
         bare_caller = caller.split(" ", 1)[-1] if " " in caller else caller
         bare_callee = callee.split(" ", 1)[-1] if " " in callee else callee
         if bare_caller == bare_callee and (callee_file is None or callee_file == caller_file):
             return
+
+        # --- duplicate filter: ignore identical (caller, callee, files) ---
+        for existing in self.invocation_edges:
+            if (existing.get("caller") == caller
+                and existing.get("callee") == callee
+                and existing.get("caller_file") == caller_file
+                and existing.get("callee_file") == callee_file):
+                return
 
         self.invocation_edges.append({
             "caller": caller,
@@ -151,7 +192,7 @@ class DependencyCollector:
             "edge_type": "invokes",
             "generator": "design_interfaces"
         })
-    
+
     def add_reference(
         self,
         unit_name: str,
@@ -159,7 +200,17 @@ class DependencyCollector:
         source_file: str,
         type_file: Optional[str] = None
     ):
-        """Add a type reference relationship."""
+        """Add a type reference relationship.
+
+        Duplicate (unit, referenced_type, source_file, type_file) entries
+        are skipped so AST and LLM-declared references don't double-count.
+        """
+        for existing in self.reference_edges:
+            if (existing.get("unit") == unit_name
+                and existing.get("referenced_type") == referenced_type
+                and existing.get("source_file") == source_file
+                and existing.get("type_file") == type_file):
+                return
         self.reference_edges.append({
             "unit": unit_name,
             "referenced_type": referenced_type,
@@ -323,15 +374,71 @@ class DependencyCollector:
 
             cleaned.append(edge)
 
-        self.invocation_edges = cleaned
+        # --- 4. Dedup: drop exact-duplicate invocation edges -------------
+        # Two sources can emit the same edge: AST inspection
+        # (`analyze_code_dependencies`) and LLM declarations
+        # (`process_llm_dependencies`). Without this pass duplicates
+        # silently inflate `incoming` counts and can mask real orphans.
+        seen: Set[Tuple[str, str, Optional[str], Optional[str]]] = set()
+        deduped: List[Dict[str, Any]] = []
+        for edge in cleaned:
+            key = (
+                edge.get("caller", ""),
+                edge.get("callee", ""),
+                edge.get("caller_file"),
+                edge.get("callee_file"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(edge)
+        removed_count = len(cleaned) - len(deduped)
+        if removed_count:
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "[DependencyCollector] post_process_edges deduped "
+                "%d / %d invocation edges",
+                removed_count, len(cleaned),
+            )
+        self.invocation_edges = deduped
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert collected dependencies to dictionary."""
+        """Convert collected dependencies to dictionary.
+
+        Performs a final in-place dedup on each edge bucket as a backstop:
+        callers (especially ``_apply_fixes`` / ``_apply_add_interface``)
+        sometimes append edges directly to the lists returned by an earlier
+        ``to_dict()`` call (shared references) before re-feeding via
+        ``add_invocation``. Without this pass, the same edge appended directly
+        and then re-added via ``add_invocation`` could appear twice if the
+        write-time dedup in ``add_invocation`` were ever bypassed.
+
+        In-place mutation preserves shared list references so downstream
+        callers holding the prior result still see the deduped contents.
+        """
+        inh_removed = _dedup_edges_in_place(
+            self.inheritance_edges,
+            ("child", "parent", "source_file", "parent_file"),
+        )
+        inv_removed = _dedup_edges_in_place(
+            self.invocation_edges,
+            ("caller", "callee", "caller_file", "callee_file"),
+        )
+        ref_removed = _dedup_edges_in_place(
+            self.reference_edges,
+            ("unit", "referenced_type", "source_file", "type_file"),
+        )
+        if inh_removed or inv_removed or ref_removed:
+            logging.getLogger(__name__).info(
+                f"[DependencyCollector.to_dict] Final dedup removed "
+                f"{inh_removed} inheritance / {inv_removed} invocation / "
+                f"{ref_removed} reference duplicate edges"
+            )
         return {
             "original_edges": self.original_edges,
             "inheritance_edges": self.inheritance_edges,
             "invocation_edges": self.invocation_edges,
-            "reference_edges": self.reference_edges
+            "reference_edges": self.reference_edges,
         }
     
     def get_summary(self) -> Dict[str, int]:
@@ -396,6 +503,33 @@ class GlobalInterfaceRegistry:
         self.function_to_file: Dict[str, str] = {}
         # file_path -> list of unit info dicts
         self.file_units: Dict[str, List[Dict[str, Any]]] = {}
+        self._logger = logging.getLogger(__name__)
+
+    def _register_symbol(
+        self,
+        index: Dict[str, str],
+        symbol_kind: str,
+        name: str,
+        file_path: str,
+    ) -> None:
+        """Assign ``index[name] = file_path``, warning if it silently overrides
+        a different existing entry.
+
+        Same-named top-level symbols across files are uncommon but legal
+        (e.g. helper ``Repository`` / ``Manager`` per module). The current
+        single-valued maps lose all but one — this helper at least makes
+        the loss visible in logs so debuggers can spot ambiguous resolutions.
+        A full multi-value fix is tracked separately.
+        """
+        existing = index.get(name)
+        if existing and existing != file_path:
+            self._logger.warning(
+                "[GlobalInterfaceRegistry] %s name collision: '%s' already "
+                "registered to %s, now overwritten by %s. Cross-subtree "
+                "callee resolution may pick the wrong file.",
+                symbol_kind, name, existing, file_path,
+            )
+        index[name] = file_path
     
     def register_from_subtree_result(
         self,
@@ -424,11 +558,11 @@ class GlobalInterfaceRegistry:
                 if unit_name.startswith("class "):
                     unit_type = "class"
                     bare_name = unit_name[len("class "):]
-                    self.class_to_file[bare_name] = file_path
+                    self._register_symbol(self.class_to_file, "class", bare_name, file_path)
                 elif unit_name.startswith("function "):
                     unit_type = "function"
                     bare_name = unit_name[len("function "):]
-                    self.function_to_file[bare_name] = file_path
+                    self._register_symbol(self.function_to_file, "function", bare_name, file_path)
                 else:
                     unit_type = "unknown"
                     bare_name = unit_name
@@ -452,7 +586,53 @@ class GlobalInterfaceRegistry:
                 if file_path not in self.file_units:
                     self.file_units[file_path] = []
                 self.file_units[file_path].extend(file_unit_list)
-    
+
+    def register_unit(
+        self,
+        file_path: str,
+        unit_name: str,
+        subtree_name: str,
+        features: Optional[List[str]] = None,
+        signature_summary: str = "",
+    ) -> bool:
+        """Idempotently register a single new unit.
+
+        Used by ``InterfaceReviewer._apply_add_interface`` to plug a handler-added
+        interface into the registry without re-running the bulk
+        ``register_from_subtree_result`` pass on an already-registered subtree.
+
+        Returns:
+            True if newly registered, False if a unit with the same
+            ``(file_path, unit_name)`` already exists.
+        """
+        existing = self.units.get(unit_name)
+        if existing is not None and existing.get("file_path") == file_path:
+            return False
+
+        if unit_name.startswith("class "):
+            unit_type = "class"
+            bare_name = unit_name[len("class "):]
+            self._register_symbol(self.class_to_file, "class", bare_name, file_path)
+        elif unit_name.startswith("function "):
+            unit_type = "function"
+            bare_name = unit_name[len("function "):]
+            self._register_symbol(self.function_to_file, "function", bare_name, file_path)
+        else:
+            unit_type = "unknown"
+            bare_name = unit_name
+
+        unit_info = {
+            "file_path": file_path,
+            "subtree_name": subtree_name,
+            "unit_type": unit_type,
+            "bare_name": bare_name,
+            "signature_summary": signature_summary,
+            "features": list(features) if features else [],
+        }
+        self.units[unit_name] = unit_info
+        self.file_units.setdefault(file_path, []).append(unit_info)
+        return True
+
     def resolve_callee(self, callee_name: str) -> Optional[str]:
         """Resolve a callee name to its file_path across all registered subtrees.
         
@@ -1731,18 +1911,42 @@ class InterfaceOrchestrator:
                 max_iterations=self.max_file_iterations,
                 logger=self.logger
             )
-            
-            file_results = agent.design_subtree_interfaces(
-                file_nodes=file_nodes,
-                file_order=file_order,
-                repo_info=repo_info,
-                data_flow_str=filtered_data_flow_str,
-                base_classes_str=base_classes_str,
-                upstream_context=upstream_context,
-                dependency_collector=dependency_collector,
-                base_class_files=base_class_files,
-                subtree_name=subtree_name,
-            )
+
+            # Layer-2 retry: if the agent's internal 10-iteration loop
+            # leaves any file with no units, give the whole subtree ONE
+            # second chance. This is the simple variant — attempt 2
+            # reruns the entire subtree (not just failed files). The
+            # cost (extra LLM round) is bounded and only paid when at
+            # least one file actually failed, which is rare in practice.
+            max_subtree_attempts = 2
+            file_results: Dict[str, Any] = {}
+            for attempt in range(max_subtree_attempts):
+                file_results = agent.design_subtree_interfaces(
+                    file_nodes=file_nodes,
+                    file_order=file_order,
+                    repo_info=repo_info,
+                    data_flow_str=filtered_data_flow_str,
+                    base_classes_str=base_classes_str,
+                    upstream_context=upstream_context,
+                    dependency_collector=dependency_collector,
+                    base_class_files=base_class_files,
+                    subtree_name=subtree_name,
+                )
+                failed_paths = [
+                    fp for fp, r in file_results.items()
+                    if fp != "__new_features__"
+                    and isinstance(r, dict)
+                    and not r.get("units")
+                ]
+                if not failed_paths:
+                    break
+                if attempt + 1 < max_subtree_attempts:
+                    self.logger.warning(
+                        f"[InterfaceOrchestrator] Subtree '{subtree_name}' "
+                        f"left {len(failed_paths)} file(s) without units "
+                        f"after attempt {attempt + 1}/{max_subtree_attempts}; "
+                        f"retrying whole subtree once. Failed: {failed_paths[:5]}"
+                    )
 
             # Extract new features from this subtree
             subtree_new_features = file_results.pop("__new_features__", [])

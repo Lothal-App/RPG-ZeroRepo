@@ -1,6 +1,6 @@
 # /cmind Commands Reference
 
-CoderMind provides 13 slash commands that work in three paths:
+CoderMind provides 15 slash commands that work in three paths:
 
 - **Forward pipeline:** Requirements → Repository Planning Graph (RPG) → Code
 - **Reverse encoder:** Existing code → RPG
@@ -14,20 +14,30 @@ CoderMind provides 13 slash commands that work in three paths:
 
 | Command | Description |
 | ------- | ----------- |
+| `/cmind.feature_construct <desc>` | Run Phase 1 feature specification, build, and refactor in one step — recommended |
 | `/cmind.feature_spec <desc>` | Create structured feature specifications from user input or `docs/` files |
 | `/cmind.feature_build` | Generate and expand the feature tree from specifications |
 | `/cmind.feature_refactor` | Refactor feature tree into modular component architecture |
 | `/cmind.feature_edit <instr>` | Edit feature tree nodes before skeleton planning — optional |
 
+> `/cmind.feature_construct` is the simplest way to drive Phase 1 end-to-end. Use
+> the individual Phase 1 commands only when you want to debug or re-run a
+> specific stage.
+
 ### Phase 2: RPG Construction and Planning
 
 | Command | Description |
 | ------- | ----------- |
+| `/cmind.plan` | Run all five Phase-2 stages in one step with automatic resume — recommended |
 | `/cmind.build_skeleton` | Build repository file skeleton from component architecture; creates `.cmind/data/rpg.json` |
 | `/cmind.build_data_flow` | Build inter-component data flow DAG and update the RPG |
 | `/cmind.design_base_classes` | Design shared base classes and data structures |
 | `/cmind.design_interfaces` | Design function/class interfaces with type hints and docstrings |
 | `/cmind.plan_tasks` | Plan dependency-ordered implementation task batches |
+
+> `/cmind.plan` is the simplest way to drive Phase 2 end-to-end. Use
+> the individual commands above only when you want to debug or
+> re-run a specific stage.
 
 ### Phase 3: Code Generation and Surgical Edits
 
@@ -49,31 +59,69 @@ Both directions produce the same RPG structure at `.cmind/data/rpg.json`, enabli
 
 ## Phase 1: Feature Specification
 
+### `/cmind.feature_construct`
+
+Run the full Phase 1 pipeline (`feature_spec` → `feature_build` → `feature_refactor`) in one step. This is the recommended entry point for creating the feature tree that feeds `/cmind.plan`.
+
+**Input modes:**
+
+- **Direct input:** provide requirements after the command.
+- **Auto-detect:** omit input to use existing `docs/*.md` files automatically.
+- **Inline prompt:** if neither direct input nor usable docs exist, the command asks for requirements and then continues in the same flow.
+
+**Output:** the three Phase 1 JSON artefacts — `feature_spec.json`, `feature_build.json`, and `feature_tree.json` — in the CoderMind data store.
+
+**Process:**
+
+1. **Probe progress** — runs `cmind script feature_construct.py --check-only --json` to see which Phase 1 stages already have valid artifacts.
+2. **Generate requirements artifacts when needed** — follows the `/cmind.feature_spec` workflow for direct text or `docs/*.md` sources.
+3. **Run/resume** — executes `cmind script feature_construct.py`, skipping completed stages and cascading downstream rebuilds when an upstream stage reruns.
+4. **Optional expansion** — after completion, the user can expand features through the existing `feature_build --mode suggest-directions` and `--mode step2 --direction <indices>` flow; refactor is rerun afterward so `feature_tree.json` stays aligned.
+
+**CLI flags forwarded after `$ARGUMENTS`:**
+
+- `--check-only` — show Phase 1 progress without modifying artifacts or running stages.
+- `--json` — with `--check-only`, emit the progress report as JSON.
+- `--force` — rebuild all Phase 1 stages.
+- `--dry-run` — print the commands that would run without modifying artifacts.
+- `--verbose` — forward native verbose logging flags.
+- `--no-trajectory` — disable trajectory recording where supported.
+- `--max-iter-refactor N` — forward to `feature_refactor.py` as `--max-iterations N`.
+- `--review-threshold N` — forward to `feature_build.py --mode step1`.
+- `--review-max-iterations N` — forward to `feature_build.py --mode step1`.
+
+Use `--` to separate options from requirement text:
+
+```text
+/cmind.feature_construct --check-only
+/cmind.feature_construct --check-only --json
+/cmind.feature_construct --review-threshold 99 -- Build a CLI tool for managing Docker containers
+/cmind.feature_construct Build a CLI tool for managing Docker containers
+/cmind.feature_construct                  # Auto-detect docs/ files
+```
+
+**Next step:** `/cmind.plan` is the default handoff after Phase 1. If the final tree needs small adjustments, run `/cmind.feature_edit <instructions>`. The granular Phase 1 commands remain available for debug and surgical reruns; `/cmind.build_skeleton` is a Phase 2 granular fallback, not the default next step.
+
+---
+
 ### `/cmind.feature_spec`
 
-Create structured feature specifications from user input or documentation files.
+Generate a structured feature specification from user input or
+documentation files.
+
+> **Recommended workflow:** Use `/cmind.feature_construct` for the
+> end-to-end Phase 1 flow. `/cmind.feature_spec` is the granular
+> single-stage command, kept available for debugging and surgical reruns.
 
 **Input modes:**
 
 - **Direct input:** provide a description after the command
 - **Auto-detect:** omit input to auto-detect `docs/*.md` files
 
-**Output:**
-
-```text
-.cmind/data/feature_spec/
-├── evidence/                # Source evidence files
-│   ├── user_input.md        # From direct user input, or
-│   ├── 01_project_charter.md
-│   └── ...
-├── feature_spec.md          # Meta + Background + NFR
-└── features/                # Feature tree documents
-    ├── FT-001.md
-    ├── FT-002.md
-    └── ...
-```
-
-Also generates `.cmind/data/feature_spec.json`.
+**Output:** `.cmind/data/feature_spec.json` — a Pydantic-validated JSON
+document containing `meta`, `repository_name`, `repository_purpose`,
+`background_and_overview`, `non_functional_requirements`, and a
+recursive `functional_requirements` tree.
 
 **Examples:**
 
@@ -158,6 +206,67 @@ Edit feature tree nodes before repository planning begins.
 ---
 
 ## Phase 2: RPG Construction and Planning
+
+### `/cmind.plan`
+
+Run the full Phase-2 pipeline (`build_skeleton` → `build_data_flow` →
+`design_base_classes` → `design_interfaces` → `plan_tasks`) in one
+step. This is the recommended entry point for Phase 2.
+
+**Input:** `~/.cmind/workspaces/<workspace-id>/data/feature_tree.json` (produced by
+`/cmind.feature_construct` or `/cmind.feature_refactor`)
+
+**Output:** every artifact produced by the five individual commands —
+`skeleton.json`, `data_flow.json`, `base_classes.json`,
+`interfaces.json`, `tasks.json`, plus `rpg.json` and the
+`data_flow_viz.html` visualization.
+
+**Process:**
+
+1. **Probe progress** — runs `cmind script plan.py --check-only --json`
+   to see which stages already have valid artifacts.
+2. **Decide** — based on the probe result, the command prompts you
+   **once** with one of three options:
+    - All five stages already done → `Overwrite` or `Exit`.
+    - Partial progress (some stages done) → `Continue`, `Restart`, or `Exit`.
+    - Fresh workspace → no prompt; runs the full pipeline.
+3. **Run** — executes the chosen mode through `cmind script plan.py`.
+   Each stage's stdout is streamed live and also written to a per-stage
+   log under `~/.cmind/workspaces/<workspace-id>/logs/`.
+4. **Verify** — after every stage's build script, the corresponding
+   `check_*.py` script re-runs to validate the produced artifact. If
+   verification fails the pipeline stops and prints recovery hints.
+
+**Resume semantics:** if you press Ctrl-C halfway through, running
+`/cmind.plan` again automatically resumes from the first incomplete
+stage. When any earlier stage is re-run, every downstream stage is
+rebuilt too so artifacts never drift apart.
+
+**CLI flags forwarded after `$ARGUMENTS`:**
+
+- `--force` — discard existing artifacts and rebuild every stage.
+- `--max-iter-skeleton N`, `--max-iter-data-flow N`,
+  `--max-iter-base-classes N`, `--max-iter-interfaces N` —
+  override iteration counts for the corresponding stage.
+- `--verbose` — forward `--verbose` to every sub-script.
+- `--no-trajectory` — forward `--no-trajectory` where supported.
+
+**Examples:**
+
+```text
+/cmind.plan
+/cmind.plan --verbose
+/cmind.plan --force                    # rebuild everything
+/cmind.plan --max-iter-skeleton 15
+```
+
+To inspect progress without running anything:
+
+```bash
+cmind script plan.py --check-only
+```
+
+---
 
 ### `/cmind.build_skeleton`
 
@@ -458,14 +567,13 @@ See [configuration.md](configuration.md) for MCP registration, auto-approval, ho
 
 ## Data Files
 
-All intermediate data is stored in `.cmind/data/`:
+All intermediate data is stored in `.cmind/data/` (a logical name; the actual files live under `~/.cmind/workspaces/<workspace-id>/data/` — see the note at the top of this document).
 
 | File | Produced by | Description |
 | ---- | ----------- | ----------- |
-| `feature_spec/` | `feature_spec` | Evidence and feature specification documents |
-| `feature_spec.json` | `feature_spec` | Structured feature specification |
-| `feature_build.json` | `feature_build` | Expanded feature tree |
-| `feature_tree.json` | `feature_refactor` / `feature_edit` | Component architecture |
+| `feature_spec.json` | `feature_construct` / `feature_spec` | Structured feature specification |
+| `feature_build.json` | `feature_construct` / `feature_build` | Expanded feature tree |
+| `feature_tree.json` | `feature_construct` / `feature_refactor` / `feature_edit` | Component architecture |
 | `skeleton.json` | `build_skeleton` | File skeleton |
 | `skeleton_summary.txt` | `build_skeleton` | Human-readable skeleton summary |
 | `rpg.json` | `build_skeleton` / `encode`, then updated by later commands | Repository Planning Graph |

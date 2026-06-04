@@ -60,9 +60,21 @@ role in the architecture means they don't need an internal caller. This includes
 - Application entry points: a `MainLoop` class, a CLI `main()` function, an `Application` class
 - Standalone submodules: components that can function independently (e.g., a `TestRunner`, a `Benchmark` harness)
 - Externally-invoked APIs: interfaces designed to be called by external code, plugins, or frameworks
-- Framework callbacks: handlers registered with an event system or framework
+- Framework callbacks: handlers registered with an event system or framework.
+  This explicitly includes (do not omit these):
+  * HTTP route handlers (Flask `@route` / FastAPI / Django view functions) —
+    even if not decorated in the signature, any unit whose role is "respond
+    to an HTTP request" is invoked by the web framework, not by other Python
+    code. Always mark these as entry_points.
+  * CLI subcommand handlers (click commands, argparse callbacks).
+  * Event / signal subscribers, background workers, scheduled job entry
+    functions, message-queue consumers.
+  * Test fixtures / hooks that pytest, unittest, or other test runners
+    invoke automatically.
 
 Use semantic judgment based on the module's role and the project's architecture.
+Lean towards MORE entry points when in doubt — false positives only add an
+"externally invoked" tag, but false negatives create spurious orphan reports.
 
 ### Task 2: Wiring Completeness
 - Does every non-top-level module's output have at least one consumer?
@@ -126,6 +138,16 @@ You must return ONLY a valid JSON object with the following structure (no other 
       "calls_to_add": [
         {"callee": "...", "callee_file": "...", "purpose": "..."}
       ]
+    },
+    {
+      "action": "add_interface",
+      "file_path": "src/.../foo.py",
+      "unit_name": "function bar",
+      "signature": "def bar(arg: T) -> R:",
+      "docstring": "1-3 sentence summary of what this unit does.",
+      "feature_path": "Category/Subcategory/feature name",
+      "incoming_calls_from": ["function caller_a", "class CallerB"],
+      "description": "Why this new interface is required."
     }
   ],
   "pass": true
@@ -135,8 +157,37 @@ Important:
 - "pass" should be true only if there are no orphan modules, no missing wiring,
   and no orchestration gaps.
 - recommended_fixes should contain concrete, actionable fixes.
-- Each fix action must be one of: "add_dependency", "add_interface", "modify_interface"
-- For "add_dependency" fixes, include "calls_to_add" with callee name and file.
+- Each fix action must be one of: "add_dependency", "add_interface", "modify_interface".
+
+Rules for `add_dependency`:
+- include "calls_to_add" with callee name and (if known) file.
+
+Rules for `add_interface` (auto-applied when valid):
+- Use ONLY when no existing unit could possibly serve the role (e.g. a route
+  handler is missing entirely). If two existing units just need to be wired
+  together, use `add_dependency` instead — do NOT invent a new unit.
+- `signature` MUST be a single-line Python def/class header ending with `:`,
+  e.g. `def list_todos() -> Response:` or `class TodoView(MethodView):`.
+- `docstring` MUST be non-empty (1–3 sentences).
+- `unit_name` MUST be prefixed with "function " or "class ".
+- `feature_path` MUST be one of the feature paths declared in the skeleton;
+  do NOT invent new features.
+- `incoming_calls_from` is OPTIONAL but strongly recommended: list the
+  existing unit(s) that should call this new interface, so the review can
+  install the wiring edge in the same step (otherwise the new unit will
+  immediately be reported as orphan).
+
+Rules for `modify_interface`:
+- This action has no auto-handler. Use it sparingly and only for true
+  architectural issues (e.g. breaking a circular import). Each such request
+  will be recorded as `unapplied_fixes` and will block `passed=true`.
+- Do NOT use modify_interface for cases solvable by add_dependency or
+  add_interface.
+
+Cross-cutting rules:
+- Do NOT repeat in this iteration any fix that was reported as unapplied
+  in the previous iteration (see "Previous Review Results" above when
+  present); switch to a different action or omit it.
 """.strip()
 
 
@@ -352,6 +403,65 @@ def check_feature_dependency_coverage(
 
 
 # ============================================================================
+# Handler helpers
+# ============================================================================
+
+# Cheap signature sanity check used by ``_apply_add_interface``.
+#
+# The prompt contract requires ``signature`` to be a single-line Python
+# header ending with ``:`` (e.g. ``def foo(arg: int) -> str:`` or
+# ``class Bar(Base):``). Enforce both shape and terminator so a
+# truncated LLM response like ``def foo(`` cannot be injected as
+# syntactically invalid code into ``file_code``.
+_SIGNATURE_RE = __import__("re").compile(r"^(def |class )[A-Za-z_]\w*\s*\(.*\)\s*(->\s*.+)?\s*:\s*$|^class\s+[A-Za-z_]\w*\s*:\s*$")
+
+
+def _insert_unit_into_file_code(file_code: str, stub: str) -> str:
+    """Insert ``stub`` into ``file_code`` at a safe location.
+
+    Preferred insertion point is **immediately before** any top-level
+    ``if __name__ == "__main__":`` block, so handler-added units do not
+    end up after the module's main guard (which would make them look like
+    they are defined inside the guard or as dead code, depending on the
+    reader's eye).
+
+    Fallbacks (in order):
+    - Append to the end of the file with two blank lines of separation.
+
+    Never raises: a ``SyntaxError`` in ``file_code`` falls through to the
+    append branch so the handler can never crash the review loop.
+    """
+    if not file_code.strip():
+        return stub
+
+    try:
+        tree = ast.parse(file_code)
+    except SyntaxError:
+        return file_code.rstrip() + "\n\n\n" + stub
+
+    main_node: Optional[ast.If] = None
+    for node in tree.body:
+        if (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "__name__"
+        ):
+            main_node = node
+            break
+
+    if main_node is None:
+        return file_code.rstrip() + "\n\n\n" + stub
+
+    lines = file_code.splitlines()
+    insert_at = max(main_node.lineno - 1, 0)  # ast.lineno is 1-based
+    prefix = lines[:insert_at]
+    suffix = lines[insert_at:]
+    # Ensure separation: one blank line before stub, two blank lines after.
+    return "\n".join(prefix + ["", stub.rstrip(), "", ""] + suffix)
+
+
+# ============================================================================
 # Interface Reviewer
 # ============================================================================
 
@@ -385,6 +495,8 @@ class InterfaceReviewer:
         data_flow_edges: List[Dict[str, Any]],
         dependency_collector: Optional[DependencyCollector] = None,
         max_fix_iterations: int = 2,
+        skeleton_features: Optional[Set[str]] = None,
+        rpg_features: Optional[Set[str]] = None,
     ) -> Dict[str, Any]:
         """Run the full global review and fix cycle.
         
@@ -403,7 +515,14 @@ class InterfaceReviewer:
             data_flow_edges: Original data flow DAG edges
             dependency_collector: DependencyCollector for adding new edges
             max_fix_iterations: Maximum number of review-fix cycles
-            
+            skeleton_features: Canonical set of feature paths from skeleton.json.
+                Required for ``add_interface`` handler to validate that an
+                LLM-requested ``feature_path`` is real (not invented).
+            rpg_features: Set of feature paths currently present in
+                ``repo_rpg.json``. ``add_interface`` rejects requests for
+                features that have been pruned from the RPG, because
+                ``update_rpg`` would silently drop them otherwise.
+
         Returns:
             Dict with review results, applied fixes, and updated interfaces_data
         """
@@ -480,30 +599,88 @@ class InterfaceReviewer:
             # Step 4: Apply fixes
             recommended_fixes = llm_review.get("recommended_fixes", [])
             if recommended_fixes:
-                applied_count = self._apply_fixes(
+                fix_stats = self._apply_fixes(
                     fixes=recommended_fixes,
                     interfaces_data=interfaces_data,
                     enhanced_data_flow=enhanced_data_flow,
                     global_registry=global_registry,
                     dependency_collector=dependency_collector,
+                    skeleton_features=skeleton_features or set(),
+                    rpg_features=rpg_features or set(),
                 )
+                review_result["fix_stats"] = fix_stats
+                unapplied_n = len(fix_stats["unapplied"])
+                tail = f" ({unapplied_n} unapplied)" if unapplied_n else ""
                 self.logger.info(
-                    f"[InterfaceReviewer] Applied {applied_count}/{len(recommended_fixes)} fixes"
+                    f"[InterfaceReviewer] Applied {fix_stats['applied_edges']} edge(s) "
+                    f"from {fix_stats['applied_fixes']}/{fix_stats['requested_fixes']} fix request(s)"
+                    + tail
                 )
             else:
                 self.logger.info("[InterfaceReviewer] No fixes recommended, stopping iteration")
                 break
-        
-        # Compile final summary
+
+        # ------------------------------------------------------------------
+        # Final re-check: fixes applied in the LAST iteration were never
+        # re-evaluated inside the loop, so connectivity / feature_orphans
+        # stored in review_history may be stale. Re-run the structural
+        # checks once more against the (now patched) enhanced_data_flow
+        # and use those numbers for the final verdict.
+        # ------------------------------------------------------------------
+        final_entry_points = (
+            review_history[-1]["entry_points"] if review_history else []
+        )
+        final_orphan_units: List[Any] = []
+        final_feature_orphans: List[Any] = []
+        if review_history:
+            final_connectivity = check_call_graph_connectivity(
+                interfaces_data, enhanced_data_flow, final_entry_points
+            )
+            final_feature_orphans = check_feature_dependency_coverage(
+                interfaces_data, enhanced_data_flow, final_entry_points
+            )
+            final_orphan_units = final_connectivity["orphan_units"]
+            self.logger.info(
+                f"[InterfaceReviewer] Final re-check: "
+                f"{len(final_orphan_units)} orphan unit(s), "
+                f"{len(final_feature_orphans)} orphan feature(s)"
+            )
+
+        # Collect unapplied fixes from every iteration (modify_interface /
+        # add_interface requests that have no auto-handler). These block
+        # passed=true because they represent acknowledged-but-unresolved
+        # architectural issues.
+        unapplied_fixes: List[Dict[str, Any]] = []
+        for entry in review_history:
+            stats = entry.get("fix_stats") or {}
+            for u in stats.get("unapplied", []):
+                unapplied_fixes.append({**u, "iteration": entry.get("iteration")})
+
+        last_llm_pass = (
+            review_history[-1]["llm_review"].get("pass", False)
+            if review_history else False
+        )
+        code_passed = (
+            len(final_orphan_units) == 0
+            and len(final_feature_orphans) == 0
+            and len(unapplied_fixes) == 0
+        )
+
         final_result = {
             "review_history": review_history,
-            "final_entry_points": review_history[-1]["entry_points"] if review_history else [],
-            "final_feature_orphans": review_history[-1]["feature_orphans"] if review_history else [],
+            "final_entry_points": final_entry_points,
+            "final_feature_orphans": final_feature_orphans,
+            "final_orphan_units": final_orphan_units,
+            "unapplied_fixes": unapplied_fixes,
             "iterations_run": len(review_history),
-            "passed": (
-                review_history[-1]["llm_review"].get("pass", False)
-                if review_history else False
-            ),
+            # ``last_llm_pass`` is a snapshot taken BEFORE the LLM's own
+            # iteration-N fixes are applied, so it can read FAIL even when
+            # those fixes resolved every issue. The structural ``code_passed``
+            # check runs against the post-fix graph and is authoritative; we
+            # surface ``last_llm_pass`` separately for visibility but do not
+            # gate the overall verdict on it.
+            "last_llm_pass": last_llm_pass,
+            "passed": bool(code_passed),
         }
 
         return final_result
@@ -542,6 +719,39 @@ class InterfaceReviewer:
             prev_llm = last_review.get("llm_review", {})
             prev_orphan_units = last_review.get("orphan_units", [])
             prev_orphan_count = len(last_review.get("feature_orphans", []))
+            prev_fix_stats = last_review.get("fix_stats") or {}
+
+            # Detailed fix accounting so the LLM doesn't blindly repeat
+            # requests we already failed to auto-apply last time.
+            applied_edges = prev_fix_stats.get("applied_edges", 0)
+            applied_fixes = prev_fix_stats.get("applied_fixes", 0)
+            requested_fixes = prev_fix_stats.get(
+                "requested_fixes", len(prev_llm.get("recommended_fixes", []))
+            )
+            unapplied = prev_fix_stats.get("unapplied", []) or []
+
+            applied_line = (
+                f"- Successfully applied: {applied_edges} dependency edge(s) "
+                f"from {applied_fixes}/{requested_fixes} fix request(s)"
+            )
+            if unapplied:
+                # Cap to top 5 to keep prompt small; truncate per-entry desc.
+                lines = ["- Could NOT auto-apply (do NOT request these again — switch to a different action or omit):"]
+                for u in unapplied[:5]:
+                    desc = (u.get("description") or "").strip().replace("\n", " ")
+                    if len(desc) > 120:
+                        desc = desc[:117] + "..."
+                    lines.append(
+                        f"  * [{u.get('action','?')}] "
+                        f"{u.get('file_path','?')}::{u.get('unit_name','?')} "
+                        f"— {u.get('reason','?')}"
+                        + (f"  ({desc})" if desc else "")
+                    )
+                if len(unapplied) > 5:
+                    lines.append(f"  * ... and {len(unapplied) - 5} more")
+                unapplied_block = "\n".join(lines)
+            else:
+                unapplied_block = "- Could NOT auto-apply: (none)"
 
             prev_context = f"""
 ## Previous Review Results (iteration {last_review.get('iteration', '?')})
@@ -549,9 +759,16 @@ class InterfaceReviewer:
 - Orphan modules from LLM: {len(prev_llm.get('orphan_modules', []))}
 - Orphan units (no incoming edges): {len(prev_orphan_units)}
 - Orphan features: {prev_orphan_count}
-- Fixes applied: {len(prev_llm.get('recommended_fixes', []))}
+{applied_line}
+{unapplied_block}
 
-Please review the CURRENT state after fixes were applied and provide updated analysis.
+Please review the CURRENT state after the applied fixes and provide updated
+analysis. For any issue listed above as "could NOT auto-apply", do NOT
+repeat the same request — either pick a different action that the handler
+can apply (e.g. switch `modify_interface` to `add_dependency` /
+`add_interface`), supply the missing fields (e.g. `signature`,
+`docstring`, `feature_path` for `add_interface`), or omit the request and
+accept that aspect of the design as-is.
 """
         
         user_prompt = f"""
@@ -610,19 +827,28 @@ Please perform the review tasks and return the JSON result.
         enhanced_data_flow: Dict[str, Any],
         global_registry: GlobalInterfaceRegistry,
         dependency_collector: Optional[DependencyCollector] = None,
-    ) -> int:
+        skeleton_features: Optional[Set[str]] = None,
+        rpg_features: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
         """Apply recommended fixes from the LLM review.
-        
+
         Supported actions:
-        - add_dependency: Add a call dependency edge
-        - add_interface: (logged as warning — requires manual or future LLM action)
-        - modify_interface: (logged as warning — requires manual or future LLM action)
-        
+        - add_dependency:    Add a call dependency edge (auto-applied)
+        - add_interface:     Materialise a new unit (auto-applied via
+                             ``_apply_add_interface``; requires
+                             ``skeleton_features`` + ``rpg_features``)
+        - modify_interface:  Logged + recorded as unapplied (manual)
+
         Returns:
-            Number of fixes successfully applied
+            Stats dict with keys ``requested_fixes`` (top-level fix count),
+            ``applied_fixes`` (fixes that produced >=1 edge or unit),
+            ``applied_edges`` (total dependency edges added), and
+            ``unapplied`` (list of fixes with no auto-handler).
         """
-        applied = 0
-        
+        applied_edges = 0
+        applied_fixes = 0
+        unapplied: List[Dict[str, Any]] = []
+
         for fix in fixes:
             action = fix.get("action", "")
             file_path = fix.get("file_path", "")
@@ -631,6 +857,9 @@ Please perform the review tasks and return the JSON result.
             
             if action == "add_dependency":
                 calls_to_add = fix.get("calls_to_add", [])
+                edges_added = 0
+                edges_already_existed = 0
+                edges_unresolved = 0
                 for call_info in calls_to_add:
                     callee = call_info.get("callee", "")
                     callee_file = call_info.get("callee_file", "")
@@ -647,65 +876,326 @@ Please perform the review tasks and return the JSON result.
                             f"[InterfaceReviewer] Cannot resolve callee '{callee}' "
                             f"for fix on {file_path}::{unit_name}"
                         )
+                        edges_unresolved += 1
                         continue
                     
                     # Add to enhanced_data_flow
                     inv_edges = enhanced_data_flow.get("invocation_edges", [])
                     
                     # Check if edge already exists
+                    # (must match all four identity fields: same
+                    # callee_name can resolve to different callee_file
+                    # when two unrelated units share a name)
                     exists = any(
                         e.get("caller") == unit_name
                         and e.get("callee") == callee
                         and e.get("caller_file") == file_path
+                        and e.get("callee_file") == callee_file
                         for e in inv_edges
                     )
                     
-                    if not exists:
-                        new_edge = {
-                            "caller": unit_name,
-                            "callee": callee,
-                            "caller_file": file_path,
-                            "callee_file": callee_file,
-                            "edge_type": "invokes",
-                            "generator": "global_review",
-                        }
-                        inv_edges.append(new_edge)
-                        enhanced_data_flow["invocation_edges"] = inv_edges
-                        
-                        # Also add to dependency_collector if available
-                        if dependency_collector:
-                            dependency_collector.add_invocation(
-                                caller=unit_name,
-                                callee=callee,
-                                caller_file=file_path,
-                                callee_file=callee_file,
-                            )
-                        
-                        self.logger.info(
-                            f"[InterfaceReviewer] Added dependency: "
-                            f"{unit_name} ({file_path}) -> {callee} ({callee_file})"
+                    if exists:
+                        edges_already_existed += 1
+                        continue
+
+                    new_edge = {
+                        "caller": unit_name,
+                        "callee": callee,
+                        "caller_file": file_path,
+                        "callee_file": callee_file,
+                        "edge_type": "invokes",
+                        "generator": "global_review",
+                    }
+                    inv_edges.append(new_edge)
+                    enhanced_data_flow["invocation_edges"] = inv_edges
+
+                    # Also add to dependency_collector if available
+                    if dependency_collector:
+                        dependency_collector.add_invocation(
+                            caller=unit_name,
+                            callee=callee,
+                            caller_file=file_path,
+                            callee_file=callee_file,
                         )
-                        applied += 1
-            
+
+                    self.logger.info(
+                        f"[InterfaceReviewer] Added dependency: "
+                        f"{unit_name} ({file_path}) -> {callee} ({callee_file})"
+                    )
+                    applied_edges += 1
+                    edges_added += 1
+                # A fix counts as applied if at least one edge was added OR
+                # all its edges already existed (LLM repeated a prior fix).
+                # Only mark as unapplied when nothing happened AND there were
+                # unresolved callees that actually need attention.
+                if edges_added > 0 or (edges_already_existed > 0 and edges_unresolved == 0):
+                    applied_fixes += 1
+                elif edges_unresolved > 0:
+                    unapplied.append({
+                        "action": action,
+                        "file_path": file_path,
+                        "unit_name": unit_name,
+                        "description": description[:200],
+                        "reason": f"{edges_unresolved} callee(s) could not be resolved",
+                    })
+                # else: empty calls_to_add — silently ignore (LLM bug, not actionable)
+
             elif action == "add_interface":
-                self.logger.warning(
-                    f"[InterfaceReviewer] add_interface fix requested but not auto-applied: "
-                    f"{description} (file: {file_path})"
+                ok, reason, edges_added = self._apply_add_interface(
+                    fix=fix,
+                    interfaces_data=interfaces_data,
+                    enhanced_data_flow=enhanced_data_flow,
+                    global_registry=global_registry,
+                    dependency_collector=dependency_collector,
+                    skeleton_features=skeleton_features or set(),
+                    rpg_features=rpg_features or set(),
                 )
-            
+                if ok:
+                    applied_fixes += 1
+                    applied_edges += edges_added
+                else:
+                    self.logger.warning(
+                        f"[InterfaceReviewer] add_interface fix rejected: "
+                        f"{reason} (file: {file_path}, unit: {unit_name})"
+                    )
+                    unapplied.append({
+                        "action": action,
+                        "file_path": file_path,
+                        "unit_name": unit_name,
+                        "description": description[:200],
+                        "reason": reason,
+                    })
+
             elif action == "modify_interface":
                 self.logger.warning(
                     f"[InterfaceReviewer] modify_interface fix requested but not auto-applied: "
                     f"{description} (file: {file_path}, unit: {unit_name})"
                 )
-            
+                unapplied.append({
+                    "action": action,
+                    "file_path": file_path,
+                    "unit_name": unit_name,
+                    "description": description[:200],
+                    "reason": "modify_interface has no auto-handler",
+                })
+
             else:
                 self.logger.warning(
                     f"[InterfaceReviewer] Unknown fix action: {action}"
                 )
-        
-        return applied
-    
+                unapplied.append({
+                    "action": action,
+                    "file_path": file_path,
+                    "unit_name": unit_name,
+                    "description": description[:200],
+                    "reason": f"unknown action '{action}'",
+                })
+
+        return {
+            "requested_fixes": len(fixes),
+            "applied_fixes": applied_fixes,
+            "applied_edges": applied_edges,
+            "unapplied": unapplied,
+        }
+
+    def _apply_add_interface(
+        self,
+        fix: Dict[str, Any],
+        interfaces_data: Dict[str, Any],
+        enhanced_data_flow: Dict[str, Any],
+        global_registry: GlobalInterfaceRegistry,
+        dependency_collector: Optional[DependencyCollector],
+        skeleton_features: Set[str],
+        rpg_features: Set[str],
+    ) -> Tuple[bool, str, int]:
+        """Materialise an LLM-requested new interface unit into interfaces_data.
+
+        Required fix fields:
+            - ``file_path``: must already exist as a key under some subtree
+            - ``unit_name``: prefixed with ``"function "`` or ``"class "``
+            - ``signature``: full Python signature (e.g. ``def foo() -> None:``)
+            - ``docstring``: non-empty, 1-3 sentences
+            - ``feature_path``: must be present in BOTH ``skeleton_features``
+              and ``rpg_features`` (the latter ensures ``update_rpg`` will
+              find a target node for the ``meta.path`` write-back)
+
+        Optional:
+            - ``incoming_calls_from``: list of caller unit names; for each
+              caller resolvable via ``global_registry.resolve_callee``, an
+              invocation edge is added. Unresolvable callers are logged but
+              do NOT block the unit from being added.
+
+        Idempotent on ``(file_path, unit_name)``: a second invocation
+        returns ``(False, "unit already exists (idempotent skip)", 0)``.
+
+        Returns:
+            ``(applied, reason, edges_added)``. ``reason`` is empty on
+            success; ``edges_added`` is the number of incoming invocation
+            edges materialised (0 if no ``incoming_calls_from``).
+        """
+        file_path = str(fix.get("file_path", "")).strip()
+        unit_name = str(fix.get("unit_name", "")).strip()
+        signature = str(fix.get("signature", "")).strip()
+        docstring = str(fix.get("docstring", "")).strip()
+        feature_path = str(fix.get("feature_path", "")).strip()
+        incoming = fix.get("incoming_calls_from") or []
+        if not isinstance(incoming, list):
+            incoming = []
+
+        # --- Required-field validation ------------------------------------
+        missing = [
+            name for name, val in (
+                ("file_path", file_path),
+                ("unit_name", unit_name),
+                ("signature", signature),
+                ("docstring", docstring),
+                ("feature_path", feature_path),
+            ) if not val
+        ]
+        if missing:
+            return False, f"missing required field(s): {missing}", 0
+
+        if not (unit_name.startswith("function ") or unit_name.startswith("class ")):
+            return (
+                False,
+                "unit_name must start with 'function ' or 'class '",
+                0,
+            )
+
+        if not _SIGNATURE_RE.match(signature) or "\n" in signature:
+            return False, f"signature must be a single-line Python def/class header ending with ':', got: {signature!r}", 0
+
+        if skeleton_features and feature_path not in skeleton_features:
+            return (
+                False,
+                f"feature_path '{feature_path}' is not present in skeleton.json",
+                0,
+            )
+        if rpg_features and feature_path not in rpg_features:
+            return (
+                False,
+                f"feature_path '{feature_path}' is not present in repo_rpg.json (may have been pruned in a prior run)",
+                0,
+            )
+
+        # --- Locate target subtree/file -----------------------------------
+        subtrees = interfaces_data.get("subtrees") or interfaces_data.get("components") or {}
+        target_subtree: Optional[str] = None
+        file_entry: Optional[Dict[str, Any]] = None
+        for st_name, st_data in subtrees.items():
+            file_container = st_data.get("interfaces") or st_data.get("files") or {}
+            if file_path in file_container:
+                target_subtree = st_name
+                file_entry = file_container[file_path]
+                break
+        if file_entry is None:
+            return (
+                False,
+                f"file_path '{file_path}' not found in any subtree's interfaces",
+                0,
+            )
+
+        # --- Idempotency check --------------------------------------------
+        existing_units = file_entry.setdefault("units", [])
+        if unit_name in existing_units:
+            return False, "unit already exists (idempotent skip)", 0
+
+        # --- Build stub body (Decision A: signature + docstring + pass) ---
+        # Escape any triple-quotes in docstring to keep the stub parseable.
+        safe_doc = docstring.replace('"""', '\\"\\"\\"')
+        stub = f'{signature}\n    """{safe_doc}"""\n    pass\n'
+
+        new_file_code = _insert_unit_into_file_code(
+            file_entry.get("file_code", ""), stub
+        )
+
+        # --- Mutate file entry in-place -----------------------------------
+        existing_units.append(unit_name)
+        file_entry.setdefault("units_to_features", {})[unit_name] = [feature_path]
+        file_entry.setdefault("units_to_code", {})[unit_name] = stub
+        file_entry["file_code"] = new_file_code
+        # Tag so InterfacesStore.find_orphan_units can exclude this unit
+        # from prune candidates: it was deliberately added during review and
+        # not having incoming edges yet doesn't mean it's dead code.
+        file_entry.setdefault("_handler_added", []).append(unit_name)
+
+        # --- Register so subsequent iterations / global review see it -----
+        global_registry.register_unit(
+            file_path=file_path,
+            unit_name=unit_name,
+            subtree_name=target_subtree,
+            features=[feature_path],
+            signature_summary=signature,
+        )
+
+        # --- Optional incoming invocation edges ---------------------------
+        edges_added = 0
+        for caller_name in incoming:
+            caller_name = str(caller_name).strip()
+            if not caller_name:
+                continue
+            caller_file = global_registry.resolve_callee(caller_name)
+            if not caller_file:
+                self.logger.warning(
+                    f"[InterfaceReviewer] add_interface: incoming caller "
+                    f"'{caller_name}' could not be resolved; skipping that edge"
+                )
+                continue
+
+            # Normalise caller_name to the "function "/"class " prefixed form
+            # the rest of the pipeline uses.
+            normalised_caller = caller_name
+            if not (caller_name.startswith("function ") or caller_name.startswith("class ")):
+                # Best-effort lookup: registry stores prefixed unit_name as key.
+                for k in global_registry.units:
+                    bare = k.split(" ", 1)[1] if " " in k else k
+                    if bare == caller_name:
+                        normalised_caller = k
+                        break
+
+            # Strip the prefix for the edge "caller" field, matching the
+            # convention used elsewhere in enhanced_data_flow.
+            caller_bare = normalised_caller.split(" ", 1)[-1]
+            callee_bare = unit_name.split(" ", 1)[-1]
+
+            inv_edges = enhanced_data_flow.setdefault("invocation_edges", [])
+            already = any(
+                e.get("caller") == caller_bare
+                and e.get("callee") == callee_bare
+                and e.get("caller_file") == caller_file
+                and e.get("callee_file") == file_path
+                for e in inv_edges
+            )
+            if already:
+                continue
+
+            inv_edges.append({
+                "caller": caller_bare,
+                "callee": callee_bare,
+                "caller_file": caller_file,
+                "callee_file": file_path,
+                "edge_type": "invokes",
+                "generator": "global_review_add_interface",
+            })
+            if dependency_collector is not None:
+                dependency_collector.add_invocation(
+                    caller=caller_bare,
+                    callee=callee_bare,
+                    caller_file=caller_file,
+                    callee_file=file_path,
+                )
+            edges_added += 1
+            self.logger.info(
+                f"[InterfaceReviewer] add_interface: incoming edge "
+                f"{caller_bare} ({caller_file}) -> {callee_bare} ({file_path})"
+            )
+
+        self.logger.info(
+            f"[InterfaceReviewer] Added interface {unit_name} in {file_path} "
+            f"(subtree={target_subtree}, feature={feature_path}, +{edges_added} edge(s))"
+        )
+        return True, "", edges_added
+
     def _build_interface_summary(
         self,
         interfaces_data: Dict[str, Any],
