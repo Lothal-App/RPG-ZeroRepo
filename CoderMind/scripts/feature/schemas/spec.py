@@ -1,8 +1,7 @@
 """Pydantic schemas for ``feature_spec.json``.
 
-The schema mirrors the historical ``feature_spec.json`` shape produced by
-``feature_spec_to_json.py`` so that downstream stages (``feature_build``,
-``build_skeleton``, …) can consume it without modification.
+The schema preserves the ``feature_spec.json`` contract consumed by
+downstream stages (``feature_build``, ``build_skeleton``, …).
 
 Reference sample::
 
@@ -32,7 +31,9 @@ from __future__ import annotations
 
 from typing import List, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from common.language_meta import normalize_language_metadata
 
 
 ProjectType = Literal[
@@ -110,6 +111,31 @@ class Meta(BaseModel):
             "``['01_charter.md','02_spec.md']`` or ``['user_input']``."
         ),
     )
+    primary_language: str | None = Field(
+        default=None,
+        description=(
+            "Primary target programming language for code generation, e.g. "
+            "``\"python\"`` / ``\"go\"`` / ``\"typescript\"``."
+        ),
+    )
+    target_languages: List[str] = Field(
+        default_factory=list,
+        description=(
+            "All programming languages expected in the generated repository. "
+            "The primary language is listed first."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _normalize_language_metadata(self) -> "Meta":
+        """Keeps primary and list language metadata consistent."""
+        primary, languages = normalize_language_metadata(
+            self.primary_language,
+            self.target_languages,
+        )
+        self.primary_language = primary
+        self.target_languages = languages
+        return self
 
 
 class BackgroundItem(BaseModel):
@@ -217,8 +243,8 @@ FeatureNode.model_rebuild()
 class FeatureSpecOutput(BaseModel):
     """Top-level model representing the full ``feature_spec.json``.
 
-    Field order intentionally mirrors the historical sample to maximise
-    diff-friendliness when comparing old vs new outputs.
+    Field order intentionally follows the reference sample to maximise
+    diff-friendliness across generated outputs.
     """
 
     meta: Meta
@@ -239,6 +265,15 @@ class FeatureSpecOutput(BaseModel):
             "repository."
         ),
     )
+    @property
+    def target_language(self) -> str | None:
+        """The primary target programming language."""
+        return self.meta.primary_language
+
+    @property
+    def target_languages(self) -> List[str]:
+        """The ordered target programming language list."""
+        return self.meta.target_languages
 
 
 __all__ = [

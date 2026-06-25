@@ -14,7 +14,6 @@ Output: .cmind/tasks.json (ordered implementation tasks)
 import json
 import logging
 import argparse
-import ast
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Set
@@ -23,6 +22,8 @@ from collections import Counter, defaultdict, deque
 
 from common.trajectory import Trajectory, load_or_create_trajectory
 from common import LLMClient
+from common.language_meta import extract_language_metadata, metadata_with_languages
+from decoder_lang import FileDependencyEdge, ProjectTaskContext, get_backend, infer_language_from_path
 from rpg import uuid8
 
 # Import centralized paths
@@ -166,104 +167,6 @@ class PlannedTask:
         return obj
 
 
-def _file_path_to_module_name(file_path: str) -> str:
-    """Convert a Python file path to its importable module name."""
-    normalized = file_path.replace("\\", "/")
-    if normalized.endswith(".py"):
-        normalized = normalized[:-3]
-    return _normalize_module_name(normalized.replace("/", "."))
-
-
-def _normalize_module_name(module_name: Optional[str]) -> str:
-    """Normalize module names so equivalent import styles map to the same file."""
-    if not module_name:
-        return ""
-
-    normalized = module_name.strip()
-    while normalized.startswith("."):
-        normalized = normalized[1:]
-    if normalized.startswith("src."):
-        normalized = normalized[4:]
-    return normalized
-
-
-def _resolve_relative_import(module_name: str, level: int, current_file: str) -> Optional[str]:
-    """Resolve a relative import target to an absolute module name."""
-    current_module = _file_path_to_module_name(current_file)
-    package_parts = current_module.split(".")[:-1]
-
-    if level <= 0:
-        return _normalize_module_name(module_name)
-
-    if level > len(package_parts):
-        return None
-
-    anchor_parts = package_parts[: len(package_parts) - level + 1]
-    if module_name:
-        anchor_parts.extend(module_name.split("."))
-    return _normalize_module_name(".".join(anchor_parts))
-
-
-def _is_type_checking_test(test_node: ast.AST) -> bool:
-    """Return True when an if-test represents TYPE_CHECKING."""
-    if isinstance(test_node, ast.Name):
-        return test_node.id == "TYPE_CHECKING"
-    if isinstance(test_node, ast.Attribute):
-        return test_node.attr == "TYPE_CHECKING"
-    return False
-
-
-def _iter_import_nodes(tree: ast.AST, inside_type_checking: bool = False):
-    """Yield import nodes together with whether they are TYPE_CHECKING-only."""
-    for node in ast.iter_child_nodes(tree):
-        child_inside_type_checking = inside_type_checking
-        if isinstance(node, ast.If) and _is_type_checking_test(node.test):
-            child_inside_type_checking = True
-
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            yield node, inside_type_checking
-
-        yield from _iter_import_nodes(node, child_inside_type_checking)
-
-
-def _extract_imported_modules(file_code: str, current_file: str) -> Set[str]:
-    """Extract runtime imported module names from code, excluding TYPE_CHECKING-only imports."""
-    if not file_code.strip():
-        return set()
-
-    try:
-        tree = ast.parse(file_code)
-    except SyntaxError:
-        return set()
-
-    imported_modules: Set[str] = set()
-
-    for node, inside_type_checking in _iter_import_nodes(tree):
-        if inside_type_checking:
-            continue
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name:
-                    imported_modules.add(_normalize_module_name(alias.name))
-        elif isinstance(node, ast.ImportFrom):
-            resolved_module = _resolve_relative_import(node.module, node.level, current_file)
-            if resolved_module:
-                imported_modules.add(resolved_module)
-
-            if node.module:
-                base_module = _resolve_relative_import(node.module, node.level, current_file)
-            else:
-                base_module = _resolve_relative_import("", node.level, current_file)
-
-            if base_module:
-                for alias in node.names:
-                    if alias.name == "*":
-                        continue
-                    imported_modules.add(_normalize_module_name(f"{base_module}.{alias.name}"))
-
-    return imported_modules
-
-
 def _load_dependency_source_code(file_path: str, interface_file_code: str) -> str:
     """Load source code for dependency analysis, combining repo and interface inputs."""
     code_parts: List[str] = []
@@ -279,6 +182,77 @@ def _load_dependency_source_code(file_path: str, interface_file_code: str) -> st
         code_parts.append(interface_file_code)
     return "\n\n".join(code_parts)
 
+
+def _infer_backend_name_for_file(file_path: str, fallback_language: Optional[str] = None) -> str:
+    """Infer the backend name for a file without relying on subtree primary language."""
+    inferred = infer_language_from_path(file_path)
+    if inferred:
+        return inferred
+    return (fallback_language or "python").lower()
+
+
+def _subtree_file_sources(
+    files: List[str],
+    subtree_interfaces: Dict[str, Dict[str, Any]],
+) -> Dict[str, str]:
+    """Build source-code map used by backend file-dependency resolvers."""
+    sources: Dict[str, str] = {}
+    for file_path in files:
+        interface_file_code = subtree_interfaces.get(file_path, {}).get("file_code", "")
+        sources[file_path] = _load_dependency_source_code(file_path, interface_file_code)
+    return sources
+
+
+def _edges_to_toposort_input(edges: List[FileDependencyEdge]) -> Dict[str, Set[str]]:
+    dependency_edges: Dict[str, Set[str]] = defaultdict(set)
+    for edge in edges:
+        dependency_edges[edge.dependency].add(edge.dependent)
+    return dependency_edges
+
+
+def _serialize_dependency_edges(edges: List[FileDependencyEdge]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "dependency": edge.dependency,
+            "dependent": edge.dependent,
+            "reason": edge.reason,
+            "confidence": edge.confidence,
+            "detail": edge.detail,
+        }
+        for edge in edges
+    ]
+
+
+def _language_summary(language_to_files: Dict[str, List[str]]) -> Dict[str, int]:
+    return {language: len(files) for language, files in sorted(language_to_files.items())}
+
+
+def _sort_files_with_backend_edges(
+    files: List[str],
+    backend_name: str,
+    file_sources: Dict[str, str],
+) -> tuple[List[str], List[FileDependencyEdge], bool]:
+    """Sort a same-language file group with its backend's dependency edges."""
+    backend = get_backend(backend_name)
+    edges = backend.file_dependency_edges(files, file_sources)
+    corrected = _topologically_sort_files(files, _edges_to_toposort_input(edges))
+    if corrected is None:
+        return files, edges, True
+    return corrected, edges, False
+
+
+def _merge_sorted_language_groups(
+    original_files: List[str],
+    file_to_language: Dict[str, str],
+    sorted_by_language: Dict[str, List[str]],
+) -> List[str]:
+    """Fill each original language slot with the next sorted file from that language."""
+    queues = {language: deque(files) for language, files in sorted_by_language.items()}
+    merged: List[str] = []
+    for file_path in original_files:
+        language = file_to_language[file_path]
+        merged.append(queues[language].popleft())
+    return merged
 
 def _topologically_sort_files(
     files_order: List[str],
@@ -328,10 +302,20 @@ def correct_intra_subtree_file_order(
     files_order: List[str],
     subtree_interfaces: Dict[str, Dict[str, Any]],
     logger: Optional[logging.Logger] = None,
+    language: Optional[str] = None,
 ) -> tuple[List[str], Dict[str, Any]]:
-    """Correct file order using imports declared in interface skeleton code."""
+    """Correct file order with per-file language backend dependency rules."""
     logger = logger or logging.getLogger(__name__)
     available_files = [file_path for file_path in files_order if file_path in subtree_interfaces]
+    file_to_language = {
+        file_path: _infer_backend_name_for_file(file_path, language)
+        for file_path in available_files
+    }
+    language_to_files: Dict[str, List[str]] = defaultdict(list)
+    for file_path in available_files:
+        language_to_files[file_to_language[file_path]].append(file_path)
+    languages = _language_summary(language_to_files)
+
     if len(available_files) <= 1:
         return available_files, {
             "original_files_order": list(available_files),
@@ -339,55 +323,83 @@ def correct_intra_subtree_file_order(
             "changed": False,
             "dependency_edges": [],
             "reason": "single_file_or_empty_subtree",
+            "languages": languages,
+            "language_groups": languages,
+            "cycle_detected": False,
+            "has_unresolved_or_ambiguous_edges": False,
+            "has_weak_edges": False,
         }
 
-    module_to_file = {
-        _file_path_to_module_name(file_path): file_path
-        for file_path in available_files
-    }
-    dependency_edges: Dict[str, Set[str]] = defaultdict(set)
-    dependency_pairs: List[Dict[str, str]] = []
-    seen_dependency_pairs: Set[tuple[str, str, str]] = set()
+    file_sources = _subtree_file_sources(available_files, subtree_interfaces)
+    all_edges: List[FileDependencyEdge] = []
+    cycles_by_language: Dict[str, bool] = {}
 
-    for file_path in available_files:
-        file_code = _load_dependency_source_code(
-            file_path=file_path,
-            interface_file_code=subtree_interfaces[file_path].get("file_code", ""),
+    if len(language_to_files) == 1:
+        backend_name = next(iter(language_to_files))
+        corrected_order, edges, cycle_detected = _sort_files_with_backend_edges(
+            available_files,
+            backend_name,
+            file_sources,
         )
-        imported_modules = _extract_imported_modules(file_code, file_path)
-
-        for module_name in sorted(imported_modules):
-            dependency_file = module_to_file.get(module_name)
-            if not dependency_file or dependency_file == file_path:
-                continue
-            dependency_edges[dependency_file].add(file_path)
-            dependency_key = (dependency_file, file_path, module_name)
-            if dependency_key not in seen_dependency_pairs:
-                seen_dependency_pairs.add(dependency_key)
-                dependency_pairs.append({
-                    "dependency": dependency_file,
-                    "dependent": file_path,
-                    "module": module_name,
-                })
-
-    corrected_order = _topologically_sort_files(available_files, dependency_edges)
-    if corrected_order is None:
-        logger.warning(
-            "[TaskPlanner] Detected cyclic or invalid intra-subtree imports in '%s'; keeping original file order.",
-            subtree_name,
-        )
-        return available_files, {
+        all_edges.extend(edges)
+        if cycle_detected:
+            logger.warning(
+                "[TaskPlanner] Detected cyclic or invalid %s file dependencies in '%s'; keeping original file order.",
+                backend_name,
+                subtree_name,
+            )
+            corrected_order = available_files
+        changed = corrected_order != available_files
+        if changed:
+            logger.info(
+                "[TaskPlanner] Corrected files_order for subtree '%s' using %s backend dependencies: %s -> %s",
+                subtree_name,
+                backend_name,
+                available_files,
+                corrected_order,
+            )
+        return corrected_order, {
             "original_files_order": list(available_files),
-            "corrected_files_order": list(available_files),
-            "changed": False,
-            "dependency_edges": dependency_pairs,
-            "reason": "cycle_detected_fallback_to_original_order",
+            "corrected_files_order": list(corrected_order),
+            "changed": changed,
+            "dependency_edges": _serialize_dependency_edges(all_edges),
+            "reason": "backend_file_dependencies",
+            "languages": languages,
+            "language_groups": languages,
+            "cycle_detected": cycle_detected,
+            "has_unresolved_or_ambiguous_edges": any(
+                edge.confidence in {"unresolved", "ambiguous"}
+                for edge in all_edges
+            ),
+            "has_weak_edges": any(edge.confidence == "weak" for edge in all_edges),
         }
 
+    sorted_by_language: Dict[str, List[str]] = {}
+    for backend_name, language_files in language_to_files.items():
+        sorted_group, edges, cycle_detected = _sort_files_with_backend_edges(
+            language_files,
+            backend_name,
+            file_sources,
+        )
+        all_edges.extend(edges)
+        cycles_by_language[backend_name] = cycle_detected
+        sorted_by_language[backend_name] = language_files if cycle_detected else sorted_group
+        if cycle_detected:
+            logger.warning(
+                "[TaskPlanner] Detected cyclic or invalid %s file dependencies in mixed-language subtree '%s'; keeping that language group's original order.",
+                backend_name,
+                subtree_name,
+            )
+
+    corrected_order = _merge_sorted_language_groups(
+        available_files,
+        file_to_language,
+        sorted_by_language,
+    )
     changed = corrected_order != available_files
     if changed:
         logger.info(
-            "[TaskPlanner] Corrected files_order for subtree '%s': %s -> %s",
+            "[TaskPlanner] Corrected files_order for mixed-language subtree '%s' within language groups only: %s -> %s",
             subtree_name,
             available_files,
             corrected_order,
@@ -397,8 +409,18 @@ def correct_intra_subtree_file_order(
         "original_files_order": list(available_files),
         "corrected_files_order": list(corrected_order),
         "changed": changed,
-        "dependency_edges": dependency_pairs,
-        "reason": "ast_import_toposort",
+        "dependency_edges": _serialize_dependency_edges(all_edges),
+        "reason": "mixed_language_grouped_sort",
+        "languages": languages,
+        "language_groups": languages,
+        "cycles_by_language": cycles_by_language,
+        "cycle_detected": any(cycles_by_language.values()),
+        "has_unresolved_or_ambiguous_edges": any(
+            edge.confidence in {"unresolved", "ambiguous"}
+            for edge in all_edges
+        ),
+        "has_weak_edges": any(edge.confidence == "weak" for edge in all_edges),
+        "cross_language_policy": "preserve_original_language_slots_no_cross_language_edges",
     }
 
 
@@ -738,6 +760,11 @@ class TaskPlanner:
         self.repo_info = repo_info
         self.debug = debug
         self.trajectory = trajectory
+        self.primary_language = (
+            extract_language_metadata(interfaces)[0]
+            or extract_language_metadata(data_flow)[0]
+        )
+        self.backend = get_backend(self.primary_language)
         self.llm: Optional[LLMClient] = None
         self.logger = logging.getLogger(__name__)
         
@@ -794,6 +821,7 @@ class TaskPlanner:
                 files_order=files_order,
                 subtree_interfaces=subtree_interfaces,
                 logger=self.logger,
+                language=self.primary_language,
             )
             self.file_order_diagnostics[subtree] = order_diagnostics
             
@@ -881,6 +909,11 @@ class TaskPlanner:
                     planned_tasks_serializable[subtree][file_path] = valid_tasks
         
         result = {
+            "meta": metadata_with_languages(
+                self.interfaces
+                if extract_language_metadata(self.interfaces)[0]
+                else self.data_flow
+            ),
             "planned_tasks_dict": planned_tasks_serializable,
             "agent_results_dict": self.agent_results_dict,
             "file_order_diagnostics": self.file_order_diagnostics,
@@ -915,6 +948,11 @@ class TaskPlanner:
         updated_subtree_order = subtree_order + ["FINAL_TASKS", "PROJECT_FILES"]
         
         result = {
+            "meta": metadata_with_languages(
+                self.interfaces
+                if extract_language_metadata(self.interfaces)[0]
+                else self.data_flow
+            ),
             "planned_tasks_dict": planned_tasks_serializable,
             "agent_results_dict": self.agent_results_dict,
             "file_order_diagnostics": self.file_order_diagnostics,
@@ -1010,7 +1048,7 @@ class TaskPlanner:
                     "- Module A defines function but Module B never imports/calls it\n"
                     "- Data format mismatch at module boundary\n"
                     "- CSS class names in templates not matching stylesheet definitions\n"
-                    "\nDo NOT create main.py — it will be created in a later task."
+                    "\nDo NOT create the main entry point — it will be created in a later task."
                 ),
                 file_path="<WIRING>",
                 units_key=["cross_module_wiring"],
@@ -1046,7 +1084,7 @@ class TaskPlanner:
                 "For ALL other project types, follow these steps:\n\n"
                 "## Step 1: Inventory existing assets\n"
                 "List all files related to user-facing output:\n"
-                "- Style modules (styles.py, *.css, theme files)\n"
+                "- Style, theme, or presentation files when the project type uses them\n"
                 "- Template/page/view files\n"
                 "- Layout/component files\n"
                 "- Static assets directory\n"
@@ -1079,7 +1117,7 @@ class TaskPlanner:
                 "- GUI: verify window opens without errors\n"
                 "- CLI: verify --help output and a basic command run\n"
                 "- Write tests that assert key structural elements\n\n"
-                "Do NOT create main.py — it will be created in a later task."
+                "Do NOT create the main entry point — it will be created in a later task."
             ),
             file_path="<UI_POLISH>",
             units_key=["ui_polish"],
@@ -1109,7 +1147,7 @@ class TaskPlanner:
                 "In addition, create clear usage examples (e.g., example scripts or notebooks) that demonstrate "
                 "typical end-to-end workflows. "
                 "Place the new test files and examples in appropriate locations in the project structure. "
-                "NOTE: The main entry point (main.py) will be created in the next task — "
+                "NOTE: The main entry point will be created in the next task — "
                 "do NOT create it here."
             ),
             file_path="<COMPREHENSIVE_TEST>",  # Special marker - let agent decide placement
@@ -1194,8 +1232,8 @@ class TaskPlanner:
         so they can reference the actual code content.
         
         Task types:
-        - project_requirements: requirements.txt (needs import validation test)
-        - project_docs: README.md (no tests needed)
+        - project_requirements: language-specific dependency metadata
+        - project_docs: README.md
         """
         print("\n   Adding project file tasks...")
         
@@ -1209,7 +1247,7 @@ class TaskPlanner:
             task=self._build_requirements_task(),
             file_path="<REQUIREMENTS>",
             units_key=["requirements_generation"],
-            unit_to_code={"requirements_generation": "# Generate requirements.txt"},
+            unit_to_code={"requirements_generation": "# Generate dependency metadata"},
             unit_to_features={"requirements_generation": ["dependency management"]},
             priority=3000,  # After main_entry (2100)
             subtree=pf_subtree,
@@ -1217,7 +1255,7 @@ class TaskPlanner:
         )
         planned_tasks[pf_subtree]["<REQUIREMENTS>"] = [requirements_task.to_dict()]
         agent_results[pf_subtree]["<REQUIREMENTS>"] = {"success": True, "type": "project_requirements"}
-        print("      -  Added requirements.txt generation task (with import test)")
+        print("      -  Added dependency metadata task (with validation test)")
         
         # 2. README documentation task (no tests needed)
         readme_task = PlannedTask(
@@ -1235,9 +1273,42 @@ class TaskPlanner:
         print("      -  Added README.md generation task (no test)")
         
         self.logger.info("Added 2 project file tasks")
+
+    def _backend_project_task_templates(self):
+        """Return backend-owned project task templates when available."""
+        return self.backend.project_task_templates(
+            ProjectTaskContext(
+                repo_name=self.repo_name,
+                repo_info=self.repo_info,
+                package_name=self._package_slug(separator="-"),
+                entry_point_path=self._reconciled_entry_point_path(),
+            )
+        )
+
+    def _reconciled_entry_point_path(self) -> Optional[str]:
+        """Resolve the program entry path from already-designed interfaces.
+
+        Reuses an existing language-appropriate entry file when the
+        skeleton already placed one (e.g. C++ ``src/cli/main.cpp`` off the
+        canonical ``src/main.cpp``, or Go ``cmd/<name>/main.go``), so the
+        synthetic MAIN_ENTRY task extends it instead of generating a
+        SECOND entry — the dual-``main`` bug. The per-language matching
+        rule lives in ``backend.find_existing_entry`` (filename match by
+        default; Go encodes the ``cmd/*/main.go`` shape). Returns ``None``
+        when the skeleton declared no entry, letting the backend use its
+        canonical path.
+        """
+        return self.backend.find_existing_entry(self.interfaces)
     
     def _build_requirements_task(self) -> str:
-        """Build task description for requirements.txt generation."""
+        """Build task description for dependency metadata generation."""
+        templates = self._backend_project_task_templates()
+        if templates is not None:
+            return templates.dependencies
+
+        if self.backend.name != "python":
+            raise RuntimeError(f"{self.backend.name} backend must provide project task templates")
+
         return f"""Generate or update the dependency management files for the repository: {self.repo_name}
 
 **Files to create/update:**
@@ -1281,6 +1352,13 @@ package3>=3.0.0  # For feature X
     
     def _build_main_entry_task(self) -> str:
         """Build task description for main entry point generation."""
+        templates = self._backend_project_task_templates()
+        if templates is not None:
+            return templates.main_entry
+
+        if self.backend.name != "python":
+            raise RuntimeError(f"{self.backend.name} backend must provide project task templates")
+
         # Infer the main package name from the interfaces subtree structure
         package_name = self._get_package_name()
 
@@ -1359,6 +1437,18 @@ if __name__ == "__main__":
 - Reference ONLY actual module names, classes, and functions from the codebase
 - Provide meaningful default behaviors so `python main.py` does something useful
 - The entry point should feel like a finished product, not a scaffold
+- **Make `python main.py` work from a clean checkout.** If the package lives
+  under `src/` (e.g. `src/{package_name}/`), a bare `python main.py` will raise
+  `ModuleNotFoundError` because `src/` is not on `sys.path`. You MUST make the
+  import resolvable by ONE of:
+    1. Adding a `pyproject.toml` with `[tool.setuptools] packages` discovery
+       under `src` (`package-dir = {{"" = "src"}}`), so an editable/normal
+       install exposes the package; OR
+    2. Inserting a path bridge at the very top of `main.py`, before importing
+       the package:
+       `import sys, pathlib; sys.path.insert(0, str(pathlib.Path(__file__).parent / "src"))`
+  Prefer (1) for installable projects; (2) is the minimal always-works bridge.
+  Do NOT rely on the caller exporting `PYTHONPATH`.
 - **Read the `docs/` directory first** — it contains the user's original requirements
   and feature specifications. Make sure the entry point faithfully exposes
   all requested features and does NOT deviate from the intended purpose.
@@ -1418,8 +1508,23 @@ if __name__ == "__main__":
             return self.repo_name.lower().replace("-", "_").replace(" ", "_")
         return "project"
 
+    def _package_slug(self, separator: str = "-") -> str:
+        """Infer a compact package name from repository metadata."""
+        raw = self.repo_name or "project"
+        candidate = raw.lower().replace(" ", separator).replace("_", separator)
+        candidate = _re.sub(rf"[^a-z0-9{_re.escape(separator)}]+", separator, candidate)
+        candidate = _re.sub(rf"{_re.escape(separator)}+", separator, candidate)
+        return candidate.strip(separator) or "project"
+
     def _build_readme_task(self) -> str:
         """Build task description for README.md generation."""
+        templates = self._backend_project_task_templates()
+        if templates is not None:
+            return templates.readme
+
+        if self.backend.name != "python":
+            raise RuntimeError(f"{self.backend.name} backend must provide project task templates")
+
         return f"""Update the README.md for the repository: {self.repo_name}
 Repository purpose: {self.repo_info}
 

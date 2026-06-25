@@ -338,7 +338,7 @@ class TestSemanticParsingToRPGEncoding:
         # feature value as the node name, not the key after "function ")
         new_nodes = [
             n for n in rpg.nodes.values()
-            if n.meta and n.meta.path == "src/user_manager.py:new_utility"
+            if n.meta and n.meta.path == "src/user_manager.py::new_utility"
         ]
         assert len(new_nodes) == 1
         # The name is taken from the feature list
@@ -585,16 +585,9 @@ class TestEvolutionToRPGUpdate:
     def test_evolution_process_diff_no_changes(self, rpg_with_structure):
         """process_diff with no changes returns the RPG unchanged."""
         with patch(
-            "rpg_encoder.rpg_evolution.RPGParser",
-        ) as MockParser, \
-             patch(
                  "rpg_encoder.rpg_evolution.generate_detailed_diff",
                  return_value={"added": {}, "deleted": {}, "modified": {}},
              ):
-            mock_instance = MagicMock()
-            mock_instance.exclude_irrelevant_files.return_value = []
-            MockParser.return_value = mock_instance
-
             result = RPGEvolution.process_diff(
                 repo_name="test_project",
                 repo_info="test",

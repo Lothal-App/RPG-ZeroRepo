@@ -17,7 +17,9 @@ Internal to the codegen package; no external API contract.
 
 from __future__ import annotations
 
+import json
 import logging
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -27,6 +29,7 @@ from common.execution_state import BatchExecutionState, load_code_gen_state
 from common.import_normalizer import build_import_convention_snippet
 from common.paths import (
     CODE_GEN_STATE_FILE as STATE_FILE,
+    FEATURE_SPEC_FILE,
     REPO_RPG_FILE,
     TASKS_FILE,
     get_scripts_dir,
@@ -43,6 +46,14 @@ from code_gen.test_runner import (
     get_dev_python,
     get_dev_venv_path,
 )
+from decoder_lang import (
+    EnvHandle,
+    LanguageBackend,
+    ToolchainUnavailable,
+    get_backend,
+    resolve_decoder_language,
+    scan_repo_source_files,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +63,15 @@ from code_gen._constants import DEFAULT_TEST_TIMEOUT  # noqa: E402
 # Sub-agent internal TDD-loop iteration cap (enforced inside the
 # generated prompt; not used to drive any Python-side loop).
 MAX_ITERATIONS = 5
+
+_FALLBACK_TEST_COMMANDS = {
+    "go": ["go", "test", "-v", "./..."],
+    "rust": ["cargo", "test"],
+    "typescript": ["npm", "test"],
+    "javascript": ["npm", "test"],
+    "c": ["make", "test"],
+    "cpp": ["ctest", "--test-dir", "build", "--output-on-failure"],
+}
 
 
 # ============================================================================
@@ -81,7 +101,7 @@ Follow these steps IN ORDER. Do not skip steps.
   HTML with CSS classes, returns data structures), read those consuming modules
   to ensure compatibility.
 - Read existing test files in `tests/` to understand conventions.
-- Read `requirements.txt` if it exists.
+- {dependency_manifest_instruction}
 - **UI/View code quality:** If you are implementing code that generates HTML,
   renders pages, produces visual output, or defines styles/CSS:
   - Ensure all HTML pages use the shared layout (head, nav, footer) consistently
@@ -132,14 +152,14 @@ fix YOUR code, not the pre-existing tests (unless the test itself is
 clearly wrong based on the skeleton).
 
 ### Step 5: Analyze & Fix (if tests fail)
-- Read the FULL pytest output carefully.
+- Read the FULL {test_tool_name} output carefully.
 - Determine root cause: test bug, code bug, import error, or dependency issue.
 - Fix the appropriate file(s). You MAY fix:
   - Test files (wrong assertions, bad mocks, missing imports)
   - Source files (logic bugs, missing methods, wrong signatures)
-  - Other project files (broken imports, missing `__init__.py`)
-  - requirements.txt (missing third-party package)
-- After fixing, re-run the EXACT SAME pytest command from Step 4.
+    - Other project files (broken imports, missing package markers)
+    - Dependency manifests (missing third-party package or module)
+- After fixing, re-run the EXACT SAME test command from Step 4.
 
 ### Step 6: Repeat Steps 4–5
 - Maximum **{max_iterations} iterations** of test → fix → test.
@@ -176,77 +196,77 @@ The final two lines of your response MUST follow this exact shape so the
 runner can verify your claim:
 
 ```
-PYTEST_SUMMARY: <verbatim last summary line from pytest>
+PYTEST_SUMMARY: <verbatim last summary line from the test command>
 BATCH_RESULT: PASS
 ```
 
 or on failure:
 
 ```
-PYTEST_SUMMARY: <verbatim last summary line from pytest>
+PYTEST_SUMMARY: <verbatim last summary line from the test command>
 BATCH_RESULT: FAIL | <one-line reason>
 ```
 
-The `PYTEST_SUMMARY` line must be the *literal* one-line summary that
-pytest printed, e.g. `5 passed in 0.42s`, `2 passed, 1 failed in 1.30s`,
-`1 failed, 1 error in 0.55s`.  Copy it verbatim from the run you just
-performed; do NOT invent it.  This lets the runner cross-check your
-claim against an independent re-run.
+The `PYTEST_SUMMARY` marker name is kept for runner compatibility. Its
+value must be the *literal* one-line summary printed by the test command,
+for example `5 passed in 0.42s`, `ok ./...`, or `test result: ok`. Copy it
+verbatim from the run you just performed; do NOT invent it. This lets the
+runner cross-check your claim against an independent re-run.
 
 ## ── Capabilities ─────────────────────────────────────────
 
 [OK] You CAN:
 - Read/write any file under `src/`, `tests/`, `static/`, `templates/`, and `examples/`
-  (Python, HTML, CSS, JavaScript, JSON, YAML, config files, etc.)
+  (source files in the target language, plus HTML, CSS, JSON, YAML, config files, etc.)
 - Create new directories and files if needed (e.g., `static/css/`, `templates/`)
 - Read any file in the repo for context
 - Run: `{pytest_cmd}` (this exact command only)
-- Run: `{pip_install_cmd} install <package>` to install missing packages
-- Update `requirements.txt` when adding new dependencies
+{dependency_install_capability}
 - Fix import errors in ANY source file (not just the target)
 - Run: `git add -A && git commit -m "<message>"`
 
 [FAIL] You MUST NOT:
 - Modify or read files under `.cmind/`
 - Run any `cmind script ...` or `cmind-mcp` commands
-- Run arbitrary shell commands beyond pytest/pip/git listed above
+- Run arbitrary shell commands beyond the test/dependency/git commands listed above
 - Install packages that are not genuinely needed by the source code
 - Delete files that are not part of your task
-- Run pytest without `--timeout` flag (already included in the command)
+{test_timeout_rule}
 
-## ── Pytest Rules (CRITICAL) ──────────────────────────────────
+## ── Test Command Rules (CRITICAL) ─────────────────────────────
 
-1. **Always use the EXACT pytest command provided** — it has timeout flags
-   to prevent hanging tests.
-2. **Do not manually run a different pytest command** — the provided command
-   already targets the correct test files for this batch.
+1. **Always use the EXACT {test_tool_name} command provided**.
+2. **Do not manually run a different test command** — the provided command
+    already targets the correct test scope for this batch.
 3. If a test times out or hangs, the test is wrong. Fix the test:
-   - Remove infinite loops, blocking I/O, or `time.sleep()` calls
+   - Remove infinite loops, blocking I/O, or real-time sleeps/waits
    - Mock any external resources (network, filesystem, GPU)
    - Ensure all fixtures have finite setup/teardown
 4. **Do not write tests that depend on timing** (real-time waits).
-   Use mocks or `unittest.mock.patch` for time-dependent behavior.
+   Mock time-dependent behavior with your target language's test/mocking
+   framework (see the Target Language section below).
 5. **Do not write tests that spawn subprocesses or servers.**
-6. **Output control:** Use `-x` (stop at first failure) and `--tb=short`
-   to keep output manageable. Focus on the FIRST failure.
+6. **Output control:** prefer fail-fast and concise tracebacks so the
+   FIRST failure stays the focus; follow the exact test command provided.
 
 ## ── Test Quality Rules ───────────────────────────────────
 
-- Use `MagicMock(spec=RealClass)` or `create_autospec()`, never bare `MagicMock()`.
-- For numeric/math operations: use real values (`np.array(...)`, `4.0`), not mocks.
-- Mock at boundaries (I/O, external deps), not internal implementation.
+- Use spec'd / auto-generated mocks bound to a real type, never an
+  unconstrained stand-in, and mock at boundaries (I/O, external deps),
+  not internal implementation. Use your target language's idiomatic
+  mocking facility.
+- For numeric/math operations: use real values, not mocks.
 - Keep tests deterministic — no random data without fixed seeds.
 - Test count: proportional to task complexity. Small task = 3–8 tests.
   Do NOT over-engineer with 20+ tests for a simple class.
 
 ## ── Dependency Management ────────────────────────────────
 
-When you encounter `ModuleNotFoundError` or `ImportError` for a third-party package:
-1. Install it: `{pip_install_cmd} install <package>`
-2. Verify by re-running pytest.
-3. Append the package to `requirements.txt` (create the file if it doesn't exist).
+{dependency_management}
 
 {import_convention}
+
+{language_context}
 
 ## ── Project Context ──────────────────────────────────────
 {dependency_context}
@@ -269,15 +289,15 @@ Your job is to **continue from where it left off** and make tests pass.
 **Attempt:** {attempt_number}
 **Failure reason:** {failure_reason}
 {post_verify_section}
-## Previous Test Output (last pytest run)
+## Previous Test Output (last test-command run)
 ```
 {last_test_output}
 ```
 
 ## Instructions
 1. Review what has already been written (read modified files).
-2. Run the pytest command to see current status.
-3. If tests fail → fix the **production code** first, then re-run pytest.
+2. Run the exact test command to see current status.
+3. If tests fail → fix the **production code** first, then re-run the exact test command.
 4. **Do NOT silence failures by editing tests** — the tests in `tests/`
    describe the contract.  Only modify a test if you can show it is
    logically wrong (wrong expected value, wrong fixture, etc.) and
@@ -287,13 +307,14 @@ Your job is to **continue from where it left off** and make tests pass.
 ## Exit Protocol (same as the original task)
 The final two lines of your response MUST be:
 ```
-PYTEST_SUMMARY: <verbatim last summary line from pytest>
+PYTEST_SUMMARY: <verbatim last summary line from the test command>
 BATCH_RESULT: PASS    # or FAIL | <one-line reason>
 ```
-The `PYTEST_SUMMARY` must be copied verbatim from your pytest run.
+The `PYTEST_SUMMARY` marker is kept for runner compatibility. Copy the
+last summary line from your test-command run verbatim.
 
 All other rules from the original task apply (capabilities, constraints,
-pytest rules, etc). The full original task is included below.
+test-command rules, etc). The full original task is included below.
 """
 
 TDD_PROJECT_FILE_PREAMBLE = """\
@@ -356,6 +377,177 @@ When finished, on the LAST line of your response write:
 # Builder functions
 # ============================================================================
 
+def _load_json_if_exists(path: Path) -> Any:
+    """Load JSON from ``path`` or return None when unavailable."""
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _resolve_codegen_backend(repo_path: Path | None = None) -> LanguageBackend:
+    """Resolve the target language backend for code generation."""
+    feature_spec = _load_json_if_exists(FEATURE_SPEC_FILE)
+    rpg_obj = _load_json_if_exists(REPO_RPG_FILE)
+    valid_files = None
+    if repo_path is not None:
+        valid_files = scan_repo_source_files(repo_path) or None
+    language = resolve_decoder_language(
+        feature_spec=feature_spec,
+        rpg_obj=rpg_obj,
+        valid_files=valid_files,
+    )
+    return get_backend(language)
+
+
+def _shell_join(argv: List[str]) -> str:
+    """Return a shell-safe command string for display in prompts."""
+    return shlex.join([str(part) for part in argv])
+
+
+def _fallback_test_command(backend: LanguageBackend) -> List[str]:
+    """Return a stable test command when host tool detection is unavailable."""
+    return list(_FALLBACK_TEST_COMMANDS.get(backend.name, [backend.prompt_hints().test_framework_name]))
+
+
+def _build_backend_test_cmd(
+    backend: LanguageBackend,
+    repo_path: Path,
+    test_files: List[str],
+    venv_python: str,
+) -> str:
+    """Build the exact test command the codegen agent should run."""
+    if backend.name == "python":
+        return build_batch_pytest_cmd(test_files, venv_python)
+
+    env = backend.detect_env(repo_path) or EnvHandle(project_root=repo_path.resolve())
+    try:
+        return _shell_join(backend.test_command(env))
+    except (ToolchainUnavailable, NotImplementedError, OSError):
+        return _shell_join(_fallback_test_command(backend))
+
+
+def _dependency_manifest_instruction(backend: LanguageBackend) -> str:
+    """Return the dependency manifest reading instruction for the backend."""
+    manifest_by_language = {
+        "python": "Read `requirements.txt` if it exists.",
+        "go": "Read `go.mod` if it exists.",
+        "rust": "Read `Cargo.toml` if it exists.",
+        "typescript": "Read `package.json` and `tsconfig.json` if they exist.",
+        "javascript": "Read `package.json` if it exists.",
+        "c": "Read `Makefile` if it exists.",
+        "cpp": "Read `CMakeLists.txt` or `Makefile` if they exist.",
+    }
+    return manifest_by_language.get(backend.name, "Read the project's dependency manifest if it exists.")
+
+
+def _dependency_install_capability(backend: LanguageBackend, repo_path: Path) -> str:
+    """Return the allowed dependency-install command bullet."""
+    if backend.name == "python":
+        return f"- Run: `{_build_pip_install_cmd(repo_path)} install <package>` to install missing packages\n- Update `requirements.txt` when adding new dependencies"
+    capability_by_language = {
+        "go": "- Run: `go get <module>` only when a non-standard module is genuinely required\n- Update `go.mod` / `go.sum` when adding dependencies",
+        "rust": "- Run: `cargo add <crate>` only when a crate is genuinely required\n- Update `Cargo.toml` / `Cargo.lock` when adding dependencies",
+        "typescript": "- Run: `npm install <package>` only when a package is genuinely required\n- Update `package.json` / lockfiles when adding dependencies",
+        "javascript": "- Run: `npm install <package>` only when a package is genuinely required\n- Update `package.json` / lockfiles when adding dependencies",
+        "c": "- Prefer the C standard library; do not install system packages from this workflow\n- Update `Makefile` when build flags or source lists change",
+        "cpp": "- Prefer the C++ standard library; do not install system packages from this workflow\n- Update `CMakeLists.txt` or `Makefile` when build flags or source lists change",
+    }
+    return capability_by_language.get(
+        backend.name,
+        "- Use the project's native dependency tool only when a dependency is genuinely required",
+    )
+
+
+def _dependency_management_text(backend: LanguageBackend, repo_path: Path) -> str:
+    """Return dependency-management instructions for the target language."""
+    if backend.name == "python":
+        pip_cmd = _build_pip_install_cmd(repo_path)
+        return (
+            "When you encounter `ModuleNotFoundError` or `ImportError` for a third-party package:\n"
+            f"1. Install it: `{pip_cmd} install <package>`\n"
+            "2. Verify by re-running the exact test command.\n"
+            "3. Append the package to `requirements.txt` (create the file if it doesn't exist)."
+        )
+    management_by_language = {
+        "go": (
+            "When a non-standard Go module is genuinely needed:\n"
+            "1. Run `go get <module>`.\n"
+            "2. Verify by re-running the exact test command.\n"
+            "3. Keep `go.mod` and `go.sum` consistent."
+        ),
+        "rust": (
+            "When an external Rust crate is genuinely needed:\n"
+            "1. Run `cargo add <crate>`.\n"
+            "2. Verify by re-running the exact test command.\n"
+            "3. Keep `Cargo.toml` and `Cargo.lock` consistent."
+        ),
+        "typescript": (
+            "When an npm package is genuinely needed:\n"
+            "1. Run `npm install <package>`.\n"
+            "2. Verify by re-running the exact test command.\n"
+            "3. Keep `package.json` and lockfiles consistent."
+        ),
+        "javascript": (
+            "When an npm package is genuinely needed:\n"
+            "1. Run `npm install <package>`.\n"
+            "2. Verify by re-running the exact test command.\n"
+            "3. Keep `package.json` and lockfiles consistent."
+        ),
+        "c": "Prefer the C standard library. Do not add system dependencies unless the repository already documents them.",
+        "cpp": "Prefer the C++ standard library. Do not add system dependencies unless the repository already documents them.",
+    }
+    return management_by_language.get(
+        backend.name,
+        "Use the project's native dependency workflow and re-run the exact test command after changes.",
+    )
+
+
+def _test_timeout_rule(backend: LanguageBackend) -> str:
+    """Return a timeout-safety rule tailored to the test command."""
+    if backend.name == "python":
+        return "- Run pytest without `--timeout` flag (already included in the command)"
+    return "- Run long-lived servers, watchers, or interactive commands instead of the exact test command"
+
+
+def _build_language_context(backend: LanguageBackend, test_command: str) -> str:
+    """Build the target-language prompt section."""
+    hints = backend.prompt_hints()
+    context = (
+        "## ── Target Language ─────────────────────────────────────\n"
+        f"- Language: {hints.display_name}\n"
+        f"- Source extension: `{hints.file_extension}`\n"
+        f"- Code fences: ```{hints.markdown_fence}\n"
+        f"- Test command: `{test_command}`\n"
+        f"- Test framework/tool: {hints.test_framework_name}\n"
+        f"- Module naming: {hints.module_naming_rule}\n"
+        f"- Style: {hints.style_directive}\n"
+    )
+    if backend.name != "python":
+        # The decoder's defaults are Python-centric; without an explicit
+        # prohibition the sub-agent tends to add Python helpers (a main.py
+        # launcher wrapper, a pytest conftest.py to drive native tests, a
+        # requirements.txt). Forbid them outright so the generated repo stays
+        # a pure single-language project.
+        context += (
+            f"- **This is a {hints.display_name} project, NOT Python.** Every source and test "
+            f"file you create MUST use `{hints.file_extension}` (or the language's own test "
+            "suffix). Do NOT create ANY `.py` file.\n"
+            "- Specifically FORBIDDEN: `main.py` or any Python launcher/wrapper, `conftest.py`, "
+            "`pytest.ini`, `setup.py`, `pyproject.toml`, `requirements.txt`, `__init__.py`, or a "
+            "`.venv`/pip workflow.\n"
+            f"- Run tests ONLY with `{test_command}` ({hints.test_framework_name}). Do NOT wrap, "
+            "re-implement, or drive the test suite through pytest or any Python script.\n"
+        )
+    else:
+        context += (
+            "- Do NOT introduce Python-specific files, packages, or pytest conventions unless this is a Python project.\n"
+        )
+    return context
+
 def build_batch_pytest_cmd(
     test_files: List[str],
     venv_python: str,
@@ -408,37 +600,55 @@ def _build_api_summary(repo_path: Path, source_files: List[str], max_chars: int 
     Returns:
         Formatted string of file → class/function signatures.
     """
-    import ast as _ast
+    # Resolve the project's actual backend so signatures are extracted from
+    # the right language. Python keeps a precise AST rendering (bare argument
+    # names + return annotation); every other language uses the backend's own
+    # one-line ``format_signature`` so non-Python test-writing batches still
+    # receive real API context instead of nothing.
+    import ast as _ast  # local import; only used for unparse(returns)
 
+    backend = _resolve_codegen_backend(repo_path)
+    is_python = backend.name == "python"
     summaries = []
     for filepath in sorted(source_files):
         full_path = repo_path / filepath
-        if not full_path.exists() or full_path.suffix != '.py':
+        if not full_path.exists() or not backend.is_source_file(filepath):
             continue
         try:
-            tree = _ast.parse(full_path.read_text(encoding='utf-8'))
-        except (SyntaxError, UnicodeDecodeError):
+            source = full_path.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError):
             continue
 
+        units = backend.list_code_units(source, filepath)
+        # Walk top-level declarations only (parent is None) and, for
+        # classes, list direct public methods. The prompt format keeps
+        # bare argument names plus return annotations.
+        top_level = [u for u in units if u.parent is None]
         file_sigs = []
-        for node in tree.body:
-            if isinstance(node, _ast.ClassDef):
-                if node.name.startswith('_'):
-                    continue
+        for unit in top_level:
+            if not unit.name or unit.name.startswith('_'):
+                continue
+            if unit.unit_type == 'class':
                 methods = [
-                    n.name for n in node.body
-                    if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
-                    and not n.name.startswith('_')
+                    u.name for u in units
+                    if u.unit_type == 'method' and u.parent == unit.name
+                    and not u.name.startswith('_')
                 ]
                 methods_str = ', '.join(methods) if methods else '(dataclass)'
-                file_sigs.append(f"  class {node.name}: {methods_str}")
-            elif isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
-                if node.name.startswith('_'):
-                    continue
-                args = [a.arg for a in node.args.args if a.arg != 'self']
-                ret = _ast.unparse(node.returns) if node.returns else ''
-                ret_str = f" -> {ret}" if ret else ""
-                file_sigs.append(f"  def {node.name}({', '.join(args)}){ret_str}")
+                file_sigs.append(f"  class {unit.name}: {methods_str}")
+            elif unit.unit_type == 'function':
+                if is_python:
+                    node = (unit.extra or {}).get('ast_node')
+                    if node is None:
+                        continue
+                    args = [a.arg for a in node.args.args if a.arg != 'self']
+                    ret = _ast.unparse(node.returns) if node.returns else ''
+                    ret_str = f" -> {ret}" if ret else ""
+                    file_sigs.append(f"  def {unit.name}({', '.join(args)}){ret_str}")
+                else:
+                    # Non-Python: use the backend's own signature renderer.
+                    sig = backend.format_signature(unit) or unit.name
+                    file_sigs.append(f"  {sig}")
 
         if file_sigs:
             summaries.append(f"# {filepath}\n" + "\n".join(file_sigs))
@@ -555,8 +765,13 @@ def build_tdd_prompt(
     Returns:
         Complete prompt string ready for LLMClient.generate().
     """
+    backend = _resolve_codegen_backend(repo_path)
     venv_python = get_dev_python(repo_path) or "python3"
-    import_convention = build_import_convention_snippet(repo_path=repo_path)
+    import_convention = (
+        build_import_convention_snippet(repo_path=repo_path)
+        if backend.name == "python"
+        else ""
+    )
 
     # --- Project docs: simplest path ---
     if is_project_docs_batch(task):
@@ -579,8 +794,11 @@ def build_tdd_prompt(
         test_files = []
     else:
         test_files = find_related_test_files(task.file_path, repo_path)
-    pytest_cmd = build_batch_pytest_cmd(test_files, venv_python)
-    pip_cmd = _build_pip_install_cmd(repo_path)
+    pytest_cmd = _build_backend_test_cmd(backend, repo_path, test_files, venv_python)
+
+    # Language-aware entry point reference so testing-batch guidance never
+    # plants a Python file name (e.g. "main.py") in a non-Python project.
+    entry_point = backend.prompt_hints().entrypoint_example or "the main entry point"
 
     # For testing batches, allow fixing genuine integration bugs
     if task.task_type in ("integration_test", "final_test_docs"):
@@ -594,11 +812,12 @@ def build_tdd_prompt(
             "- Data format mismatch at a module boundary\n\n"
             "Do NOT modify production code solely to make a poorly-written test pass.\n"
             "The test should reflect correct behavior; the code should implement it.\n"
-            "Do NOT create main.py — it will be created in a later task.\n\n"
+            f"Do NOT create the entry point ({entry_point}) — it will be created in a later task.\n\n"
             "**Testing strategy for efficiency:**\n"
-            "- After the first full pytest run, use `--last-failed` on subsequent runs "
-            "to only re-run failing tests. This saves time.\n"
-            "- Only run a full pytest at the very end to confirm everything passes.\n"
+            "- After the first full test-command run, use the native tool's "
+            "focused rerun option when available. This saves time.\n"
+            "- Only run the full provided test command at the very end to "
+            "confirm everything passes.\n"
         )
     else:
         code_instructions = batch_state.code_prompt
@@ -660,10 +879,15 @@ def build_tdd_prompt(
         test_instructions=batch_state.test_prompt,
         code_instructions=code_instructions,
         pytest_cmd=pytest_cmd,
+        test_tool_name=backend.prompt_hints().test_framework_name,
         max_iterations=MAX_ITERATIONS,
         batch_id=batch_state.batch_id,
-        pip_install_cmd=pip_cmd,
+        dependency_manifest_instruction=_dependency_manifest_instruction(backend),
+        dependency_install_capability=_dependency_install_capability(backend, repo_path),
+        dependency_management=_dependency_management_text(backend, repo_path),
+        test_timeout_rule=_test_timeout_rule(backend),
         import_convention=import_convention,
+        language_context=_build_language_context(backend, pytest_cmd),
         dependency_context=dep_ctx_str,
         file_path=task.file_path,
         units=", ".join(task.units_key),
@@ -688,7 +912,7 @@ def build_resume_prompt(
         failure_reason: One-line reason from BATCH_RESULT: FAIL,
             or the post-verify mismatch reason if the sub-agent
             self-reported PASS but verification failed.
-        last_test_output: pytest output from post-verification.
+        last_test_output: Test-command output from post-verification.
         sub_agent_claimed_pass: True if the previous attempt reported
             ``BATCH_RESULT: PASS`` but post-verify rejected it; this
             triggers an extra warning section in the prompt so the
@@ -714,11 +938,11 @@ def build_resume_prompt(
         post_verify_section = (
             "\n\n## ⚠ False-positive PASS detected\n"
             "Your previous attempt ended with `BATCH_RESULT: PASS` and the\n"
-            f"PYTEST_SUMMARY line {agent_summary_repr}, but the runner's\n"
-            "independent pytest re-run reported the failure shown below.\n"
+            "PYTEST_SUMMARY line {agent_summary_repr}, but the runner's\n"
+            "independent test-command re-run reported the failure shown below.\n"
             "Possible causes you must investigate:\n"
-            "* You did not actually run pytest before declaring PASS.\n"
-            "* You ran pytest with `--no-cov` / `-k` / a different path that\n"
+            "* You did not actually run the exact test command before declaring PASS.\n"
+            "* You ran a different command or selector that\n"
             "  excluded the failing tests.\n"
             "* You modified or deleted tests instead of fixing production code.\n"
             "* Your local changes were not committed before the runner verified.\n"

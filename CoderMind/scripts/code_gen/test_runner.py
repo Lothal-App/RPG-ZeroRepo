@@ -13,7 +13,6 @@ import re
 import signal
 import subprocess
 import sys
-import ast
 import shutil
 import importlib.util
 import logging
@@ -25,6 +24,15 @@ from .test_output_parser import analyze_test_output
 from common.llm_client import LLMClient
 import json as _json
 from common.import_normalizer import normalize_files
+from common.paths import FEATURE_SPEC_FILE, REPO_RPG_FILE
+from decoder_lang import (
+    EnvHandle,
+    LanguageBackend,
+    ToolchainUnavailable,
+    get_backend,
+    resolve_decoder_language,
+    scan_repo_source_files,
+)
 
 
 def _set_pdeathsig() -> None:
@@ -108,35 +116,22 @@ def find_test_files_in_directory(
     return sorted(test_files)
 
 
-def find_related_test_files(
-    source_file: str,
-    repo_root: Path
-) -> List[str]:
-    """Find test files related to a source file using path-signature matching.
+def _existing_relative_paths(repo_root: Path, candidates: List[Path]) -> List[str]:
+    """Return existing candidate paths relative to ``repo_root`` without duplicates."""
+    seen: Set[str] = set()
+    found: List[str] = []
+    for candidate in candidates:
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        rel = str(candidate.relative_to(repo_root))
+        if rel not in seen:
+            seen.add(rel)
+            found.append(rel)
+    return found
 
-    Builds a canonical signature from the source path by stripping common
-    prefixes (``src/``, ``lib/``) and the project-package directory, then
-    joining remaining directory parts + stem with ``_``.
 
-    Example::
-
-        src/flask_blog/auth/views.py  → signature "auth_views"
-        tests/test_auth_views.py      → match ✓
-
-    If no signature match is found, falls back to simple stem matching
-    (the legacy behavior).
-
-    Args:
-        source_file: Path to the source file (relative to repo root)
-        repo_root: Repository root path
-
-    Returns:
-        List of related test file paths (relative to repo root)
-    """
-    source_path = Path(source_file)
-    if source_path.suffix != '.py':
-        return []
-
+def _find_related_python_tests(source_path: Path, repo_root: Path) -> List[str]:
+    """Find Python tests related to ``source_path`` using legacy heuristics."""
     # --- Build canonical signature from source path ---
     # Strip known prefixes: "src", "lib"
     skip_prefixes = {'src', 'lib'}
@@ -187,6 +182,78 @@ def find_related_test_files(
                 related_tests.append(str(test_file.relative_to(repo_root)))
 
     return related_tests
+
+
+def _find_related_non_python_tests(source_path: Path, repo_root: Path) -> List[str]:
+    """Find likely related non-Python test files using common naming conventions.
+
+    These are discovery hints only.  Non-Python post-verification still runs the
+    backend's project-level test command unless a backend-specific selector layer
+    explicitly supports scoped execution.
+    """
+    suffix = source_path.suffix.lower()
+    stem = source_path.stem
+    parent = repo_root / source_path.parent
+    tests_dir = repo_root / "tests"
+
+    if suffix == ".go":
+        return _existing_relative_paths(repo_root, [parent / f"{stem}_test.go"])
+
+    if suffix == ".rs":
+        return _existing_relative_paths(repo_root, [
+            parent / f"{stem}_test.rs",
+            tests_dir / f"{stem}.rs",
+            tests_dir / f"{stem}_test.rs",
+        ])
+
+    if suffix in {".ts", ".tsx", ".js", ".jsx"}:
+        variants = [
+            f"{stem}.test{suffix}",
+            f"{stem}.spec{suffix}",
+        ]
+        return _existing_relative_paths(repo_root, [
+            *(parent / name for name in variants),
+            *(parent / "__tests__" / name for name in variants),
+            *(tests_dir / name for name in variants),
+            *(tests_dir / source_path.parent.name / name for name in variants),
+        ])
+
+    c_suffixes = {".c": [".c"], ".cpp": [".cpp", ".cc", ".cxx"], ".cc": [".cc", ".cpp", ".cxx"], ".cxx": [".cxx", ".cpp", ".cc"]}
+    if suffix in c_suffixes:
+        names = []
+        for ext in c_suffixes[suffix]:
+            names.extend([f"test_{stem}{ext}", f"{stem}_test{ext}"])
+        return _existing_relative_paths(repo_root, [
+            *(parent / name for name in names),
+            *(tests_dir / name for name in names),
+        ])
+
+    return []
+
+
+def find_related_test_files(
+    source_file: str,
+    repo_root: Path
+) -> List[str]:
+    """Find test files likely related to a source file.
+
+    Python keeps the legacy path-signature matching. Other languages use
+    conservative file-name conventions (Go ``*_test.go``, JS/TS
+    ``*.test.*``/``*.spec.*``, C/C++ ``test_*``/``*_test`` and Rust common
+    integration-test names). These results are discovery hints; backend-specific
+    test execution decides whether scoped execution is safe.
+
+    Args:
+        source_file: Path to the source file (relative to repo root)
+        repo_root: Repository root path
+
+    Returns:
+        List of related test file paths (relative to repo root)
+    """
+    source_path = Path(source_file)
+    if source_path.suffix == '.py':
+        return _find_related_python_tests(source_path, repo_root)
+    return _find_related_non_python_tests(source_path, repo_root)
 
 
 def extract_files_from_diff(diff_content: str) -> Tuple[List[str], List[str]]:
@@ -403,6 +470,142 @@ def run_pytest(
             success=False,
             return_code=-1,
             output=f"Test execution failed: {str(e)}",
+            test_files=test_files or [],
+        )
+
+
+def _load_json_if_exists(path: Path) -> Any:
+    """Load JSON from ``path`` or return None when unavailable."""
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            return _json.load(file)
+    except (OSError, _json.JSONDecodeError):
+        return None
+
+
+def resolve_test_backend(
+    valid_files: Optional[List[str]] = None,
+    repo_path: Optional[Path] = None,
+) -> LanguageBackend:
+    """Resolve the backend that should run codegen verification tests.
+
+    Language is resolved through :func:`resolve_decoder_language`'s tier
+    chain (feature_spec meta -> rpg meta -> dominant language of the
+    supplied files -> python default). When the caller has no scoped
+    ``valid_files`` (e.g. the final-test / global-review / env-setup
+    stages operate over the whole repo), pass ``repo_path`` so the
+    language can still be inferred from the actual on-disk sources rather
+    than silently defaulting to python for a non-python project.
+    """
+    feature_spec = _load_json_if_exists(FEATURE_SPEC_FILE)
+    rpg_obj = _load_json_if_exists(REPO_RPG_FILE)
+    if not valid_files and repo_path is not None:
+        valid_files = scan_repo_source_files(repo_path) or None
+    language = resolve_decoder_language(
+        feature_spec=feature_spec,
+        rpg_obj=rpg_obj,
+        valid_files=valid_files,
+    )
+    return get_backend(language)
+
+
+def run_project_tests(
+    repo_root: Path,
+    test_files: Optional[List[str]] = None,
+    timeout: int = 300,
+    extra_args: Optional[List[str]] = None,
+    env: Optional[Dict[str, str]] = None,
+    backend: Optional[LanguageBackend] = None,
+) -> TestResult:
+    """Run the target language's native project test command."""
+    selected_backend = backend or resolve_test_backend(
+        valid_files=test_files, repo_path=repo_root
+    )
+    if selected_backend.name == "python":
+        return run_pytest(
+            repo_root,
+            test_files=test_files,
+            timeout=timeout,
+            extra_args=extra_args,
+            env=env,
+        )
+
+    try:
+        env_handle = selected_backend.detect_env(repo_root) or EnvHandle(
+            project_root=repo_root.resolve(),
+        )
+        # Settle the build state before testing (no-op for most backends;
+        # C/C++ reconfigure cmake so ctest sees the current test set rather
+        # than a stale one left from a mid-edit configure).
+        prepare = getattr(selected_backend, "prepare_test_env", None)
+        if callable(prepare):
+            try:
+                prepare(env_handle)
+            except Exception as exc:  # noqa: BLE001 - best-effort prep
+                _logger.debug("prepare_test_env failed (non-fatal): %s", exc)
+        cmd = selected_backend.test_command(env_handle)
+    except (ToolchainUnavailable, NotImplementedError, OSError) as exc:
+        return TestResult(
+            success=False,
+            return_code=-1,
+            output=f"{selected_backend.display_name} test command unavailable: {exc}",
+            test_files=test_files or [],
+        )
+
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=run_env,
+            start_new_session=True,
+            preexec_fn=_set_pdeathsig,
+        )
+        try:
+            stdout_data, stderr_data = proc.communicate(timeout=timeout)
+        except BaseException:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                proc.kill()
+            proc.wait()
+            raise
+
+        output = stdout_data
+        if stderr_data:
+            output += "\n\nSTDERR:\n" + stderr_data
+        parsed = selected_backend.parse_test_output(output, proc.returncode)
+        return TestResult(
+            success=parsed.status == "passed",
+            return_code=proc.returncode,
+            output=output,
+            test_files=test_files or [],
+            passed=parsed.passed_count,
+            failed=parsed.failed_count,
+            errors=parsed.error_count,
+            skipped=parsed.skipped_count,
+            duration=parsed.duration_sec,
+        )
+    except subprocess.TimeoutExpired:
+        return TestResult(
+            success=False,
+            return_code=-1,
+            output=f"Test execution timed out after {timeout} seconds",
+            test_files=test_files or [],
+        )
+    except Exception as exc:
+        return TestResult(
+            success=False,
+            return_code=-1,
+            output=f"Test execution failed: {exc}",
             test_files=test_files or [],
         )
 
@@ -798,7 +1001,13 @@ def scan_missing_imports(repo_root: Path) -> List[str]:
                 if child.is_dir() and not child.name.startswith('.'):
                     project_modules.add(child.name)
 
-    # Collect all external imports from source files
+    # Collect all external imports from source files through the
+    # backend import scanner. ``LPDependency.extra["module"]`` carries
+    # the dotted module name for both ``import`` and ``from`` statements;
+    # use the top-level segment for dependency installation.
+    from decoder_lang import get_backend
+    backend = get_backend("python")
+
     external_imports: Set[str] = set()
     scan_dirs = [d for d in [src_dir, tests_dir] if d.is_dir()]
 
@@ -808,19 +1017,16 @@ def scan_missing_imports(repo_root: Path) -> List[str]:
                 continue
             try:
                 source = py_file.read_text(encoding='utf-8')
-                tree = ast.parse(source)
-            except (SyntaxError, UnicodeDecodeError):
+            except (OSError, UnicodeDecodeError):
                 continue
-            for node in ast.walk(tree):
-                mod_name = None
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        mod_name = alias.name.split('.')[0]
-                elif isinstance(node, ast.ImportFrom):
-                    if node.module and node.level == 0:
-                        mod_name = node.module.split('.')[0]
-                if mod_name is None:
+            for dep in backend.list_imports(source, str(py_file)):
+                extra = dep.extra or {}
+                module = extra.get("module") or ""
+                if not module or module.startswith("."):
+                    # Skip relative imports; they refer to project-local
+                    # modules rather than installable third-party packages.
                     continue
+                mod_name = module.split(".")[0]
                 if mod_name in _STDLIB_TOP_LEVEL or mod_name in project_modules:
                     continue
                 external_imports.add(mod_name)

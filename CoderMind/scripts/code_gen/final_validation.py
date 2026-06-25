@@ -26,13 +26,15 @@ from typing import Any, Dict, Optional
 
 from common.git_utils import GitRunner
 from common.paths import CODE_GEN_STATE_FILE as STATE_FILE, REPO_DIR
+from code_gen.batch_prompts import _build_backend_test_cmd
 from code_gen.git_ops import ensure_on_main
 from code_gen.stage_io import save_stage_result
 from code_gen.sub_agent import dispatch_sub_agent
 from code_gen.test_runner import (
     ensure_deps_installed,
     get_dev_python,
-    run_pytest,
+    resolve_test_backend,
+    run_project_tests,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,12 +49,17 @@ from code_gen._constants import (  # noqa: E402
 def final_test(
     repo_path: Optional[Path] = None,
     state_path: Path = STATE_FILE,
+    max_repair_iters: int = 2,
 ) -> Dict[str, Any]:
     """Run the full test suite against the completed repo.
 
     Args:
         repo_path: Project repo path.
         state_path: Path to state file.
+        max_repair_iters: Bound on repair sub-agent passes when the full
+            suite fails. Cross-batch inconsistencies (e.g. a test asserting the
+            README documents a symbol another batch produced) only surface here,
+            where no per-batch TDD loop can catch them.
 
     Returns:
         Result dict with test statistics.
@@ -67,21 +74,134 @@ def final_test(
     except RuntimeError as exc:
         return {"success": False, "error": str(exc)}
 
-    # Ensure all deps
-    try:
-        ensure_deps_installed(repo_path)
-    except Exception as exc:
-        logger.warning("Dependency install issue: %s", exc)
+    backend = resolve_test_backend(repo_path=repo_path)
+    if backend.name == "python":
+        try:
+            ensure_deps_installed(repo_path)
+        except Exception as exc:
+            logger.warning("Dependency install issue: %s", exc)
 
     # Run full test suite
-    result = run_pytest(
+    result = run_project_tests(
         repo_path,
         timeout=DEFAULT_PYTEST_OVERALL_TIMEOUT,
         extra_args=[
             "-v", "--tb=short",
             f"--timeout={DEFAULT_TEST_TIMEOUT}", "--timeout-method=thread",
         ],
+        backend=backend,
     )
+
+    # Guard against a no-op "pass": a verification gate that executed zero
+    # tests is not a pass, it is a non-result (e.g. ``go test ./...`` matching
+    # no packages, or the runner invoked before sources were in the tree).
+    # The backend already reports this as a non-success "errored" status; here
+    # we make the final gate fail loudly with a precise diagnostic instead of
+    # dispatching a code-repair agent that cannot fix a "no tests ran" state.
+    executed = result.passed + result.failed + result.errors + result.skipped
+    if not result.success and executed == 0:
+        # A toolchain/infra failure (missing tool, timeout, crash →
+        # return_code -1) is a different non-result than a command that ran
+        # cleanly (exit 0) yet collected zero tests. Neither is a pass and
+        # neither is fixable by a code-repair agent, but they need different
+        # diagnostics, so report them distinctly.
+        toolchain_failure = result.return_code != 0
+        if toolchain_failure:
+            next_action = (
+                f"Final test could not run the {backend.display_name} test "
+                "command (toolchain unavailable, timeout, or crash). Install or "
+                "repair the language toolchain and re-run — this is an "
+                "environment problem, not a code defect."
+            )
+        else:
+            next_action = (
+                f"Final test ran the {backend.display_name} test command but "
+                "no tests executed (zero collected). This is a verification "
+                "no-op, not a pass: confirm the generated test suite is present "
+                "on the main branch and the test command discovers it."
+            )
+        logger.error(
+            "Final test executed zero tests for %s backend (return_code=%s) — "
+            "treating as a verification failure, not a pass.",
+            backend.name, result.return_code,
+        )
+        no_test_result = {
+            "success": False,
+            "type": "final_test",
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+            "duration": result.duration,
+            "output": result.output[:5000],
+            "no_tests_executed": not toolchain_failure,
+            "toolchain_unavailable": toolchain_failure,
+            "next_action": next_action,
+        }
+        save_stage_result("final_test", {
+            "success": False,
+            "passed": 0,
+            "failed": 0,
+            "errors": 0,
+            "no_tests_executed": not toolchain_failure,
+            "toolchain_unavailable": toolchain_failure,
+            "output_tail": "\n".join(result.output.splitlines()[-40:]),
+        })
+        return no_test_result
+
+    # Repair loop for full-suite failures. The per-batch TDD loop only sees one
+    # file's tests at a time, so cross-file consistency gaps (a test asserting
+    # the README / an example module documents a specific symbol or section that
+    # a different batch generated independently) survive to here. Dispatch a
+    # bounded repair pass that reconciles the repo against the EXISTING tests
+    # rather than letting one such gap fail the whole stage with no recovery.
+    repair_attempts = 0
+    while not result.success and repair_attempts < max_repair_iters:
+        repair_attempts += 1
+        venv_python = get_dev_python(repo_path) or "python3"
+        repair_verify_cmd = _build_backend_test_cmd(
+            backend, repo_path, [], venv_python,
+        )
+        failure_tail = "\n".join(result.output.splitlines()[-80:])
+        repair_prompt = (
+            "The full test suite failed after every batch completed. Reconcile "
+            "the repository so the EXISTING tests pass. These failures are "
+            "usually cross-file consistency gaps — for example a test asserts "
+            "that the README or an example module documents a specific symbol "
+            "or section, but a different batch generated those files "
+            "independently.\n\n"
+            f"Failing test output (tail):\n{failure_tail}\n\n"
+            "Rules:\n"
+            "- Fix production code, documentation, or example files so the "
+            "existing tests pass. Do NOT delete, skip, or weaken any test.\n"
+            "- Do NOT create new test files.\n\n"
+            f"Verify with:\n```\n{repair_verify_cmd}\n```\n\n"
+            "When the suite is green, commit:\n"
+            "```\ngit add -A && git commit -m "
+            '"fix: reconcile final test failures"\n```\n'
+            "Then output: BATCH_RESULT: PASS"
+        )
+        logger.info(
+            "Final test failed; dispatching repair agent (attempt %d/%d)",
+            repair_attempts, max_repair_iters,
+        )
+        response, error = dispatch_sub_agent(
+            repair_prompt, repo_path, timeout=1800,
+            purpose="final_test_repair",
+        )
+        if not response:
+            logger.warning("Final-test repair agent failed: %s", error)
+            break
+        ensure_on_main(git)
+        result = run_project_tests(
+            repo_path,
+            timeout=DEFAULT_PYTEST_OVERALL_TIMEOUT,
+            extra_args=[
+                "-v", "--tb=short",
+                f"--timeout={DEFAULT_TEST_TIMEOUT}", "--timeout-method=thread",
+            ],
+            backend=backend,
+        )
 
     result_dict = {
         "success": result.success,
@@ -99,6 +219,9 @@ def final_test(
             f"Review the output above and fix remaining issues."
         ),
     }
+    if repair_attempts:
+        result_dict["final_test_repair_attempts"] = repair_attempts
+        result_dict["final_test_repaired"] = result.success
 
     # After pytest passes, run smoke test and attempt repair if issues found
     if result.success:
@@ -106,7 +229,6 @@ def final_test(
             # Lazy import: smoke_test pulls in the dep_graph stack, so only
             # load it on the success path where we actually need it.
             from smoke_test import run_smoke_test
-            from code_gen.batch_prompts import build_batch_pytest_cmd
 
             smoke_result = run_smoke_test()
             smoke_dict = smoke_result.to_dict()
@@ -119,9 +241,11 @@ def final_test(
                 findings_desc = "\n".join(
                     f"- [{f.severity}] {f.message}" for f in actionable
                 )
-                # Build pytest command for the repair agent
+                # Build the language-appropriate verify command for the agent
                 venv_python = get_dev_python(repo_path) or "python3"
-                repair_pytest_cmd = build_batch_pytest_cmd([], venv_python)
+                repair_verify_cmd = _build_backend_test_cmd(
+                    backend, repo_path, [], venv_python,
+                )
                 repair_prompt = (
                     "The smoke test detected the following issues after all "
                     "unit tests passed. Fix each issue in the production code, "
@@ -134,7 +258,7 @@ def final_test(
                     "- Startup crash → fix initialization code\n\n"
                     "Do NOT create new test files. Only fix production code.\n"
                     "After fixing, run this command to verify:\n"
-                    f"```\n{repair_pytest_cmd}\n```\n\n"
+                    f"```\n{repair_verify_cmd}\n```\n\n"
                     "When done, commit your changes:\n"
                     "```\ngit add -A && git commit -m "
                     '"fix: repair smoke test findings"\n```\n'
@@ -150,13 +274,14 @@ def final_test(
                 )
                 if response:
                     # Verify repair didn't break existing tests
-                    recheck = run_pytest(
+                    recheck = run_project_tests(
                         repo_path,
                         timeout=DEFAULT_PYTEST_OVERALL_TIMEOUT,
                         extra_args=[
                             "-v", "--tb=short",
                             f"--timeout={DEFAULT_TEST_TIMEOUT}", "--timeout-method=thread",
                         ],
+                        backend=backend,
                     )
                     if not recheck.success:
                         logger.warning(

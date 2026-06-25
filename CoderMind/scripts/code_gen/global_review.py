@@ -33,7 +33,7 @@ from common.paths import (
     REPO_DIR,
     TOOLS_DIR,
 )
-from code_gen.batch_prompts import build_batch_pytest_cmd
+from code_gen.batch_prompts import _build_backend_test_cmd
 from code_gen.stage_io import (
     save_stage_result as _save_stage_result,
     load_stage_result as _load_stage_result,
@@ -42,7 +42,8 @@ from code_gen.sub_agent import dispatch_sub_agent
 from code_gen.test_runner import (
     ensure_deps_installed,
     get_dev_python,
-    run_pytest,
+    resolve_test_backend,
+    run_project_tests,
 )
 
 logger = logging.getLogger(__name__)
@@ -652,8 +653,8 @@ def _collect_children(children: list, depth: int = 1, max_depth: int = 3) -> Lis
 def _load_gui_script_reuse_context(repo_path: Path) -> str:
     """Load reusable GUI interaction scripts for review prompt context.
 
-    Scripts are stored under ``repo/.cmind/tmp/gui_test_scripts`` and are
-    intended to capture stable, previously-validated interaction flows.
+    Scripts are stored under ``repo/.cmind/tmp/gui_test_scripts`` and
+    capture stable interaction flows that the review prompt can reuse.
     """
     scripts_dir = repo_path / ".cmind" / "tmp" / "gui_test_scripts"
     if not scripts_dir.is_dir():
@@ -714,7 +715,8 @@ def _build_review_prompt(repo_path: Path, previous_issues: str = "") -> str:
         file_list = "(file listing unavailable)"
 
     venv_python = get_dev_python(repo_path) or "python3"
-    pytest_cmd = build_batch_pytest_cmd([], venv_python)
+    backend = resolve_test_backend(repo_path=repo_path)
+    pytest_cmd = _build_backend_test_cmd(backend, repo_path, [], venv_python)
     gui_script_reuse_context = _load_gui_script_reuse_context(repo_path)
 
     # Load accumulated findings from all pipeline stages
@@ -1115,6 +1117,7 @@ def global_review(
     }
     start_time = time.time()
     previous_issues = ""
+    backend = resolve_test_backend(repo_path=repo_path)
 
     for iteration in range(1, max_iterations + 1):
         logger.info("━━━ Global Review: iteration %d/%d ━━━", iteration, max_iterations)
@@ -1127,15 +1130,17 @@ def global_review(
         except Exception:
             pass
 
-        # 1. Pre-check: run pytest to know current state
-        try:
-            ensure_deps_installed(repo_path)
-        except Exception:
-            pass
-        pre_pytest = run_pytest(
+        # 1. Pre-check: run the project's tests to know current state
+        if backend.name == "python":
+            try:
+                ensure_deps_installed(repo_path)
+            except Exception:
+                pass
+        pre_pytest = run_project_tests(
             repo_path,
             timeout=DEFAULT_PYTEST_OVERALL_TIMEOUT,
             extra_args=[f"--timeout={DEFAULT_TEST_TIMEOUT}", "--timeout-method=thread"],
+            backend=backend,
         )
         # Update stage file so _build_review_prompt sees fresh state
         _save_stage_result("final_test", {
@@ -1192,10 +1197,11 @@ def global_review(
         # 5. Post-verify (independent — don't trust sub-agent)
         _cleanup_background_processes(repo_path)
 
-        post_pytest = run_pytest(
+        post_pytest = run_project_tests(
             repo_path,
             timeout=DEFAULT_PYTEST_OVERALL_TIMEOUT,
             extra_args=["-v", "--tb=short", f"--timeout={DEFAULT_TEST_TIMEOUT}", "--timeout-method=thread"],
+            backend=backend,
         )
 
         # Stub check

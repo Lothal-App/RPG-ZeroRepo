@@ -30,7 +30,8 @@ from code_gen.prompts import is_project_docs_batch
 from code_gen.test_runner import (
     ensure_deps_installed,
     find_related_test_files,
-    run_pytest,
+    resolve_test_backend,
+    run_project_tests,
 )
 
 logger = logging.getLogger(__name__)
@@ -110,22 +111,30 @@ def post_verify(
         # fall back to all tests so no regression goes undetected.
         test_files = _git_diff_test_files("tests/test_")
 
+    regular_file = not (task.file_path.startswith("<") and task.file_path.endswith(">"))
+    backend_hint_files = test_files or ([task.file_path] if regular_file else None)
+    backend = resolve_test_backend(valid_files=backend_hint_files, repo_path=repo_path)
+    run_test_files = test_files if backend.name == "python" else None
+
     logger.info(
-        "Post-verification: running pytest on %s",
-        test_files if test_files else "all tests",
+        "Post-verification: related test files=%s; running %s project tests on %s",
+        test_files if test_files else "none",
+        backend.display_name,
+        run_test_files if run_test_files else "all tests",
     )
 
-    # Ensure deps are installed (sub-agent may have added new ones)
-    try:
-        ensure_deps_installed(repo_path)
-    except Exception as exc:
-        logger.warning("ensure_deps_installed failed: %s", exc)
+    if backend.name == "python":
+        try:
+            ensure_deps_installed(repo_path)
+        except Exception as exc:
+            logger.warning("ensure_deps_installed failed: %s", exc)
 
-    result = run_pytest(
+    result = run_project_tests(
         repo_path,
-        test_files=test_files or None,
+        test_files=run_test_files,
         timeout=timeout,
         extra_args=[f"--timeout={DEFAULT_TEST_TIMEOUT}", "--timeout-method=thread"],
+        backend=backend,
     )
 
     # Build summary

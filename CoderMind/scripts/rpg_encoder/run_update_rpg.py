@@ -30,6 +30,7 @@ from common.paths import (  # noqa: E402
     DEP_GRAPH_FILE,
     WORKSPACE_ROOT,
 )
+from common.rpg_io import atomic_write_rpg  # noqa: E402
 
 
 def run_update_rpg(
@@ -60,9 +61,9 @@ def run_update_rpg(
     cur_repo_dir = os.path.abspath(cur_repo_dir)
     last_repo_dir = os.path.abspath(last_repo_dir)
     rpg_file = os.path.abspath(rpg_file)
-    # ``dep_graph_path`` defaults to the standard ``.cmind/data/dep_graph.json``
-    # location so that ``run_update_rpg.py`` (CLI) and the pre-commit
-    # hook agree on a single canonical file.
+    # ``dep_graph_path`` is a legacy standalone location retained for
+    # callers that still pass ``--dep-graph``. Normal updates embed the
+    # refreshed dependency graph in ``rpg.json``.
     if dep_graph_path is None:
         dep_graph_path = str(DEP_GRAPH_FILE)
     else:
@@ -114,9 +115,11 @@ def run_update_rpg(
         pre_commit = (rpg.git_meta or {}).get("head_commit")
 
         # === Step 1: LLM-driven feature graph refactor ===
-        # Now threaded with the dep_graph save path so the structural
-        # refresh inside process_diff actually persists dep_graph.json
-        # to disk (fixes the legacy ``_update_dep_graph_index`` bug).
+        # ``dep_graph_save_path=None``: the dep_graph rides inside
+        # ``rpg.json`` as the single source of truth (embedded by
+        # ``RPG.to_dict`` and persisted by the ``atomic_write_rpg`` below).
+        # The legacy standalone ``dep_graph.json`` is no longer produced;
+        # readers tolerate its absence and use the embedded copy.
         updated_rpg = RPGEvolution.process_diff(
             repo_name=repo_name,
             repo_info=repo_info,
@@ -126,7 +129,6 @@ def run_update_rpg(
             last_rpg=rpg,
             last_feature_tree=feature_tree,
             update_dep_graph=True,
-            dep_graph_save_path=dep_graph_path,
             max_exclude_votes=max_exclude_votes,
         )
 
@@ -171,11 +173,14 @@ def run_update_rpg(
         except Exception as exc:
             logger.warning("set_git_meta after update_rpg failed: %s", exc)
 
-        # Save updated RPG in the same format as run_encode (rpg.to_dict())
+        # Save updated RPG in the same format as run_encode (rpg.to_dict()).
+        # Atomic write: a kill mid-update used to leave a half-truncated
+        # rpg.json that bricked every subsequent ``cmind`` invocation;
+        # ``atomic_write_rpg`` swaps a fully-written ``<output>.tmp`` into
+        # place so readers always see either the previous good rpg.json
+        # or the new one.
         result_data = updated_rpg.to_dict()
-
-        with open(output, "w", encoding="utf-8") as fh:
-            json.dump(result_data, fh, indent=2, ensure_ascii=False)
+        atomic_write_rpg(output, result_data, indent=2, ensure_ascii=False)
 
         # Collect stats
         post_nodes = len(updated_rpg.nodes)
@@ -227,8 +232,8 @@ def main():
         "--dep-graph",
         default=None,
         help=(
-            "Path to write dep_graph.json (default: .cmind/data/dep_graph.json). "
-            "Must match the path used by the pre-commit sync hook to avoid drift."
+            "Legacy standalone dep_graph path. Normal updates embed the "
+            "dependency graph in rpg.json."
         ),
     )
     parser.add_argument(

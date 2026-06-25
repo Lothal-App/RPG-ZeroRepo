@@ -31,6 +31,7 @@ from .path_format import (
     desc_key_function,
     desc_key_class,
     desc_key_method,
+    from_dep_graph_id,
 )
 
 if TYPE_CHECKING:
@@ -98,6 +99,11 @@ class NodeMetaData:
     description: str = ""
     content: str = ""
     generator: str = ""
+    # Source language ("python", "go", "typescript", ...). Populated by the
+    # encoder via lang_parser.detect_language for any FILE / code-entity node
+    # backed by an on-disk source file. ``None`` for non-code nodes
+    # (features, directories, etc.) or when detection is unavailable.
+    language: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -106,6 +112,7 @@ class NodeMetaData:
             "content": self.content,
             "description": self.description,
             "generator": self.generator,
+            "language": self.language,
         }
 
     @classmethod
@@ -120,6 +127,7 @@ class NodeMetaData:
             description=d.get("description", ""),
             content=d.get("content", ""),
             generator=d.get("generator", ""),
+            language=d.get("language"),
         )
 
 
@@ -187,16 +195,11 @@ def _normalize_dep_id_for_matching(dep_nid: str) -> str:
     """Normalize a dep-graph node ID to a suffix-based matching key.
 
     ``'models/user.py:User'``   → ``'models/user.py::User'``
-    ``'models/user.py'``         → ``'models/user.py'``
-    ``'x.py:Cls.method'``        → ``'x.py::Cls.method'``
+    ``'models/user.go:User'``   → ``'models/user.go::User'``
+    ``'models/user.py'``        → ``'models/user.py'``
+    ``'x.py:Cls.method'``       → ``'x.py::Cls.method'``
     """
-    if ".py:" in dep_nid:
-        file_part, entity = dep_nid.rsplit(":", 1)
-    else:
-        file_part, entity = dep_nid, ""
-    parts = file_part.replace("\\", "/").split("/")
-    suffix = "/".join(parts[-2:]) if len(parts) >= 2 else file_part
-    return f"{suffix}::{entity}" if entity else suffix
+    return _normalize_path_for_matching(from_dep_graph_id(dep_nid))
 
 
 def infer_type_name_from_path(path: str, has_children: bool = False) -> Optional[str]:
@@ -251,7 +254,17 @@ def infer_type_name_from_path(path: str, has_children: bool = False) -> Optional
     
     if path.endswith(".py"):
         return "file"
-    
+
+    # Non-Python source files (Go / TypeScript / JavaScript / C / C++ /
+    # Rust, ...). Delegate to lang_parser if available so the inference
+    # stays in sync with the parser registry.
+    try:
+        from lang_parser import is_supported_source
+        if is_supported_source(path):
+            return "file"
+    except ImportError:
+        pass
+
     return "directory"
 
 
@@ -435,7 +448,7 @@ class RPG:
 
         # Cross-graph mapping (dep_graph ↔ feature graph)
         self._feature_to_dep_map: Dict[str, List[str]] = {}  # feature_node_id -> [dep_node_ids]
-        self._dep_graph_file: Optional[str] = None  # relative path to dep_graph.json (for serialization)
+        self._dep_graph_file: Optional[str] = None  # legacy external dep_graph path
 
         # Git sync state — see :meth:`set_git_meta`.  ``None`` means the RPG
         # has never been linked to a git commit (e.g. brand-new RPG produced
@@ -1936,45 +1949,28 @@ class RPG:
                     dep2rpg[nid] = filtered
                     continue
 
-            # Fallback for code-unit dep nodes: if RPG has no dedicated
-            # function/class/method node, map to the parent file node instead.
-            if dep_node_type is not None:
-                dep_type_str = (
-                    dep_node_type.value
-                    if hasattr(dep_node_type, "value")
-                    else str(dep_node_type)
-                )
-                if dep_type_str in ("class", "function", "method"):
-                    # Extract file path from qualified path
-                    # e.g. "src/x.py:Cls" -> "src/x.py"
-                    # e.g. "src/x.py::function foo" -> "src/x.py"
-                    sep = "::" if "::" in nid else (":" if ":" in nid else None)
-                    if sep:
-                        file_part = nid.split(sep, 1)[0]
-                        file_rpg_path = prefix + file_part if prefix else file_part
-                        file_matches = rpg_path_index.get(file_rpg_path, [])
-                        if not file_matches:
-                            file_matches = rpg_path_index.get(file_part, [])
-                        if file_matches:
-                            # Prefer an exact file-type node; accept any if none
-                            file_filtered = [
-                                rpg_nid for rpg_nid in file_matches
-                                if self._node_index[rpg_nid].meta
-                                and self._node_index[rpg_nid].meta.type_name is not None
-                                and (
-                                    self._node_index[rpg_nid].meta.type_name.value == "file"
-                                    if hasattr(self._node_index[rpg_nid].meta.type_name, "value")
-                                    else str(self._node_index[rpg_nid].meta.type_name) == "file"
-                                )
-                            ]
-                            if file_filtered:
-                                dep2rpg[nid] = file_filtered
-                            elif file_matches:
-                                dep2rpg[nid] = file_matches
+            # Fallback: exact canonical path match for dep-graph code-unit IDs
+            # (``src/x.py:Cls.method`` -> ``src/x.py::Cls::method``).
+            canonical_path = from_dep_graph_id(nid)
+            canonical_rpg_path = prefix + canonical_path if prefix else canonical_path
+            matched_canonical = rpg_path_index.get(canonical_rpg_path, [])
+            if not matched_canonical and canonical_rpg_path != canonical_path:
+                matched_canonical = rpg_path_index.get(canonical_path, [])
+            if matched_canonical:
+                filtered = [
+                    rpg_nid for rpg_nid in matched_canonical
+                    if self._node_index[rpg_nid].meta
+                    and self._node_index[rpg_nid].meta.type_name == dep_node_type
+                ]
+                if filtered:
+                    dep2rpg[nid] = filtered
+                    continue
 
         # Step 4: suffix-normalized fallback for remaining unmatched nodes.
-        # Resolves separator mismatch (dep ':' vs RPG '::class') and
-        # path-prefix differences (decoder 'src/...' vs encoder 'repo/...').
+        # Resolves separator mismatch (dep ':' vs RPG '::') and path-prefix
+        # differences (decoder 'src/...' vs encoder 'repo/...'). Run this
+        # before the parent-file fallback so code units prefer their exact RPG
+        # node over a coarse file node when both are present.
         unmatched = [nid for nid in self.dep_graph.G.nodes() if nid not in dep2rpg]
         if unmatched:
             rpg_suffix_index = self._build_rpg_suffix_index()
@@ -1989,6 +1985,53 @@ class RPG:
                 ]
                 if filtered:
                     dep2rpg[dep_nid] = filtered
+
+        # Final fallback for code-unit dep nodes: if RPG has no dedicated
+        # function/class/method node, map to the parent file node instead.
+        unmatched = [nid for nid in self.dep_graph.G.nodes() if nid not in dep2rpg]
+        for nid in unmatched:
+            dep_node = self.dep_graph.G.nodes[nid]
+            dep_node_type = dep_node.get("type")
+            if dep_node_type is None:
+                continue
+            dep_type_str = (
+                dep_node_type.value
+                if hasattr(dep_node_type, "value")
+                else str(dep_node_type)
+            )
+            if dep_type_str not in ("class", "function", "method"):
+                continue
+
+            # Extract the file path from either dep-graph or canonical RPG path:
+            # ``src/x.py:Cls`` / ``src/x.py::Cls`` -> ``src/x.py``.
+            canonical_path = from_dep_graph_id(nid)
+            if "::" in canonical_path:
+                file_part = canonical_path.split("::", 1)[0]
+            elif ":" in nid:
+                file_part = nid.split(":", 1)[0]
+            else:
+                continue
+
+            file_rpg_path = prefix + file_part if prefix else file_part
+            file_matches = rpg_path_index.get(file_rpg_path, [])
+            if not file_matches:
+                file_matches = rpg_path_index.get(file_part, [])
+            if file_matches:
+                # Prefer an exact file-type node; accept any if none
+                file_filtered = [
+                    rpg_nid for rpg_nid in file_matches
+                    if self._node_index[rpg_nid].meta
+                    and self._node_index[rpg_nid].meta.type_name is not None
+                    and (
+                        self._node_index[rpg_nid].meta.type_name.value == "file"
+                        if hasattr(self._node_index[rpg_nid].meta.type_name, "value")
+                        else str(self._node_index[rpg_nid].meta.type_name) == "file"
+                    )
+                ]
+                if file_filtered:
+                    dep2rpg[nid] = file_filtered
+                elif file_matches:
+                    dep2rpg[nid] = file_matches
 
         return dep2rpg
 
@@ -2073,18 +2116,32 @@ class RPG:
     def save_dep_graph(self, path: str) -> None:
         """Serialize dep_graph to an independent JSON file.
 
+        .. deprecated::
+            The dep_graph is now embedded in ``rpg.json`` via
+            ``RPG.to_dict(include_dep_graph=True)`` (the default), and
+            ``RPGService.load`` prefers the embedded copy.  New code
+            should rely on ``svc.save(rpg_path)`` to persist both the
+            tree and the dep_graph in a single file.  This helper is
+            kept so legacy callers and debugging tools that want a
+            standalone ``dep_graph.json`` snapshot keep working.
+
         Wraps ``DependencyGraph.to_dict()`` with additional metadata
         (``code_dir``, ``generated_at``) to produce the schema defined
         in the encoder-decoder integration plan (§3.2).
+
+        Writes are atomic: a crash during ``json.dump`` leaves the
+        existing ``dep_graph.json`` intact (instead of the truncated
+        half-file that the previous ``open('w') + json.dump`` pattern
+        produced when the encoder was killed mid-write).
         """
         if self.dep_graph is None:
             raise ValueError("No dep_graph attached; call set_dep_graph() first")
         from datetime import datetime, timezone
+        from common.rpg_io import atomic_write_rpg
         raw = self.dep_graph.to_dict(dep_to_rpg_map=self._dep_to_rpg_map)
         raw["code_dir"] = self._dep_graph_code_dir
         raw["generated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-        with open(str(path), "w", encoding="utf-8") as f:
-            json.dump(raw, f, ensure_ascii=False, indent=2)
+        atomic_write_rpg(str(path), raw, ensure_ascii=False, indent=2)
 
     @staticmethod
     def load_dep_graph(path: str) -> "DependencyGraph":
@@ -2794,9 +2851,18 @@ class RPG:
         return node
 
     def save_json(self, path: str, ensure_ascii: bool = False, indent: int = 2):
-        """Save to JSON file."""
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, ensure_ascii=ensure_ascii, indent=indent)
+        """Save to JSON file.
+
+        Routes through :func:`common.rpg_io.atomic_write_rpg` so a
+        crash mid-write leaves the previous ``rpg.json`` intact rather
+        than truncated. Loaders (``safe_load_rpg``) can then fall back
+        to the last known-good version from the inner-git snapshot.
+        """
+        from common.rpg_io import atomic_write_rpg
+        atomic_write_rpg(
+            str(path), self.to_dict(),
+            ensure_ascii=ensure_ascii, indent=indent,
+        )
 
     @classmethod
     def load_json(cls, path: str) -> "RPG":

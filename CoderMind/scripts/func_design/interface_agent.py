@@ -16,13 +16,21 @@ import ast
 import re
 from typing import Dict, List, Optional, Tuple, Any, Set
 from collections import defaultdict, deque
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # Import ParsedFile and CodeUnit for code parsing
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from rpg.code_unit import ParsedFile, CodeUnit
+
+# AST inspection routes through the decoder language backend so
+# code-structure extraction can vary by target language. The direct
+# ``ast`` import supports Python-specific node inspection for docstrings
+# and annotation syntax below.
+from decoder_lang import get_backend
+from decoder_lang.backend import LanguageBackend
+from decoder_lang.prompt_directive import with_language_directive
 
 # Import common LLMClient with trajectory support
 from common import (
@@ -57,6 +65,21 @@ class InterfaceDefinition(BaseModel):
     code: str = Field(..., description="Python code for the interface")
     dependencies: Optional[InterfaceDependency] = Field(default=None, description="Declared dependencies")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalise_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalised = dict(value)
+        if "features" not in normalised:
+            if "feature_paths" in normalised:
+                normalised["features"] = normalised["feature_paths"]
+            elif "feature_path" in normalised:
+                normalised["features"] = [normalised["feature_path"]]
+        if "dependencies" not in normalised and "dependency" in normalised:
+            normalised["dependencies"] = normalised["dependency"]
+        return normalised
+
 
 class InterfaceOutput(BaseModel):
     """Output from LLM for interface design."""
@@ -67,6 +90,28 @@ class FileInterfaceBlock(BaseModel):
     """Block of interface definitions for a single file within a subtree batch."""
     file_path: str = Field(..., description="Path to the file being designed")
     interfaces: List[InterfaceDefinition] = Field(..., min_length=1, description="Interface definitions for this file")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalise_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalised = dict(value)
+        if "file_path" not in normalised and "path" in normalised:
+            normalised["file_path"] = normalised["path"]
+        if "interfaces" not in normalised:
+            for alias in ("interface_definitions", "interface_units", "units"):
+                if alias in normalised:
+                    normalised["interfaces"] = normalised[alias]
+                    break
+        if "interfaces" not in normalised and "code" in normalised:
+            interface_data = {
+                key: normalised[key]
+                for key in ("features", "feature_paths", "feature_path", "code", "dependencies")
+                if key in normalised
+            }
+            normalised["interfaces"] = [interface_data]
+        return normalised
 
 
 class SubtreeInterfaceOutput(BaseModel):
@@ -111,7 +156,12 @@ class DependencyCollector:
     2. LLM declarations - expected function calls declared by LLM
     """
     
-    def __init__(self, known_base_classes: Set[str], known_types: Set[str]):
+    def __init__(
+        self,
+        known_base_classes: Set[str],
+        known_types: Set[str],
+        target_language: Optional[str] = None,
+    ):
         """Initialize the dependency collector.
         
         Args:
@@ -120,6 +170,7 @@ class DependencyCollector:
         """
         self.known_base_classes = known_base_classes
         self.known_types = known_types
+        self.backend = get_backend(target_language)
         self.original_edges: List[Dict[str, Any]] = []
         self.inheritance_edges: List[Dict[str, Any]] = []
         self.invocation_edges: List[Dict[str, Any]] = []
@@ -226,50 +277,62 @@ class DependencyCollector:
         file_path: str,
         base_class_files: Dict[str, str]
     ):
-        """Analyze code to extract dependencies via AST parsing.
-        
-        Extracts:
-        - Inheritance relationships (class X(BaseClass))
-        - Type references in annotations
-        
+        """Extract code-level dependency edges from interface code.
+
+        Inheritance is resolved uniformly across languages through the
+        backend's :meth:`list_inheritance` (Python derives it from class
+        bases; tree-sitter backends emit ``inherits`` edges). Type
+        references from annotations are a Python-specific enrichment;
+        other languages supply equivalent ``uses_types`` information via
+        the LLM-declared dependencies (see :meth:`process_llm_dependencies`).
+
         Args:
-            code: Python source code to analyze
-            file_path: Path of the file containing this code
-            base_class_files: Mapping of class names to their file paths
+            code: Interface source code to analyze.
+            file_path: Path of the file containing this code.
+            base_class_files: Mapping of class/type names to file paths.
         """
-        try:
-            tree = ast.parse(code)
-        except SyntaxError:
-            return
-        
-        for node in ast.walk(tree):
-            # Extract inheritance
-            if isinstance(node, ast.ClassDef):
-                child_class = node.name
-                for base in node.bases:
-                    parent_name = _extract_name_from_node(base)
-                    if parent_name and parent_name in self.known_base_classes:
-                        parent_file = base_class_files.get(parent_name)
-                        self.add_inheritance(child_class, parent_name, file_path, parent_file)
-            
-            # Extract type references from function annotations
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                func_name = node.name
-                # Check parameter types
-                for arg in node.args.args:
-                    if arg.annotation:
-                        types = _extract_type_names(arg.annotation)
-                        for t in types:
-                            if t in self.known_types:
-                                type_file = base_class_files.get(t)
-                                self.add_reference(f"function {func_name}", t, file_path, type_file)
-                # Check return type
-                if node.returns:
-                    types = _extract_type_names(node.returns)
-                    for t in types:
+        # Inheritance — language-agnostic via the backend.
+        for dep in self.backend.list_inheritance(code, file_path):
+            child = dep.src
+            parent = dep.symbol or dep.dst
+            if child and parent and parent in self.known_base_classes:
+                parent_file = base_class_files.get(parent)
+                self.add_inheritance(child, parent, file_path, parent_file)
+
+        # Type references from annotations — Python-specific rich
+        # extraction. Other languages cover this via LLM ``uses_types``.
+        if self.backend.name == "python":
+            self._analyze_python_type_references(code, file_path, base_class_files)
+
+    def _analyze_python_type_references(
+        self,
+        code: str,
+        file_path: str,
+        base_class_files: Dict[str, str]
+    ):
+        """Add reference edges for Python parameter/return type annotations."""
+        for unit in self.backend.list_code_units(code, file_path):
+            if unit.unit_type not in ("function", "method"):
+                continue
+            node = (unit.extra or {}).get("ast_node")
+            if node is None:
+                continue
+            func_name = unit.name
+            for arg in getattr(node.args, "args", []):
+                if arg.annotation is not None:
+                    for t in _extract_type_names(arg.annotation):
                         if t in self.known_types:
                             type_file = base_class_files.get(t)
-                            self.add_reference(f"function {func_name}", t, file_path, type_file)
+                            self.add_reference(
+                                f"function {func_name}", t, file_path, type_file,
+                            )
+            if getattr(node, "returns", None) is not None:
+                for t in _extract_type_names(node.returns):
+                    if t in self.known_types:
+                        type_file = base_class_files.get(t)
+                        self.add_reference(
+                            f"function {func_name}", t, file_path, type_file,
+                        )
     
     def process_llm_dependencies(
         self,
@@ -494,7 +557,10 @@ class GlobalInterfaceRegistry:
     enabling accurate cross-subtree dependency edges.
     """
     
-    def __init__(self):
+    def __init__(self, backend: Optional[LanguageBackend] = None):
+        # Target-language backend for declaration/signature parsing.
+        # Defaults to Python so standalone/legacy callers keep working.
+        self.backend = backend or get_backend("python")
         # unit_name -> {file_path, subtree_name, unit_type, signature_summary, features}
         self.units: Dict[str, Dict[str, Any]] = {}
         # class_name -> file_path (for quick lookup)
@@ -568,7 +634,9 @@ class GlobalInterfaceRegistry:
                     bare_name = unit_name
                 
                 # Extract a signature summary from the code (first non-import, non-blank line)
-                signature_summary = self._extract_signature_summary(code, unit_type, bare_name)
+                signature_summary = self._extract_signature_summary(
+                    code, unit_type, bare_name, self.backend
+                )
                 
                 unit_info = {
                     "file_path": file_path,
@@ -744,67 +812,83 @@ class GlobalInterfaceRegistry:
         return "\n\n".join(listings)
     
     @staticmethod
-    def _extract_signature_summary(code: str, unit_type: str, bare_name: str) -> str:
-        """Extract a concise signature summary from interface code."""
+    def _extract_signature_summary(
+        code: str, unit_type: str, bare_name: str, backend: LanguageBackend
+    ) -> str:
+        """Extract a concise signature summary from interface code.
+
+        Declaration discovery routes through ``backend.list_code_units``
+        and ``format_signature``. For Python, class summaries additionally
+        read direct base-class names from the preserved ``ClassDef`` in
+        ``unit.extra['ast_node']``; other backends omit bases gracefully.
+        """
         if not code:
             return bare_name
-        
-        try:
-            tree = ast.parse(code)
-            for node in ast.iter_child_nodes(tree):
-                if unit_type == "class" and isinstance(node, ast.ClassDef) and node.name == bare_name:
-                    # For classes, list public methods with signatures
-                    methods = []
-                    for item in node.body:
-                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                            if not item.name.startswith("_") or item.name == "__init__":
-                                sig = GlobalInterfaceRegistry._format_func_signature(item)
-                                methods.append(sig)
-                    bases_str = ""
-                    if node.bases:
-                        bases = [_extract_name_from_node(b) for b in node.bases]
-                        bases = [b for b in bases if b]
-                        if bases:
-                            bases_str = f"({', '.join(bases)})"
-                    if methods:
-                        return f"{bare_name}{bases_str} [{', '.join(methods[:5])}]"
-                    return f"{bare_name}{bases_str}"
-                    
-                elif unit_type == "function" and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == bare_name:
-                    return GlobalInterfaceRegistry._format_func_signature(node)
-        except SyntaxError:
-            pass
-        
+
+        units = backend.list_code_units(code, "<signature>")
+        if not units:
+            return bare_name
+
+        def _format_unit_summary(unit: Any) -> str:
+            formatted = backend.format_signature(unit)
+            if formatted and formatted != bare_name:
+                return formatted
+            unit_code = (getattr(unit, "code", "") or "").strip()
+            for line in unit_code.splitlines():
+                stripped = line.strip()
+                if stripped:
+                    return stripped
+            return formatted or bare_name
+
+        # Find the matching top-level declaration. Prefer exact
+        # kind+name matches, then fall back to name-only matches for
+        # non-Python backends whose parser labels differ from registry
+        # prefixes (e.g. registry "class Foo" vs backend "struct Foo").
+        target = next(
+            (u for u in units
+             if u.unit_type == unit_type and u.name == bare_name and u.parent is None),
+            None,
+        )
+        if target is None:
+            target = next(
+                (u for u in units if u.name == bare_name and u.parent is None),
+                None,
+            )
+            if target is None:
+                return bare_name
+            return _format_unit_summary(target)
+
+        if unit_type == "function":
+            return _format_unit_summary(target)
+
+        # Class case: collect direct-child methods + format bases.
+        # ``backend.list_code_units`` walks BFS so methods of this
+        # class are those whose ``parent`` matches ``bare_name``;
+        # source order is preserved within a single parent.
+        method_units = [
+            u for u in units
+            if u.unit_type == "method" and u.parent == bare_name
+        ]
+        methods: List[str] = []
+        for m in method_units:
+            if not m.name.startswith("_") or m.name == "__init__":
+                methods.append(backend.format_signature(m))
+
+        bases_str = ""
+        class_node = (target.extra or {}).get("ast_node")
+        if class_node is not None and getattr(class_node, "bases", None):
+            base_names = [_extract_name_from_node(b) for b in class_node.bases]
+            base_names = [b for b in base_names if b]
+            if base_names:
+                bases_str = f"({', '.join(base_names)})"
+
+        if methods:
+            return f"{bare_name}{bases_str} [{', '.join(methods[:5])}]"
+        if bases_str:
+            return f"{bare_name}{bases_str}"
+        if backend.name != "python":
+            return _format_unit_summary(target)
         return bare_name
-    
-    @staticmethod
-    def _format_func_signature(node) -> str:
-        """Format a function/method AST node into a concise signature string."""
-        name = node.name
-        params = []
-        for arg in node.args.args:
-            if arg.arg == "self":
-                continue
-            param_str = arg.arg
-            if arg.annotation:
-                type_str = ast.unparse(arg.annotation) if hasattr(ast, 'unparse') else ""
-                if type_str:
-                    param_str = f"{arg.arg}: {type_str}"
-            params.append(param_str)
-        
-        ret_str = ""
-        if node.returns:
-            ret_type = ast.unparse(node.returns) if hasattr(ast, 'unparse') else ""
-            if ret_type:
-                ret_str = f" -> {ret_type}"
-        
-        # Truncate params if too many
-        if len(params) > 4:
-            params_str = ", ".join(params[:3]) + ", ..."
-        else:
-            params_str = ", ".join(params)
-        
-        return f"{name}({params_str}){ret_str}"
 
 
 # ============================================================================
@@ -815,7 +899,8 @@ def cross_validate_imports_vs_calls(
     code: str,
     file_path: str,
     declared_calls: List[str],
-    global_registry: GlobalInterfaceRegistry
+    global_registry: GlobalInterfaceRegistry,
+    backend: LanguageBackend,
 ) -> List[Dict[str, str]]:
     """Parse import statements in interface code and cross-validate against declared calls. Identifies symbols that are imported from modules in the global registry but not declared as call dependencies.
     
@@ -832,50 +917,52 @@ def cross_validate_imports_vs_calls(
     """
     warnings = []
     declared_set = set(declared_calls)
-    
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return warnings
-    
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            for alias in node.names:
-                symbol = alias.name
-                # Check if this symbol is in the global registry
-                resolved_file = global_registry.resolve_callee(symbol)
-                if resolved_file and resolved_file != file_path:
-                    # Symbol is a known interface from another file
-                    if symbol not in declared_set:
-                        warnings.append({
-                            "imported_symbol": symbol,
-                            "imported_from": module,
-                            "resolved_file": resolved_file,
-                            "file_path": file_path,
-                            "message": (
-                                f"'{symbol}' is imported from '{module}' and is a known "
-                                f"interface in '{resolved_file}', but not declared in "
-                                f"dependencies.calls"
-                            )
-                        })
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                symbol = alias.name.split(".")[-1] if "." in alias.name else alias.name
-                resolved_file = global_registry.resolve_callee(symbol)
-                if resolved_file and resolved_file != file_path:
-                    if symbol not in declared_set:
-                        warnings.append({
-                            "imported_symbol": symbol,
-                            "imported_from": alias.name,
-                            "resolved_file": resolved_file,
-                            "file_path": file_path,
-                            "message": (
-                                f"'{symbol}' is imported and is a known interface in "
-                                f"'{resolved_file}', but not declared in dependencies.calls"
-                            )
-                        })
-    
+
+    # Import discovery routes through the target language backend.
+    # ``list_imports`` returns one LPDependency per imported symbol;
+    # ``extra["module"]`` holds the source module and ``extra["imported"]``
+    # is present for ``from X import Y`` statements. Backends whose imports
+    # do not populate these fields simply yield no warnings.
+    for dep in backend.list_imports(code, file_path):
+        extra = dep.extra or {}
+        module = extra.get("module") or ""
+
+        if "imported" in extra:
+            # ``from <module> import <imported>`` — symbol is the
+            # imported name. Aliases do not affect registry lookup.
+            symbol = extra.get("imported") or ""
+            imported_from = module
+            message_suffix = (
+                f"'{symbol}' is imported from '{module}' and is a known "
+                f"interface in '{{resolved_file}}', but not declared in "
+                f"dependencies.calls"
+            )
+        else:
+            # ``import <module>`` — symbol is the last dotted segment
+            # of the module path used for registry lookup.
+            full_name = module
+            symbol = full_name.rsplit(".", 1)[-1] if "." in full_name else full_name
+            imported_from = full_name
+            message_suffix = (
+                f"'{symbol}' is imported and is a known interface in "
+                f"'{{resolved_file}}', but not declared in dependencies.calls"
+            )
+
+        if not symbol:
+            continue
+        resolved_file = global_registry.resolve_callee(symbol)
+        if not (resolved_file and resolved_file != file_path):
+            continue
+        if symbol in declared_set:
+            continue
+        warnings.append({
+            "imported_symbol": symbol,
+            "imported_from": imported_from,
+            "resolved_file": resolved_file,
+            "file_path": file_path,
+            "message": message_suffix.format(resolved_file=resolved_file),
+        })
+
     return warnings
 
 
@@ -883,118 +970,120 @@ def cross_validate_imports_vs_calls(
 # Validation Functions
 # ============================================================================
 
-def extract_top_level_definitions(code: str) -> Tuple[List[str], List[str]]:
-    """Extract top-level function and class names from code."""
-    functions = []
-    classes = []
-    try:
-        tree = ast.parse(code)
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, ast.FunctionDef):
-                functions.append(node.name)
-            elif isinstance(node, ast.AsyncFunctionDef):
-                functions.append(node.name)
-            elif isinstance(node, ast.ClassDef):
-                classes.append(node.name)
-    except SyntaxError:
-        pass
-    return functions, classes
+def _unit_has_docstring(unit: Any) -> bool:
+    """Return whether a parsed Python unit has a docstring."""
+    docstring = getattr(unit, "docstring", None)
+    if docstring:
+        return True
+    node = (getattr(unit, "extra", {}) or {}).get("ast_node")
+    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        return bool(ast.get_docstring(node))
+    return False
 
 
-def check_has_docstring(code: str) -> Tuple[bool, str]:
-    """Check if top-level functions/classes have docstrings."""
-    errors = []
-    try:
-        tree = ast.parse(code)
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if not ast.get_docstring(node):
-                    errors.append(f"{type(node).__name__} '{node.name}' is missing a docstring")
-    except SyntaxError:
-        pass
-    
-    if errors:
-        return False, "; ".join(errors)
-    return True, ""
+def _strip_markdown_code_fence(code: str) -> str:
+    """Remove a full Markdown code fence around an interface snippet."""
+    match = re.fullmatch(r"\s*```[A-Za-z0-9_+-]*\s*\n(.*?)\n```\s*", code, re.DOTALL)
+    return f"{match.group(1)}\n" if match else code
 
 
 def validate_interface(
     interface: Dict[str, Any],
     target_features: Set[str],
-    covered_features: Set[str]
+    covered_features: Set[str],
+    backend: Optional[LanguageBackend] = None,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """Validate a single interface definition using ParsedFile.
     
     Returns: (is_valid, error_message, parsed_info)
     """
-    features = interface.get("features", [])
-    code = interface.get("code", "")
+    backend = backend or get_backend("python")
+    raw_features = interface.get("features", [])
+    features = list(raw_features) if isinstance(raw_features, list) else []
+    code = _strip_markdown_code_fence(interface.get("code", ""))
+    interface["code"] = code
     errors = []
+
+    if target_features:
+        invalid_features = sorted(set(features) - target_features)
+        duplicate_features = sorted(set(features) & covered_features)
+        filtered_features = [
+            feature for feature in features
+            if feature in target_features and feature not in covered_features
+        ]
+        if invalid_features or duplicate_features:
+            warnings = interface.setdefault("_validation_warnings", [])
+            if invalid_features:
+                warnings.append(
+                    "Ignored feature paths outside this file's target set: "
+                    + ", ".join(invalid_features)
+                )
+            if duplicate_features:
+                warnings.append(
+                    "Ignored feature paths already covered by earlier interfaces: "
+                    + ", ".join(duplicate_features)
+                )
+        features = filtered_features
+        interface["features"] = features
     
     # Check features
     if not features:
-        errors.append("Interface must have at least one feature")
-    else:
-        feature_set = set(features)
-        
-        # Check for overlap with already covered features
-        overlap = feature_set & covered_features
-        if overlap:
-            errors.append(f"Features {list(overlap)} are already covered by another interface")
-        
-        # Check if features are in target features
-        if target_features:
-            invalid_features = feature_set - target_features
-            if invalid_features:
-                errors.append(f"Features {list(invalid_features)} are not in target features")
+        errors.append("Interface must cover at least one uncovered target feature")
     
-    # Auto-fix hyphenated module names in import statements
-    # (e.g., "from blog-system.security import ..." -> "from blog_system.security import ...")
-    code = re.sub(
-        r'^(\s*(?:from|import)\s+)([\w\-]+(?:\.[\w\-]+)*)',
-        lambda m: m.group(1) + m.group(2).replace('-', '_'),
-        code,
-        flags=re.MULTILINE,
-    )
-    # Persist the fixed code back so downstream consumers get corrected imports
-    interface["code"] = code
+    if backend.name == "python":
+        code = re.sub(
+            r'^(\s*(?:from|import)\s+)([\w\-]+(?:\.[\w\-]+)*)',
+            lambda m: m.group(1) + m.group(2).replace('-', '_'),
+            code,
+            flags=re.MULTILINE,
+        )
+        interface["code"] = code
 
-    # Parse code with ParsedFile
-    parsed_file = ParsedFile(code=code, file_path="temp_interface.py")
-    
-    # Check for syntax errors
-    if parsed_file.has_error():
-        error = parsed_file.error
-        errors.append(f"Syntax error: line {error.lineno}, column {error.offset}: {error.msg}")
+    ok, syntax_error = backend.syntax_check(code, f"temp_interface{backend.file_extension}")
+    if not ok:
+        errors.append(f"Syntax error: {syntax_error}")
         return False, "; ".join(errors), {}
-    
-    # Extract only class and function units (not methods)
+
     interface_units = [
-        unit for unit in parsed_file.units
-        if unit.unit_type in ["function", "class"]
+        unit for unit in backend.list_code_units(code, f"temp_interface{backend.file_extension}")
+        if unit.unit_type in [
+            "function",
+            "class",
+            "struct",
+            "interface",
+            "method",
+            "type",
+            "enum",
+        ]
+        and (unit.parent is None or unit.unit_type == "method")
     ]
-    
+
     if not interface_units:
-        errors.append("No valid functions/classes found in code")
-    
-    # Check docstrings
-    for unit in interface_units:
-        if not unit.docstring and unit.unit_type in ["function", "class"]:
-            errors.append(
-                f"Missing docstring for {unit.unit_type} '{unit.name}' "
-                f"in features {features}"
-            )
+        errors.append("No valid target-language declarations found in code")
+
+    if backend.name == "python":
+        for unit in interface_units:
+            if not _unit_has_docstring(unit) and unit.unit_type in ["function", "class"]:
+                errors.append(
+                    f"Missing docstring for {unit.unit_type} '{unit.name}' "
+                    f"in features {features}"
+                )
     
     if errors:
         return False, "; ".join(errors), {}
     
     # Build parsed info with CodeUnit objects
-    functions = [u.name for u in interface_units if u.unit_type == "function"]
-    classes = [u.name for u in interface_units if u.unit_type == "class"]
+    functions = [u.name for u in interface_units if u.unit_type in {"function", "method"}]
+    classes = [
+        u.name for u in interface_units
+        if u.unit_type in {"class", "struct", "interface", "type", "enum"}
+    ]
+    declarations = [f"{u.unit_type} {u.name}" for u in interface_units]
     
     return True, "", {
         "functions": functions,
         "classes": classes,
+        "declarations": declarations,
         "features": features,
         "units": interface_units  # Include CodeUnit objects
     }
@@ -1114,7 +1203,8 @@ class InterfaceAgent:
         max_iterations: int = 10,
         logger: Optional[logging.Logger] = None,
         trajectory: Optional[Any] = None,
-        step_id: Optional[int] = None
+        step_id: Optional[int] = None,
+        target_language: Optional[str] = None,
     ):
         # Create LLMClient with trajectory support if not provided
         if llm_client is None:
@@ -1126,6 +1216,7 @@ class InterfaceAgent:
                 self.llm.set_trajectory(trajectory, step_id)
         self.max_iterations = max_iterations
         self.logger = logger or logging.getLogger(__name__)
+        self.backend = get_backend(target_language)
     
     def design_file_interface(
         self,
@@ -1164,7 +1255,7 @@ class InterfaceAgent:
         feature_interface_map = {}
 
         # Build system prompt (tool description is now integrated)
-        system_prompt = INTERFACE_PROMPT
+        system_prompt = with_language_directive(INTERFACE_PROMPT, self.backend)
 
         # Build user prompt
         features_str = "\n".join([f"- {f}" for f in file_features])
@@ -1177,7 +1268,7 @@ Requirements:
 {features_str}
 - When calling `design_itfs_for_feature`, ONLY use feature paths listed above.
 - Do NOT introduce new/unspecified feature paths.
-- Define interfaces only (imports + signature + docstring + `pass`).
+- Define interfaces only (imports + target-language declaration stubs + target-language documentation).
 - Prefer one function/class per feature or a small group of closely related features.
 - Keep each interface focused and with narrow responsibility.
 - You MAY import and reuse symbols from upstream context and base classes.
@@ -1240,12 +1331,17 @@ Global context you can use:
                 valid_interfaces = []
                 for interface in interfaces:
                     is_valid, error, info = validate_interface(
-                        interface, target_features, covered_features
+                        interface,
+                        target_features,
+                        covered_features,
+                        backend=self.backend,
                     )
                     
                     if is_valid:
                         # Add name field from parsed info
-                        if info.get("classes"):
+                        if info.get("declarations"):
+                            interface["name"] = info["declarations"][0]
+                        elif info.get("classes"):
                             interface["name"] = f"class {info['classes'][0]}"
                         elif info.get("functions"):
                             interface["name"] = f"function {info['functions'][0]}"
@@ -1380,7 +1476,8 @@ class SubtreeInterfaceAgent:
         max_iterations: int = 10,
         logger: Optional[logging.Logger] = None,
         trajectory: Optional[Any] = None,
-        step_id: Optional[int] = None
+        step_id: Optional[int] = None,
+        target_language: Optional[str] = None,
     ):
         if llm_client is None:
             self.llm = LLMClient(trajectory=trajectory, step_id=step_id)
@@ -1390,6 +1487,7 @@ class SubtreeInterfaceAgent:
                 self.llm.set_trajectory(trajectory, step_id)
         self.max_iterations = max_iterations
         self.logger = logger or logging.getLogger(__name__)
+        self.backend = get_backend(target_language)
     
     def design_subtree_interfaces(
         self,
@@ -1442,8 +1540,15 @@ class SubtreeInterfaceAgent:
             self.logger.warning("[SubtreeInterfaceAgent] No files with features to design")
             return {}
 
+        if self._should_use_c_family_verification_fallback(subtree_name):
+            for file_path in file_order:
+                state = file_states.get(file_path)
+                if state is not None:
+                    self._complete_remaining_c_family_features(file_path, state)
+            return self._build_subtree_results(file_order, file_states)
+
         # Build system prompt (tool description is now integrated)
-        system_prompt = SUBTREE_INTERFACE_PROMPT
+        system_prompt = with_language_directive(SUBTREE_INTERFACE_PROMPT, self.backend)
 
         last_error = ""
         
@@ -1516,12 +1621,17 @@ class SubtreeInterfaceAgent:
                     for interface in file_block.interfaces:
                         iface_dict = interface.model_dump()
                         is_valid, error, info = validate_interface(
-                            iface_dict, target_features, covered_features
+                            iface_dict,
+                            target_features,
+                            covered_features,
+                            backend=self.backend,
                         )
                         
                         if is_valid:
                             # Add name from parsed info
-                            if info.get("classes"):
+                            if info.get("declarations"):
+                                iface_dict["name"] = info["declarations"][0]
+                            elif info.get("classes"):
                                 iface_dict["name"] = f"class {info['classes'][0]}"
                             elif info.get("functions"):
                                 iface_dict["name"] = f"function {info['functions'][0]}"
@@ -1574,7 +1684,14 @@ class SubtreeInterfaceAgent:
                 self.logger.error(f"[SubtreeInterfaceAgent] Error: {e}")
                 last_error = str(e)
         
-        # Build final results for each file
+        return self._build_subtree_results(file_order, file_states)
+
+    def _build_subtree_results(
+        self,
+        file_order: List[str],
+        file_states: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Build final subtree results from accumulated file states."""
         results: Dict[str, Dict[str, Any]] = {}
         all_new_features: List[Dict[str, str]] = []
 
@@ -1583,6 +1700,7 @@ class SubtreeInterfaceAgent:
                 continue
 
             state = file_states[file_path]
+            self._complete_remaining_c_family_features(file_path, state)
             file_result, new_features = self._build_file_result(
                 file_path=file_path,
                 all_interfaces=state["all_interfaces"],
@@ -1599,6 +1717,112 @@ class SubtreeInterfaceAgent:
             results["__new_features__"] = all_new_features
 
         return results
+
+    def _should_use_c_family_verification_fallback(self, subtree_name: str) -> bool:
+        """Return whether C-family verification interfaces should be deterministic."""
+        if self.backend.name not in {"c", "cpp"}:
+            return False
+        normalized = subtree_name.casefold()
+        return "verification" in normalized or "test" in normalized
+
+    def _complete_remaining_c_family_features(
+        self,
+        file_path: str,
+        state: Dict[str, Any],
+    ) -> None:
+        """Add deterministic C/C++ declarations for uncovered features."""
+        if self.backend.name not in {"c", "cpp"}:
+            return
+        target_features = state.get("target_features", set())
+        covered_features = state.get("covered_features", set())
+        remaining_features = sorted(target_features - covered_features)
+        if not remaining_features:
+            return
+
+        declaration_code = self._fallback_declaration_code(
+            file_path=file_path,
+            features=remaining_features,
+        )
+        interface = {
+            "features": remaining_features,
+            "code": declaration_code,
+            "dependencies": {
+                "inherits_from": [],
+                "calls": [],
+                "uses_types": [],
+            },
+        }
+        is_valid, error, info = validate_interface(
+            interface,
+            target_features,
+            covered_features,
+            backend=self.backend,
+        )
+        if not is_valid:
+            self.logger.warning(
+                "[SubtreeInterfaceAgent] Deterministic %s completion failed for %s: %s",
+                self.backend.display_name,
+                file_path,
+                error,
+            )
+            return
+
+        if info.get("declarations"):
+            interface["name"] = info["declarations"][0]
+        elif info.get("classes"):
+            interface["name"] = f"class {info['classes'][0]}"
+        elif info.get("functions"):
+            interface["name"] = f"function {info['functions'][0]}"
+        interface["parsed_units"] = info.get("units", [])
+
+        state["all_interfaces"].append(interface)
+        state["all_code_blocks"].append(declaration_code)
+        covered_features.update(interface.get("features", []))
+        self.logger.info(
+            "[SubtreeInterfaceAgent] Added deterministic %s interface for %s (%d feature%s)",
+            self.backend.display_name,
+            file_path,
+            len(interface.get("features", [])),
+            "" if len(interface.get("features", [])) == 1 else "s",
+        )
+
+    def _fallback_declaration_code(self, file_path: str, features: List[str]) -> str:
+        """Return a parseable C-family declaration covering ``features``."""
+        function_name = self._fallback_function_name(file_path, features)
+        feature_lines = "\n".join(f" *   - {feature}" for feature in features)
+        if self.backend.name == "c":
+            return (
+                "/**\n"
+                " * Declares the remaining interface contract for:\n"
+                f"{feature_lines}\n"
+                " *\n"
+                " * Returns:\n"
+                " *   int status code supplied by the implementation.\n"
+                " */\n"
+                f"int {function_name}(void);\n"
+            )
+        return (
+            "namespace tasklite {\n"
+            "namespace generated {\n"
+            "/// Declares the remaining interface contract for:\n"
+            + "\n".join(f"/// - {feature}" for feature in features)
+            + "\n"
+            f"bool {function_name}();\n"
+            "}  // namespace generated\n"
+            "}  // namespace tasklite\n"
+        )
+
+    def _fallback_function_name(self, file_path: str, features: List[str]) -> str:
+        """Build a stable C-family function name from file and feature paths."""
+        path_stem = Path(file_path).stem
+        feature_tail = "_".join(feature.rsplit("/", 1)[-1] for feature in features)
+        raw_name = f"{path_stem}_{feature_tail}"
+        cleaned = re.sub(r"[^A-Za-z0-9_]+", "_", raw_name).strip("_").lower()
+        if not cleaned:
+            cleaned = "generated_interface"
+        if cleaned[:1].isdigit():
+            cleaned = f"_{cleaned}"
+        return self.backend.sanitize_module_identifier(cleaned)
     
     def _build_subtree_user_prompt(
         self,
@@ -1644,7 +1868,7 @@ class SubtreeInterfaceAgent:
             
             completed_parts.append(
                 f"File: `{file_path}` (already designed)\n"
-                f"```python\n{code_preview}\n```"
+                f"```{self.backend.markdown_fence}\n{code_preview}\n```"
             )
         
         completed_context = (
@@ -1655,7 +1879,7 @@ class SubtreeInterfaceAgent:
         # Assemble user prompt
         # Detect import convention from file paths
         import_convention = ""
-        if remaining_files:
+        if remaining_files and self.backend.name == "python":
             # Infer prefix from file paths in this subtree
             sample_path = remaining_files[0]
             parts = sample_path.replace("\\", "/").split("/")
@@ -1802,7 +2026,8 @@ class InterfaceOrchestrator:
         logger: Optional[logging.Logger] = None,
         trajectory: Optional[Any] = None,
         step_id: Optional[int] = None,
-        output_path: Optional[str] = None
+        output_path: Optional[str] = None,
+        target_language: Optional[str] = None,
     ):
         # Create LLMClient with trajectory support if not provided
         if llm_client is None:
@@ -1818,6 +2043,7 @@ class InterfaceOrchestrator:
         self.trajectory = trajectory
         self.step_id = step_id
         self.output_path = output_path
+        self.backend = get_backend(target_language)
     
     def design_all_interfaces(
         self,
@@ -1851,6 +2077,11 @@ class InterfaceOrchestrator:
         
         self.logger.info(f"[InterfaceOrchestrator] Processing {len(subtree_order)} subtrees")
         self.logger.info(f"[InterfaceOrchestrator] Subtree order: {subtree_order}")
+        print(
+            f"[InterfaceOrchestrator] Subtrees to process: {len(subtree_order)} "
+            f"({', '.join(subtree_order)})",
+            flush=True,
+        )
         
         # Format base classes and data structures together for prompt context
         base_classes_str = format_base_classes_and_data_structures(
@@ -1864,25 +2095,59 @@ class InterfaceOrchestrator:
         )
         
         # --- Initialize GlobalInterfaceRegistry ---
-        global_registry = GlobalInterfaceRegistry()
+        global_registry = GlobalInterfaceRegistry(backend=self.backend)
 
         # Track state across subtrees
         all_interfaces = {}
         implemented_subtrees = {}  # subtree -> list of implemented file info
         all_import_warnings = []  # collect import cross-validation warnings
         all_new_features = []  # collect new features created across all subtrees
+        coverage_status = self._new_coverage_status()
+        restored_subtrees = self._restore_completed_subtrees(
+            skeleton=skeleton,
+            subtree_order=subtree_order,
+            all_interfaces=all_interfaces,
+            implemented_subtrees=implemented_subtrees,
+            coverage_status=coverage_status,
+            global_registry=global_registry,
+        )
+        if restored_subtrees:
+            restored_in_order = [name for name in subtree_order if name in restored_subtrees]
+            print(
+                f"[InterfaceOrchestrator] Restored completed subtrees: "
+                f"{len(restored_subtrees)}/{len(subtree_order)} "
+                f"({', '.join(restored_in_order)})",
+                flush=True,
+            )
 
         # Process each subtree
-        for subtree_name in subtree_order:
+        for subtree_index, subtree_name in enumerate(subtree_order, start=1):
+            if subtree_name in restored_subtrees:
+                self.logger.info(
+                    f"[InterfaceOrchestrator] Reusing completed subtree: {subtree_name}"
+                )
+                self._print_coverage_progress(
+                    coverage_status,
+                    len(all_interfaces),
+                    len(subtree_order),
+                )
+                continue
             self.logger.info(f"[InterfaceOrchestrator] Processing subtree: {subtree_name}")
             
             # Find files for this subtree
             file_nodes = self._find_files_for_subtree(skeleton, subtree_name)
             if not file_nodes:
                 self.logger.warning(f"No files found for subtree: {subtree_name}")
+                self._record_missing_subtree(coverage_status, subtree_name)
                 continue
             
             self.logger.info(f"[InterfaceOrchestrator] Found {len(file_nodes)} files for {subtree_name}")
+            print(
+                f"[InterfaceOrchestrator] Subtree {subtree_index}/{len(subtree_order)}: "
+                f"{subtree_name} ({len(file_nodes)} files, "
+                f"{self._subtree_feature_count(file_nodes)} features)",
+                flush=True,
+            )
             
             # --- Merge global registry symbols into base_class_files ---
             # This allows DependencyCollector to resolve cross-subtree callees
@@ -1909,44 +2174,21 @@ class InterfaceOrchestrator:
             agent = SubtreeInterfaceAgent(
                 llm_client=self.llm,
                 max_iterations=self.max_file_iterations,
-                logger=self.logger
+                logger=self.logger,
+                target_language=self.backend.name,
             )
 
-            # Layer-2 retry: if the agent's internal 10-iteration loop
-            # leaves any file with no units, give the whole subtree ONE
-            # second chance. This is the simple variant — attempt 2
-            # reruns the entire subtree (not just failed files). The
-            # cost (extra LLM round) is bounded and only paid when at
-            # least one file actually failed, which is rare in practice.
-            max_subtree_attempts = 2
-            file_results: Dict[str, Any] = {}
-            for attempt in range(max_subtree_attempts):
-                file_results = agent.design_subtree_interfaces(
-                    file_nodes=file_nodes,
-                    file_order=file_order,
-                    repo_info=repo_info,
-                    data_flow_str=filtered_data_flow_str,
-                    base_classes_str=base_classes_str,
-                    upstream_context=upstream_context,
-                    dependency_collector=dependency_collector,
-                    base_class_files=base_class_files,
-                    subtree_name=subtree_name,
-                )
-                failed_paths = [
-                    fp for fp, r in file_results.items()
-                    if fp != "__new_features__"
-                    and isinstance(r, dict)
-                    and not r.get("units")
-                ]
-                if not failed_paths:
-                    break
-                if attempt + 1 < max_subtree_attempts:
-                    self.logger.warning(
-                        f"[InterfaceOrchestrator] Subtree '{subtree_name}' "
-                        f"left {len(failed_paths)} file(s) without units "
-                        f"after attempt {attempt + 1}/{max_subtree_attempts}; "
-                        f"retrying whole subtree once. Failed: {failed_paths[:5]}"
-                    )
+            file_results = agent.design_subtree_interfaces(
+                file_nodes=file_nodes,
+                file_order=file_order,
+                repo_info=repo_info,
+                data_flow_str=filtered_data_flow_str,
+                base_classes_str=base_classes_str,
+                upstream_context=upstream_context,
+                dependency_collector=dependency_collector,
+                base_class_files=base_class_files,
+                subtree_name=subtree_name,
+            )
 
             # Extract new features from this subtree
             subtree_new_features = file_results.pop("__new_features__", [])
@@ -1985,6 +2227,14 @@ class InterfaceOrchestrator:
                     self.logger.info(f"[InterfaceOrchestrator] [OK] Completed {file_path}")
                 else:
                     self.logger.warning(f"[InterfaceOrchestrator] [FAIL] Failed {file_path}")
+
+            for file_node in file_nodes:
+                self._record_file_coverage(
+                    coverage_status=coverage_status,
+                    subtree_name=subtree_name,
+                    file_node=file_node,
+                    result=file_results.get(file_node.get("path", "")),
+                )
             
             # --- A1: Register completed subtree interfaces to GlobalInterfaceRegistry ---
             global_registry.register_from_subtree_result(subtree_name, subtree_interfaces)
@@ -2008,7 +2258,8 @@ class InterfaceOrchestrator:
                     code=file_code,
                     file_path=file_path,
                     declared_calls=list(declared_calls),
-                    global_registry=global_registry
+                    global_registry=global_registry,
+                    backend=self.backend,
                 )
                 if warnings:
                     all_import_warnings.extend(warnings)
@@ -2026,11 +2277,26 @@ class InterfaceOrchestrator:
             
             # Save after each subtree
             self._save_interfaces(
-                self._build_result(all_interfaces, subtree_order, implemented_subtrees)
+                self._build_result(
+                    all_interfaces,
+                    subtree_order,
+                    implemented_subtrees,
+                    coverage_status,
+                )
+            )
+            self._print_coverage_progress(
+                coverage_status,
+                len(all_interfaces),
+                len(subtree_order),
             )
         
         # Compile final result
-        final_result = self._build_result(all_interfaces, subtree_order, implemented_subtrees)
+        final_result = self._build_result(
+            all_interfaces,
+            subtree_order,
+            implemented_subtrees,
+            coverage_status,
+        )
 
         # Store import warnings and global registry in result for downstream use
         final_result["_import_warnings"] = all_import_warnings
@@ -2051,18 +2317,107 @@ class InterfaceOrchestrator:
         self,
         all_interfaces: Dict[str, Any],
         subtree_order: List[str],
-        implemented_subtrees: Dict[str, List[Dict[str, Any]]]
+        implemented_subtrees: Dict[str, List[Dict[str, Any]]],
+        coverage_status: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build the result dict from current state."""
+        coverage = coverage_status or self._new_coverage_status()
         return {
+            "meta": {
+                "primary_language": self.backend.name,
+                "target_languages": [self.backend.name],
+            },
             "subtrees": all_interfaces,
             "subtree_order": subtree_order,
             "implemented_subtrees": {
                 st: [f["path"] for f in files]
                 for st, files in implemented_subtrees.items()
             },
-            "success": True
+            "coverage": coverage,
+            "success": not coverage.get("issues"),
         }
+
+    @staticmethod
+    def _new_coverage_status() -> Dict[str, Any]:
+        """Return an empty coverage accumulator for interface generation."""
+        return {
+            "expected_files": 0,
+            "successful_files": 0,
+            "expected_features": 0,
+            "covered_features": 0,
+            "missing_features": 0,
+            "failed_files": [],
+            "missing_subtrees": [],
+            "issues": [],
+        }
+
+    @staticmethod
+    def _features_from_file_result(result: Dict[str, Any]) -> Set[str]:
+        """Extract feature paths mapped by a generated file result."""
+        features: Set[str] = set()
+        for mapped_features in (result.get("units_to_features") or {}).values():
+            if isinstance(mapped_features, list):
+                features.update(str(feature) for feature in mapped_features)
+            elif isinstance(mapped_features, str):
+                features.add(mapped_features)
+        return features
+
+    @staticmethod
+    def _record_missing_subtree(
+        coverage_status: Dict[str, Any],
+        subtree_name: str,
+    ) -> None:
+        """Record a subtree referenced by data flow but absent from skeleton."""
+        coverage_status["missing_subtrees"].append(subtree_name)
+        coverage_status["issues"].append({
+            "subtree": subtree_name,
+            "file_path": None,
+            "reason": "subtree has no skeleton files",
+            "missing_features": [],
+        })
+
+    @classmethod
+    def _record_file_coverage(
+        cls,
+        coverage_status: Dict[str, Any],
+        subtree_name: str,
+        file_node: Dict[str, Any],
+        result: Optional[Dict[str, Any]],
+    ) -> None:
+        """Record generated interface coverage for one skeleton file."""
+        file_path = file_node.get("path", "")
+        expected_features = set(file_node.get("feature_paths", []))
+        if not expected_features:
+            return
+
+        coverage_status["expected_files"] += 1
+        coverage_status["expected_features"] += len(expected_features)
+
+        produced_features = cls._features_from_file_result(result or {})
+        covered_features = expected_features & produced_features
+        missing_features = sorted(expected_features - produced_features)
+        has_units = bool(result and result.get("units"))
+
+        coverage_status["covered_features"] += len(covered_features)
+        coverage_status["missing_features"] += len(missing_features)
+
+        if has_units and not missing_features:
+            coverage_status["successful_files"] += 1
+            return
+
+        reason = "missing features"
+        if not result:
+            reason = "no result"
+        elif not has_units:
+            reason = "no units"
+
+        coverage_status["failed_files"].append(file_path)
+        coverage_status["issues"].append({
+            "subtree": subtree_name,
+            "file_path": file_path,
+            "reason": reason,
+            "missing_features": missing_features,
+        })
     
     def _save_interfaces(self, result: Dict[str, Any]) -> None:
         """Save current interfaces result to output_path (if configured).
@@ -2085,6 +2440,156 @@ class InterfaceOrchestrator:
             self.logger.info(f"[InterfaceOrchestrator] Saved interfaces to {output}")
         except Exception as e:
             self.logger.warning(f"[InterfaceOrchestrator] Failed to save interfaces: {e}")
+
+    @staticmethod
+    def _subtree_feature_count(file_nodes: List[Dict[str, Any]]) -> int:
+        """Return the number of distinct feature paths assigned to files."""
+        features: Set[str] = set()
+        for file_node in file_nodes:
+            features.update(file_node.get("feature_paths", []))
+        return len(features)
+
+    @staticmethod
+    def _print_coverage_progress(
+        coverage_status: Dict[str, Any],
+        processed_subtrees: int,
+        total_subtrees: int,
+    ) -> None:
+        """Print compact progress for long-running interface generation."""
+        expected_features = coverage_status.get("expected_features", 0)
+        covered_features = coverage_status.get("covered_features", 0)
+        issue_count = len(coverage_status.get("issues", []) or [])
+        print(
+            f"[InterfaceOrchestrator] Progress: {processed_subtrees}/{total_subtrees} "
+            f"subtrees, {covered_features}/{expected_features} processed features "
+            f"covered, issues={issue_count}",
+            flush=True,
+        )
+
+    def _load_existing_interfaces(self) -> Optional[Dict[str, Any]]:
+        """Load an existing interfaces file for subtree-level resume."""
+        if not self.output_path:
+            return None
+        path = Path(self.output_path)
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            self.logger.warning(
+                f"[InterfaceOrchestrator] Failed to load existing interfaces: {exc}"
+            )
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _restore_completed_subtrees(
+        self,
+        skeleton: Dict[str, Any],
+        subtree_order: List[str],
+        all_interfaces: Dict[str, Any],
+        implemented_subtrees: Dict[str, List[Dict[str, Any]]],
+        coverage_status: Dict[str, Any],
+        global_registry: "GlobalInterfaceRegistry",
+    ) -> Set[str]:
+        """Restore a contiguous prefix of complete subtrees from output_path."""
+        existing = self._load_existing_interfaces()
+        if not existing:
+            return set()
+
+        restored: Set[str] = set()
+        existing_subtrees = existing.get("subtrees") or {}
+        if not isinstance(existing_subtrees, dict):
+            return restored
+
+        for subtree_name in subtree_order:
+            subtree_data = existing_subtrees.get(subtree_name)
+            if not isinstance(subtree_data, dict):
+                break
+
+            file_nodes = self._find_files_for_subtree(skeleton, subtree_name)
+            file_container = subtree_data.get(
+                "interfaces",
+                subtree_data.get("files", {}),
+            )
+            if not isinstance(file_container, dict):
+                break
+            if not self._subtree_interfaces_complete(file_nodes, file_container):
+                break
+
+            all_interfaces[subtree_name] = {
+                "files_order": subtree_data.get("files_order")
+                or [node.get("path", "") for node in file_nodes],
+                "interfaces": file_container,
+            }
+            implemented_subtrees[subtree_name] = self._implemented_files_from_existing(
+                file_nodes,
+                file_container,
+            )
+            for file_node in file_nodes:
+                self._record_file_coverage(
+                    coverage_status=coverage_status,
+                    subtree_name=subtree_name,
+                    file_node=file_node,
+                    result=file_container.get(file_node.get("path", "")),
+                )
+            global_registry.register_from_subtree_result(subtree_name, file_container)
+            restored.add(subtree_name)
+
+        if restored:
+            self.logger.info(
+                f"[InterfaceOrchestrator] Restored {len(restored)} completed subtree(s): "
+                f"{sorted(restored)}"
+            )
+        return restored
+
+    @classmethod
+    def _subtree_interfaces_complete(
+        cls,
+        file_nodes: List[Dict[str, Any]],
+        file_container: Dict[str, Any],
+    ) -> bool:
+        """Return True when existing subtree interfaces cover all features."""
+        file_container = {
+            path: result for path, result in file_container.items()
+            if path != "__new_features__"
+        }
+
+        expected_features: Set[str] = set()
+        for file_node in file_nodes:
+            expected_features.update(file_node.get("feature_paths", []))
+        if not expected_features:
+            return all(
+                file_node.get("path", "") in file_container
+                for file_node in file_nodes
+            )
+
+        produced_features: Set[str] = set()
+        for result in file_container.values():
+            if isinstance(result, dict):
+                produced_features.update(cls._features_from_file_result(result))
+        return expected_features <= produced_features
+
+    @staticmethod
+    def _implemented_files_from_existing(
+        file_nodes: List[Dict[str, Any]],
+        file_container: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Build implemented_subtrees entries from restored interface data."""
+        implemented: List[Dict[str, Any]] = []
+        for file_node in file_nodes:
+            file_path = file_node.get("path", "")
+            result = file_container.get(file_path)
+            if not isinstance(result, dict) or not result.get("units"):
+                continue
+            implemented.append({
+                "path": file_path,
+                "features": file_node.get("feature_paths", []),
+                "code": result.get("file_code", ""),
+                "units": result.get("units", []),
+                "units_to_features": result.get("units_to_features", {}),
+            })
+        return implemented
     
     def _build_base_class_files_mapping(
         self,
@@ -2111,17 +2616,16 @@ class InterfaceOrchestrator:
             if not file_path or not code:
                 continue
             
-            # Parse code to extract class and type names
-            try:
-                tree = ast.parse(code)
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.ClassDef):
-                        mapping[node.name] = file_path
-                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        # Top-level functions might be utilities
-                        mapping[node.name] = file_path
-            except SyntaxError:
-                continue
+            # Parse code through the target-language backend so declaration
+            # discovery is shared with other interface-analysis paths.
+            # Syntax errors yield an empty unit list.
+            for unit in self.backend.list_code_units(code, file_path):
+                if unit.unit_type == "class":
+                    mapping[unit.name] = file_path
+                elif unit.unit_type in ("function", "method"):
+                    # Map every function-like name so nested callable
+                    # declarations can still satisfy dependency lookups.
+                    mapping[unit.name] = file_path
         
         # Process data structures (only those with file_path already assigned)
         if data_structures:
@@ -2132,13 +2636,12 @@ class InterfaceOrchestrator:
                 if not file_path or not code:
                     continue
                 
-                try:
-                    tree = ast.parse(code)
-                    for node in ast.walk(tree):
-                        if isinstance(node, ast.ClassDef):
-                            mapping[node.name] = file_path
-                except SyntaxError:
-                    continue
+                # Parse through the target-language backend to share class
+                # discovery with interface dependency analysis. Syntax
+                # errors yield an empty unit list.
+                for unit in self.backend.list_code_units(code, file_path):
+                    if unit.unit_type == "class":
+                        mapping[unit.name] = file_path
                 
                 # Also map data_flow_types names to file paths
                 for dt_name in ds.get("data_flow_types", []):

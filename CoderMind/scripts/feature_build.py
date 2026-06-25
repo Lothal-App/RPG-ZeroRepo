@@ -24,6 +24,7 @@ from common.paths import (
 )
 from common import print_unicode_table, get_all_leaf_paths, get_leaf_name, get_all_leaf_descriptions
 from common.llm_client import LLMClient
+from common.language_meta import extract_language_metadata, metadata_with_languages
 from common.trajectory import load_or_create_trajectory
 
 # ======================== Configuration ========================
@@ -269,6 +270,38 @@ def convert_leaves_to_list(tree: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _list_leaf_to_branch(item: Any) -> tuple[str | None, Any]:
+    """Converts a list leaf into a branch entry."""
+    if isinstance(item, str):
+        return item.strip(), []
+    if isinstance(item, dict):
+        name = item.get("name")
+        if isinstance(name, str) and name.strip():
+            children = item.get("children", [])
+            if isinstance(children, (dict, list)):
+                return name.strip(), copy.deepcopy(children)
+            return name.strip(), []
+        if len(item) == 1:
+            key, value = next(iter(item.items()))
+            if isinstance(key, str) and key.strip():
+                if isinstance(value, (dict, list)):
+                    return key.strip(), copy.deepcopy(value)
+                return key.strip(), []
+    if item is None:
+        return None, []
+    return str(item).strip(), []
+
+
+def _list_leaves_to_branch(items: List[Any]) -> Dict[str, Any]:
+    """Promotes list leaves to a branch map."""
+    branch: Dict[str, Any] = {}
+    for item in items:
+        key, value = _list_leaf_to_branch(item)
+        if key:
+            branch.setdefault(key, value)
+    return branch
+
+
 def apply_changes(tree: Dict[str, Any], paths: List[str]) -> Dict[str, Any]:
     """Apply path list to tree structure.
 
@@ -298,10 +331,8 @@ def apply_changes(tree: Dict[str, Any], paths: List[str]) -> Dict[str, Any]:
             if part not in current:
                 current[part] = {}
             elif isinstance(current[part], list):
-                # If we encounter a list, we need to convert it to a dict
-                # This happens when a previous leaf node needs to become a branch
                 old_list = current[part]
-                current[part] = {item: {} for item in old_list}
+                current[part] = _list_leaves_to_branch(old_list)
             elif not isinstance(current[part], dict):
                 # Unexpected type, convert to dict
                 current[part] = {}
@@ -320,9 +351,8 @@ def apply_changes(tree: Dict[str, Any], paths: List[str]) -> Dict[str, Any]:
             if leaf not in current[parent_key]:
                 current[parent_key].append(leaf)
         elif isinstance(current[parent_key], dict):
-            # If it's a dict (previously a branch node), we have a conflict
-            # This means some paths treat this as a leaf parent, others as a branch
-            # Keep it as a dict and add the leaf as a key with empty value
+            # This path segment is used both as a leaf parent and as a
+            # branch. Keep the branch shape and add the leaf key.
             if leaf not in current[parent_key]:
                 current[parent_key][leaf] = []
         else:
@@ -866,6 +896,11 @@ def _extract_paths_and_descs(items: List) -> Tuple[List[str], Dict[str, str]]:
     return paths, desc_map
 
 
+def _target_languages(data: Dict[str, Any]) -> List[str]:
+    """Returns normalized target language list from feature data."""
+    return extract_language_metadata(data)[1]
+
+
 def _save_intermediate(
     feature_tree: Dict[str, Any],
     current_tree: Dict[str, Any],
@@ -879,6 +914,7 @@ def _save_intermediate(
         "repository_name": feature_tree.get("repository_name", "unknown"),
         "repository_purpose": feature_tree.get("repository_purpose", ""),
         "repository_specification": feature_tree.get("repository_specification", ""),
+        "meta": metadata_with_languages(feature_tree),
         "feature_tree": current_tree,
         "previous_feature_tree": previous_feature_tree,
         "iteration_logs": iteration_logs,
@@ -1487,6 +1523,7 @@ def build_from_spec(
         "repository_name": feature_tree.get("repository_name", "unknown"),
         "repository_purpose": feature_tree.get("repository_purpose", ""),
         "repository_specification": feature_tree.get("repository_specification", ""),
+        "meta": metadata_with_languages(feature_tree),
         "feature_tree": current_tree,
         "previous_feature_tree": previous_feature_tree,
         "iteration_logs": iteration_logs,
@@ -1678,6 +1715,7 @@ def expand_with_direction(
         "repository_name": feature_tree.get("repository_name", "unknown"),
         "repository_purpose": feature_tree.get("repository_purpose", ""),
         "repository_specification": feature_tree.get("repository_specification", ""),
+        "meta": metadata_with_languages(feature_tree),
         "feature_tree": current_tree,
         "previous_feature_tree": previous_feature_tree,
         "iteration_logs": iteration_logs,
@@ -2009,6 +2047,7 @@ def _load_feature_data(feature_build_path: Path, feature_spec_path: Path) -> Dic
                 "repository_name": "",
                 "repository_purpose": "",
                 "repository_specification": "",
+                "meta": {},
                 "feature_tree": {},
             }
 
@@ -2024,6 +2063,14 @@ def _load_feature_data(feature_build_path: Path, feature_spec_path: Path) -> Dic
                 feature_tree["repository_purpose"] = spec_repo_purpose
                 logger.info(
                     f"Loaded repository_purpose from feature_spec.json ({len(spec_repo_purpose)} chars)"
+                )
+
+            feature_tree["meta"] = metadata_with_languages(feature_spec)
+            languages = _target_languages(feature_tree)
+            if languages:
+                logger.info(
+                    "Loaded target languages from feature_spec.json: %s",
+                    ", ".join(languages),
                 )
 
             spec_content = feature_spec_path.read_text(encoding="utf-8").strip()

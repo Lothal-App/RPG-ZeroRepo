@@ -1,11 +1,9 @@
-"""Phase-1 ``feature_spec`` stage — direct JSON generation.
+"""Generate ``feature_spec.json`` directly from raw requirements.
 
 Reads raw requirements (inline text or ``docs/*.md`` files), drives an LLM
 via :class:`LLMClient`, and writes a validated ``feature_spec.json`` ready
 for downstream stages (``feature_build`` etc.) to consume.
 
-This module replaces the historical Markdown-intermediary pipeline
-(``feature_spec.md`` slash command + ``feature_spec_to_json.py`` parser).
 The LLM emits the final JSON directly, validated against
 :class:`feature.schemas.spec.FeatureSpecOutput`.
 
@@ -29,12 +27,14 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import List, Optional
 
 from common.llm_client import LLMClient
+from common.language_meta import normalize_language_metadata
 from common.paths import FEATURE_SPEC_FILE, WORKSPACE_ROOT
 from common.trajectory import load_or_create_trajectory
 
@@ -216,7 +216,50 @@ def _call_llm(
             "LLM failed to produce a valid feature_spec.json after "
             f"{max_retries} attempts (see LLM trace logs for details)."
         )
-    return result
+    inferred = _infer_target_languages(source)
+    if inferred and not result.meta.target_languages:
+        result.meta.target_languages = inferred
+    if inferred and not result.meta.primary_language:
+        result.meta.primary_language = inferred[0]
+    primary, languages = normalize_language_metadata(
+        result.meta.primary_language,
+        result.meta.target_languages,
+    )
+    result.meta.primary_language = primary
+    result.meta.target_languages = languages
+    return FeatureSpecOutput.model_validate(result.model_dump())
+
+
+def _infer_target_languages(source: InputSource) -> list[str]:
+    """Infers implementation languages from requirement text."""
+    text = _source_text(source).lower()
+    patterns = [
+        ("typescript", r"\btypescript\b|\bts\b"),
+        ("javascript", r"\bjavascript\b|\bnode(?:\.js)?\b"),
+        ("go", r"\bgolang\b|\bgo\.mod\b|\bgo (?:test|run|build)\b|\bgo language\b|\bgo project\b"),
+        ("rust", r"\brust\b|\bcargo\b"),
+        ("cpp", r"\bc\+\+\b|\bcpp\b"),
+        ("c", r"\bc language\b|\bc project\b"),
+        ("python", r"(?<!non-)\bpython\b|\bflask\b|\bpytest\b"),
+    ]
+    found: list[str] = []
+    for language, pattern in patterns:
+        if re.search(pattern, text) and language not in found:
+            found.append(language)
+    return found
+
+
+def _source_text(source: InputSource) -> str:
+    """Returns all source requirement text as one string."""
+    if source.kind == "user_input":
+        return source.text or ""
+    chunks: list[str] = []
+    for doc in source.docs:
+        try:
+            chunks.append(doc.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    return "\n".join(chunks)
 
 
 # ===========================================================================

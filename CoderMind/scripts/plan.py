@@ -247,11 +247,7 @@ def probe(invoker: list[str]) -> list[StageState]:
                 stage=stage,
                 type=type_,
                 message=str(result.get("message", "")),
-                # Treat ``warning`` as complete (matches ``decide()``):
-                # the artefact is present and usable, only a soft
-                # inconsistency was flagged. Anything else (``init`` /
-                # ``error``) is incomplete.
-                done=(type_ in ("update", "warning")),
+                done=(type_ == "update"),
                 raw=result,
             )
         )
@@ -261,16 +257,11 @@ def probe(invoker: list[str]) -> list[StageState]:
 def decide(states: list[StageState], force: bool) -> None:
     """Mark each state's ``will_run`` / ``reason`` in place.
 
-    Rule: any stage with ``type not in {"update", "warning"}`` runs.
-    ``warning`` means the artefact is present and usable but a soft
-    inconsistency was detected (e.g. tasks.json with auxiliary tasks
-    lacking a 1:1 interface mapping). Treating ``warning`` the same as
-    ``update`` here keeps re-runs idempotent: a stage that successfully
-    produced a warning-state artefact will not be rebuilt on the next
-    ``cmind script plan.py`` invocation. Once any stage runs, *all*
-    downstream stages run too (cascade), so derived artifacts never get
-    out of sync with regenerated upstream ones. ``--force`` flips every
-    stage to ``will_run``.
+    Rule: only ``type == "update"`` is complete. ``type == "warning"`` is
+    explicitly NOT a completed state: it means the artifact exists but
+    violates a cross-stage contract, so this stage is rerun and downstream
+    artifacts are rebuilt from it. ``--force`` flips every stage to
+    ``will_run``.
     """
     cascade = False
     for state in states:
@@ -282,12 +273,15 @@ def decide(states: list[StageState], force: bool) -> None:
             state.will_run = True
             state.reason = "upstream rebuilt"
             continue
-        if state.type in ("update", "warning"):
+        if state.type == "update":
             state.will_run = False
-            state.reason = "up-to-date" if state.type == "update" else "up-to-date (warning)"
+            state.reason = "up-to-date"
         else:
             state.will_run = True
-            state.reason = f"type={state.type}"
+            if state.type == "warning":
+                state.reason = "warning: cross-stage contract violation; rebuild stage and downstream"
+            else:
+                state.reason = f"type={state.type}"
             cascade = True
 
 
@@ -433,7 +427,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     _install_sigint_handler()
     invoker = _resolve_invoker()
 
-    # --- Phase 1: probe ----------------------------------------------------
+    # --- Step: probe ------------------------------------------------------
     states = probe(invoker)
     decide(states, force=args.force)
 
@@ -444,7 +438,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             _print_probe_summary(states)
         return 0
 
-    # --- Phase 1b: prerequisite check --------------------------------------
+    # --- Step: prerequisite check -----------------------------------------
     # If the very first stage cannot even start (its input is missing or
     # invalid), abort cleanly so the user gets a helpful pointer instead
     # of a confusing failure from the build script itself.  ``--dry-run``
@@ -463,14 +457,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 2
 
-    # --- Phase 2: short-circuit when nothing to do -------------------------
+    # --- Step: short-circuit when nothing to do ---------------------------
     runnable = [s for s in states if s.will_run]
     if not runnable:
         print("All 5 planning stages are already complete — nothing to do.")
         print("Use `cmind script plan.py --force` to rebuild from scratch.")
         return 0
 
-    # --- Phase 3: announce plan -------------------------------------------
+    # --- Step: announce plan ----------------------------------------------
     print(f"Planning pipeline: {len(runnable)} of {len(states)} stages to run.")
     print(_format_table(states))
     print()
@@ -484,7 +478,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             print("DRY-RUN ▸", " ".join(_script_argv(invoker, post)))
         return 0
 
-    # --- Phase 4: execute --------------------------------------------------
+    # --- Step: execute ----------------------------------------------------
     started = time.monotonic()
     for s in states:
         if not s.will_run:
@@ -504,21 +498,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         # fails, otherwise the user would see a JSON dump after every
         # stage.
         #
-        # ``update``  -> stage is fully valid; continue.
-        # ``warning`` -> artefact is usable but a soft inconsistency was
-        #                detected (e.g. tasks.json having auxiliary tasks
-        #                without a 1:1 interface mapping). Print the
-        #                message and continue; do not fail the pipeline.
-        # ``init`` / ``error`` -> artefact is missing or unusable; fail.
+        # ``update`` -> stage is fully valid; continue.
+        # Any other type means the artifact is missing, unusable, or
+        # violates a cross-stage contract; fail so bench cannot report a
+        # false PASS for partial plans.
         verify = _run_check(invoker, s.stage.check_script)
         verify_type = verify.get("type", "error")
-        if verify_type == "warning":
-            print(
-                f"   warning: {verify.get('message', 'no message')}"
-                f" (continuing)",
-                file=sys.stderr,
-            )
-        elif verify_type != "update":
+        if verify_type != "update":
             print(
                 f"   verification failed: {verify_type} — "
                 f"{verify.get('message', 'no message')}",
@@ -532,7 +518,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         elapsed = time.monotonic() - stage_started
         print(f"✓  {s.stage.name:<14} done in {elapsed:.1f}s")
 
-    # --- Phase 5: post-pipeline helpers -----------------------------------
+    # --- Step: post-pipeline helpers --------------------------------------
     print()
     print("Running post-pipeline helpers ...")
     for post in POST_STEPS:

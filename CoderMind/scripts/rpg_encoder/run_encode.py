@@ -25,7 +25,8 @@ _script_dir = Path(__file__).resolve().parent.parent
 if str(_script_dir) not in sys.path:
     sys.path.insert(0, str(_script_dir))
 
-from common.paths import RPG_FILE, DEP_GRAPH_FILE, RPG_HTML_FILE, WORKSPACE_ROOT, ensure_cmind_dir  # noqa: E402
+from common.paths import RPG_FILE, RPG_HTML_FILE, WORKSPACE_ROOT, ensure_cmind_dir  # noqa: E402
+from common.rpg_io import atomic_write_rpg  # noqa: E402
 from common.trajectory import Trajectory  # noqa: E402
 
 
@@ -100,35 +101,16 @@ def run_encode(
         traj.start_step(step_dep.step_id)
 
         dep_graph_stats = {}
-        dep_graph_output = None
         try:
             rpg.parse_dep_graph(repo_dir)
             if rpg.dep_graph:
-                # Save dep_graph as a standalone file so that:
-                #   1. rpg.json stays small (feature tree + maps only)
-                #   2. git hooks can update dep_graph.json independently
-                #   3. file layout is consistent from first encode onward
-                dep_graph_output = str(DEP_GRAPH_FILE)
-                os.makedirs(os.path.dirname(dep_graph_output), exist_ok=True)
-                dg_dict = rpg.dep_graph.to_dict(
-                    dep_to_rpg_map=rpg._dep_to_rpg_map,
-                )
-                with open(dep_graph_output, "w", encoding="utf-8") as dgf:
-                    json.dump(dg_dict, dgf, indent=2, ensure_ascii=False)
-
-                # Store a relative reference from rpg.json's directory to
-                # dep_graph.json so the layout is portable.  Fall back to
-                # the absolute path when they live in different trees
-                # (e.g. user passed --output to a custom location).
-                rpg_dir = Path(output).resolve().parent
-                dep_graph_resolved = Path(dep_graph_output).resolve()
-                try:
-                    rpg._dep_graph_file = str(
-                        dep_graph_resolved.relative_to(rpg_dir)
-                    )
-                except ValueError:
-                    rpg._dep_graph_file = str(dep_graph_resolved)
-
+                # The dep_graph is embedded in rpg.json by ``rpg.to_dict()``
+                # (the default is ``include_dep_graph=True``), so we no
+                # longer write a standalone ``dep_graph.json``. Single
+                # source of truth eliminates the encoder-vs-hook drift
+                # that used to bite ``RPGService.load`` when the two files
+                # disagreed.  Legacy on-disk ``dep_graph.json`` files keep
+                # loading via ``RPGService.load``'s compat path.
                 dep_graph_stats = {
                     "dep_nodes": rpg.dep_graph.G.number_of_nodes(),
                     "dep_edges": rpg.dep_graph.G.number_of_edges(),
@@ -145,8 +127,12 @@ def run_encode(
 
         result_data = rpg.to_dict()
 
-        with open(output, "w", encoding="utf-8") as fh:
-            json.dump(result_data, fh, indent=2, ensure_ascii=False)
+        # Atomic write of the central pipeline artefact. A killed
+        # encode used to truncate rpg.json and brick downstream
+        # stages (skeleton / func_design / code_gen all read it);
+        # now the previous good rpg.json survives any interrupted
+        # write.
+        atomic_write_rpg(output, result_data, indent=2, ensure_ascii=False)
 
         output_size = os.path.getsize(output)
         traj.complete_step(step_save.step_id, {
@@ -175,13 +161,21 @@ def run_encode(
             logger.warning("Failed to generate visualization: %s", viz_exc)
             traj.fail_step(step_viz.step_id, str(viz_exc))
 
-        # Collect stats — use result_data (serialized) edge count since
+        serialized_edges = result_data.get("edges", [])
+        edge_count = len(serialized_edges) if isinstance(serialized_edges, list) else 0
+        if edge_count == 0:
+            try:
+                edge_count = len(rpg.edges)
+            except Exception:
+                edge_count = 0
+
+        # Collect stats — prefer result_data (serialized) edge count since
         # to_dict() merges dep-graph semantic edges that aren't in self.edges.
         stats = {
             "repo_name": repo_name,
             "output_path": output,
             "node_count": len(rpg.nodes),
-            "edge_count": len(result_data.get("edges", [])),
+            "edge_count": edge_count,
         }
         if viz_output:
             stats["viz_path"] = viz_output

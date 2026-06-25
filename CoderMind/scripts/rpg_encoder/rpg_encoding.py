@@ -31,13 +31,16 @@ from common.llm_types import (
     SystemMessage,
     UserMessage,
 )
+from common.rpg_io import atomic_write_rpg
 from common.utils import (
+    is_skip_dir,
     exclude_files,
     normalize_path,
     parse_code_blocks,
     parse_solution_output,
     truncate_by_token,
 )
+from lang_parser import dominant_language, is_supported_source, is_test_file
 from rpg import RPG
 
 from .prompts import EXCLUDE_FILES, GENERATE_REPO_INFO
@@ -119,14 +122,7 @@ class RPGParser:
 
         for root, dirs, files in os.walk(self.repo_dir):
             # Skip hidden dirs and common non-essential dirs
-            dirs[:] = [
-                d for d in dirs
-                if not d.startswith(".")
-                and d not in {
-                    "__pycache__", "node_modules", ".git",
-                    ".venv", "venv", "env",
-                }
-            ]
+            dirs[:] = [d for d in dirs if not is_skip_dir(d)]
             dirs.sort()
 
             rel_root = os.path.relpath(root, self.repo_dir)
@@ -139,7 +135,7 @@ class RPGParser:
                 rel_path = os.path.join(rel_root, fname) if rel_root else fname
                 rel_path = rel_path.replace("\\", "/")
                 tree_lines.append(rel_path)
-                if fname.endswith(".py"):
+                if is_supported_source(rel_path) and not is_test_file(rel_path):
                     valid_files.append(rel_path)
 
         skeleton_info = "\n".join(tree_lines)
@@ -492,10 +488,30 @@ class RPGParser:
         )
 
         if save_path:
-            with open(save_path, "w") as f:
-                json.dump(final_result, f, indent=4, default=lambda o: o.to_dict() if hasattr(o, 'to_dict') else str(o))
+            # Atomic write so a kill mid-dump doesn't truncate the
+            # intermediate parsed-tree snapshot (resumed runs read it).
+            atomic_write_rpg(
+                save_path, final_result,
+                indent=4,
+                default=lambda o: o.to_dict() if hasattr(o, 'to_dict') else str(o),
+            )
 
         self.logger.info("Features parsed: files=%d", len(file2feature))
+
+        # Determine the repo's dominant language from the files actually
+        # scanned by the skeleton so RefactorTree can stamp every
+        # NodeMetaData it produces (FILE / CLASS / FUNCTION / METHOD)
+        # with the correct ``meta.language``. Without this, the
+        # encoder fell back to its (legacy) "python" default and
+        # produced misleading meta for Go / Rust / TS / ... repos.
+        repo_dominant_language = dominant_language(self.valid_files)
+        if repo_dominant_language:
+            self.logger.info("Dominant language detected: %s", repo_dominant_language)
+        else:
+            self.logger.info(
+                "Dominant language could not be detected from skeleton; "
+                "RefactorTree will leave meta.language unset."
+            )
 
         # 4) Refactor to RPG
         refactor_agent = RefactorTree(
@@ -506,6 +522,7 @@ class RPGParser:
             repo_name=self.repo_name,
             logger=self.logger,
             llm_client=self.llm_client,
+            language=repo_dominant_language,
         )
         self.logger.info("Refactoring to RPG...")
         final_rpg, refactor_traj, repo_rpg = refactor_agent.run(
@@ -534,8 +551,13 @@ class RPGParser:
         }
 
         if save_path:
-            with open(save_path, "w") as f:
-                json.dump(final_result, f, indent=4, default=lambda o: o.to_dict() if hasattr(o, 'to_dict') else str(o))
+            # Atomic write of the final encoder result; see the same
+            # note on the parsed-tree snapshot above.
+            atomic_write_rpg(
+                save_path, final_result,
+                indent=4,
+                default=lambda o: o.to_dict() if hasattr(o, 'to_dict') else str(o),
+            )
 
         self.logger.info("RPG refactoring done.")
         self.logger.info("=== RPG parsing pipeline finished ===")

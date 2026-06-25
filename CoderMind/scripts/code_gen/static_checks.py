@@ -6,11 +6,38 @@ These detect unimplemented stubs and placeholder returns without LLM cost.
 """
 
 import ast
+import json
 import logging
 from pathlib import Path
-from typing import List
+from typing import Any, List
+
+from common.paths import FEATURE_SPEC_FILE, REPO_RPG_FILE
+from decoder_lang import LanguageBackend, get_backend, resolve_decoder_language
 
 logger = logging.getLogger(__name__)
+
+
+def _load_json_if_exists(path: Path) -> Any:
+    """Load JSON from ``path`` or return None when unavailable."""
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _resolve_static_backend(files: List[str]) -> LanguageBackend:
+    """Resolve the backend used for static codegen completeness checks."""
+    feature_spec = _load_json_if_exists(FEATURE_SPEC_FILE)
+    rpg_obj = _load_json_if_exists(REPO_RPG_FILE)
+    language = resolve_decoder_language(
+        feature_spec=feature_spec,
+        rpg_obj=rpg_obj,
+        valid_files=files,
+    )
+    return get_backend(language)
 
 
 def static_completeness_check(files: List[str], repo_path: Path) -> List[str]:
@@ -30,6 +57,7 @@ def static_completeness_check(files: List[str], repo_path: Path) -> List[str]:
         List of human-readable issue strings (empty = all clean).
     """
     issues: List[str] = []
+    backend = _resolve_static_backend(files)
 
     for filepath in files:
         full_path = repo_path / filepath
@@ -37,13 +65,26 @@ def static_completeness_check(files: List[str], repo_path: Path) -> List[str]:
             issues.append(f"MISSING: {filepath} does not exist")
             continue
 
-        if full_path.suffix != ".py":
+        if not backend.is_source_file(filepath):
             continue
 
         try:
             content = full_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            issues.append(f"PARSE_ERROR: {filepath} — {exc}")
+            continue
+
+        if backend.name != "python":
+            ok, error = backend.syntax_check(content, filepath)
+            if not ok:
+                issues.append(f"PARSE_ERROR: {filepath} — {error}")
+            if backend.has_placeholder(content, filepath):
+                issues.append(f"PLACEHOLDER: {filepath} contains placeholder code")
+            continue
+
+        try:
             tree = ast.parse(content, filename=filepath)
-        except (SyntaxError, UnicodeDecodeError) as exc:
+        except SyntaxError as exc:
             issues.append(f"PARSE_ERROR: {filepath} — {exc}")
             continue
 
@@ -164,7 +205,5 @@ def static_completeness_check(files: List[str], repo_path: Path) -> List[str]:
                         f"PLACEHOLDER: {filepath}:{node.lineno} "
                         f"returns placeholder string"
                     )
-
-    return issues
 
     return issues

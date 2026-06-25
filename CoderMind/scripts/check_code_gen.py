@@ -362,16 +362,53 @@ def determine_state(
         # actually generating the expected files.
         missing_artifacts = []
         repo_root = REPO_DIR
-        
-        # Check for main_entry task artifact
+
+        # Resolve the target language so entry-point / dependency artifact
+        # checks are not hard-coded to Python's ``main.py`` /
+        # ``requirements.txt``. Routes through the canonical repo resolver so
+        # the language is inferred from the real on-disk sources when the rpg
+        # metadata is missing, rather than silently assuming Python. Falls
+        # back to Python on any failure so the check degrades to its previous
+        # behaviour rather than crashing.
+        backend = None
+        try:
+            from common.paths import REPO_RPG_FILE
+            from decoder_lang import resolve_repo_backend
+            rpg_obj = None
+            if Path(REPO_RPG_FILE).is_file():
+                rpg_obj = json.loads(Path(REPO_RPG_FILE).read_text(encoding="utf-8"))
+            backend = resolve_repo_backend(repo_root, rpg_obj=rpg_obj)
+        except Exception:  # noqa: BLE001 — degraded mode: assume Python
+            backend = None
+
+        # Check for main_entry task artifact (language-aware entry path).
         main_entry_ids = [tid for tid in completed_ids if tid.startswith("<MAIN_ENTRY>")]
-        if main_entry_ids and not (repo_root / "main.py").exists():
-            missing_artifacts.append("main.py (from <MAIN_ENTRY> task)")
-        
-        # Check for requirements task artifact
+        if main_entry_ids:
+            if backend is not None:
+                # Accept any of the backend's entry-point shapes. A single
+                # canonical path is too strict when the skeleton placed the
+                # entry off-canonical (e.g. C++ ``src/cli/main.cpp``) or the
+                # language uses a glob convention (Go ``cmd/*/main.go``).
+                candidates = backend.entry_point_candidates()
+                entry_exists = any(
+                    (any(repo_root.glob(c)) if "*" in c else (repo_root / c).exists())
+                    for c in candidates
+                )
+                if not entry_exists:
+                    missing_artifacts.append(
+                        f"{candidates[0]} (from <MAIN_ENTRY> task)"
+                    )
+            elif not (repo_root / "main.py").exists():
+                missing_artifacts.append("main.py (from <MAIN_ENTRY> task)")
+
+        # Check for requirements task artifact. The dependency-manifest
+        # filename is language-specific; only Python's is asserted here
+        # (other languages manage deps via go.mod / Cargo.toml / package.json
+        # which the dependency task and build steps validate separately).
         req_ids = [tid for tid in completed_ids if tid.startswith("<REQUIREMENTS>")]
-        if req_ids and not (repo_root / "requirements.txt").exists():
-            missing_artifacts.append("requirements.txt (from <REQUIREMENTS> task)")
+        if req_ids and (backend is None or backend.name == "python"):
+            if not (repo_root / "requirements.txt").exists():
+                missing_artifacts.append("requirements.txt (from <REQUIREMENTS> task)")
         
         if missing_artifacts:
             result["type"] = "incomplete"

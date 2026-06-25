@@ -13,10 +13,9 @@ but BEFORE the final interfaces.json is saved.
 
 import json
 import logging
-import ast
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any, Set
+from typing import Callable, Dict, List, Optional, Tuple, Any, Set
 
 import sys
 from pathlib import Path
@@ -24,10 +23,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common import LLMClient
 
+# AST inspection routes through the Python backend's
+# ``find_main_block_lineno`` helper so entry-point splicing shares the
+# same parser abstraction as the rest of interface design.
+from decoder_lang import get_backend
+from decoder_lang.prompt_directive import with_language_directive
+
 from .interface_agent import (
     GlobalInterfaceRegistry,
     DependencyCollector,
-    cross_validate_imports_vs_calls,
 )
 from .interface_prompts import ORPHAN_REVIEW_PROMPT
 
@@ -35,11 +39,58 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# Non-production feature classification
+# ============================================================================
+
+# Top-level feature categories whose units are driven by an EXTERNAL runner
+# rather than by repository code: test functions are discovered and invoked
+# by the test runner, build targets by ``make`` / ``cmake``. Such a unit
+# legitimately has no incoming *invocation* edge in the production call
+# graph, so the "no incoming edge => dead code" orphan heuristic is a false
+# positive for it — exactly like the type-like case handled by ``is_callable``,
+# but along an orthogonal axis (the unit IS callable, it is just called from
+# outside the graph).
+#
+# Categories are matched on the leading segment of a feature path
+# (``"Testing/error reporting/..."`` -> ``"testing"``) and on the subtree
+# name, both lower-cased. The set is language-agnostic: the planner emits
+# these category names independently of the target language.
+NON_PRODUCTION_FEATURE_CATEGORIES: frozenset[str] = frozenset({
+    "testing", "test", "tests", "test infrastructure", "test suite",
+    "build system", "build", "build configuration",
+    "tooling", "ci", "cd", "ci/cd",
+})
+
+
+def _is_non_production_feature(
+    features: Optional[List[str]],
+    subtree: str = "",
+) -> bool:
+    """Return True when a feature-bearing unit belongs to a test/build category.
+
+    Such units are invoked by an external driver (test runner, ``make``),
+    not by repository code, so a missing incoming invocation edge is not a
+    coverage gap. Matching is on the leading segment of each feature path
+    and on the subtree name, both lower-cased, against
+    :data:`NON_PRODUCTION_FEATURE_CATEGORIES`. Language-agnostic.
+    """
+    if subtree and subtree.strip().lower() in NON_PRODUCTION_FEATURE_CATEGORIES:
+        return True
+    for feature in features or ():
+        if not isinstance(feature, str):
+            continue
+        head = feature.split("/", 1)[0].strip().lower()
+        if head in NON_PRODUCTION_FEATURE_CATEGORIES:
+            return True
+    return False
+
+
+# ============================================================================
 # Global Review Prompt
 # ============================================================================
 
 GLOBAL_INTERFACE_REVIEW_PROMPT = """
-You are a senior software engineer reviewing the COMPLETE set of interfaces for an entire Python repository.
+You are a senior software engineer reviewing the COMPLETE set of interfaces for an entire repository.
 
 All subtrees have been designed. Your task is to review the interfaces holistically,
 focusing on CROSS-MODULE integration — not individual interface quality.
@@ -64,8 +115,8 @@ role in the architecture means they don't need an internal caller. This includes
   This explicitly includes (do not omit these):
   * HTTP route handlers (Flask `@route` / FastAPI / Django view functions) —
     even if not decorated in the signature, any unit whose role is "respond
-    to an HTTP request" is invoked by the web framework, not by other Python
-    code. Always mark these as entry_points.
+    to an HTTP request" is invoked by the web framework, not by other code
+    in the project. Always mark these as entry_points.
   * CLI subcommand handlers (click commands, argparse callbacks).
   * Event / signal subscribers, background workers, scheduled job entry
     functions, message-queue consumers.
@@ -166,8 +217,9 @@ Rules for `add_interface` (auto-applied when valid):
 - Use ONLY when no existing unit could possibly serve the role (e.g. a route
   handler is missing entirely). If two existing units just need to be wired
   together, use `add_dependency` instead — do NOT invent a new unit.
-- `signature` MUST be a single-line Python def/class header ending with `:`,
-  e.g. `def list_todos() -> Response:` or `class TodoView(MethodView):`.
+- `signature` MUST be a single-line language-appropriate interface/stub
+  signature (for Python, a def/class header ending with `:`, e.g.
+  `def list_todos() -> Response:` or `class TodoView(MethodView):`).
 - `docstring` MUST be non-empty (1–3 sentences).
 - `unit_name` MUST be prefixed with "function " or "class ".
 - `feature_path` MUST be one of the feature paths declared in the skeleton;
@@ -178,9 +230,10 @@ Rules for `add_interface` (auto-applied when valid):
   immediately be reported as orphan).
 
 Rules for `modify_interface`:
-- This action has no auto-handler. Use it sparingly and only for true
-  architectural issues (e.g. breaking a circular import). Each such request
-  will be recorded as `unapplied_fixes` and will block `passed=true`.
+- This action has no auto-handler: it is recorded as an advisory
+  `unapplied_fix` for manual follow-up and does NOT block `passed`. Use it
+  sparingly and only for true architectural issues (e.g. breaking a
+  circular import).
 - Do NOT use modify_interface for cases solvable by add_dependency or
   add_interface.
 
@@ -273,9 +326,6 @@ def build_call_graph(
     for edge in enhanced_data_flow.get("inheritance_edges", []):
         child = edge.get("child", "")
         parent = edge.get("parent", "")
-        source_file = edge.get("source_file", "")
-        parent_file = edge.get("parent_file", "")
-        
         child_candidates = name_to_keys.get(child, [])
         parent_candidates = name_to_keys.get(parent, [])
         
@@ -289,8 +339,6 @@ def build_call_graph(
     for edge in enhanced_data_flow.get("reference_edges", []):
         unit = edge.get("unit", "")
         ref_type = edge.get("referenced_type", "")
-        source_file = edge.get("source_file", "")
-        
         unit_candidates = name_to_keys.get(unit, [])
         type_candidates = name_to_keys.get(ref_type, [])
         
@@ -303,43 +351,190 @@ def build_call_graph(
     return dict(outgoing), dict(incoming), unit_to_file
 
 
+def _build_unit_feature_index(
+    interfaces_data: Dict[str, Any],
+) -> Dict[str, Tuple[List[str], str]]:
+    """Map ``file_path::unit_name`` -> (feature paths, subtree name).
+
+    Lets the orphan checks consult a unit's feature category without
+    re-walking the subtree tree per unit. Units absent from the index
+    (no ``units_to_features`` entry) are treated as production code by the
+    callers (the conservative default keeps real dead code detectable).
+    """
+    index: Dict[str, Tuple[List[str], str]] = {}
+    subtrees = interfaces_data.get("subtrees", {})
+    for subtree_name, subtree_data in subtrees.items():
+        file_interfaces = subtree_data.get("interfaces", subtree_data.get("files", {}))
+        for file_path, file_data in file_interfaces.items():
+            units_to_features = file_data.get("units_to_features", {})
+            for unit_name, features in units_to_features.items():
+                index[f"{file_path}::{unit_name}"] = (
+                    features if isinstance(features, list) else [],
+                    subtree_name,
+                )
+    return index
+
+
+def _unit_name_aliases(unit_name: str) -> Set[str]:
+    """Return comparable aliases for an interface unit name."""
+    raw = unit_name.strip()
+    if not raw:
+        return set()
+
+    aliases = {raw}
+    if " " in raw:
+        aliases.add(raw.split(" ", 1)[1].strip())
+
+    expanded = set()
+    for alias in aliases:
+        if not alias:
+            continue
+        expanded.add(alias)
+        if "." in alias:
+            expanded.add(alias.rsplit(".", 1)[-1])
+        if "::" in alias:
+            expanded.add(alias.rsplit("::", 1)[-1])
+    return {alias for alias in expanded if alias}
+
+
+def _is_advisory_unapplied_fix(fix: Dict[str, Any]) -> bool:
+    """Return True when an unapplied fix is manual follow-up, not a blocker."""
+    return (
+        fix.get("advisory") is True
+        or fix.get("manual_follow_up") is True
+        or fix.get("action") == "modify_interface"
+    )
+
+
+def _build_entry_point_keys(
+    entry_points: List[Dict[str, Any]],
+    unit_to_file: Dict[str, str],
+) -> Set[str]:
+    """Resolve LLM entry-point records to concrete unit keys."""
+    alias_to_keys: Dict[str, Set[str]] = defaultdict(set)
+    for unit_key in unit_to_file:
+        unit_name = unit_key.split("::", 1)[1] if "::" in unit_key else unit_key
+        for alias in _unit_name_aliases(unit_name):
+            alias_to_keys[alias].add(unit_key)
+
+    entry_point_keys: Set[str] = set()
+    for entry_point in entry_points:
+        entry_file = str(entry_point.get("file_path") or "").strip()
+        entry_unit = str(entry_point.get("unit_name") or "").strip()
+        if entry_file and entry_unit:
+            exact_key = f"{entry_file}::{entry_unit}"
+            if exact_key in unit_to_file:
+                entry_point_keys.add(exact_key)
+
+        for alias in _unit_name_aliases(entry_unit):
+            candidate_keys = alias_to_keys.get(alias, set())
+            if not entry_file and len(candidate_keys) > 1:
+                continue
+            for unit_key in candidate_keys:
+                if entry_file and unit_to_file.get(unit_key) != entry_file:
+                    continue
+                entry_point_keys.add(unit_key)
+    return entry_point_keys
+
+
+def _is_isolated_orphan(
+    unit_key: str,
+    unit_name: str,
+    file_path: str,
+    features: List[str],
+    subtree: str,
+    incoming: Dict[str, Set[str]],
+    outgoing: Dict[str, Set[str]],
+    entry_point_keys: Set[str],
+    is_callable: Optional[Callable[[str], bool]],
+    is_test_file: Optional[Callable[[str], bool]],
+) -> bool:
+    """Return True when a unit is a genuinely disconnected production orphan.
+
+    Single source of truth shared by the unit-level connectivity gate and
+    the feature-coverage gate so the two can never diverge (a past defect
+    had them disagree, leaving stale orphan counts). A unit is an orphan
+    only when ALL of the following hold:
+
+    * it is not an entry point;
+    * it is callable (type-like units are referenced, not invoked, so a
+      missing incoming *invocation* edge is expected);
+    * it is production code (test / build units are driven by an external
+      runner, so a missing incoming edge is not dead code);
+    * it is completely isolated — no incoming AND no outgoing edge.
+
+    Requiring isolation on BOTH directions (rather than "no incoming") is
+    what keeps roots / factories / framework callbacks — which have no
+    static incoming edge but DO call into the graph — from being mistaken
+    for dead code. The rule is identical for every language; all
+    language-specific behaviour enters only through the injected
+    ``is_callable`` / ``is_test_file`` predicates.
+    """
+    if unit_key in entry_point_keys:
+        return False
+    if is_callable is not None and not is_callable(unit_name):
+        return False
+    if _is_non_production_feature(features, subtree):
+        return False
+    if is_test_file is not None and is_test_file(file_path):
+        return False
+    has_incoming = bool(incoming.get(unit_key))
+    has_outgoing = bool(outgoing.get(unit_key))
+    return not has_incoming and not has_outgoing
+
+
 def check_call_graph_connectivity(
     interfaces_data: Dict[str, Any],
     enhanced_data_flow: Dict[str, Any],
-    entry_points: List[Dict[str, Any]]
+    entry_points: List[Dict[str, Any]],
+    is_callable: Optional[Callable[[str], bool]] = None,
+    is_test_file: Optional[Callable[[str], bool]] = None,
 ) -> Dict[str, Any]:
     """Build a directed graph of all invocation edges and check connectivity.
 
-    Identifies orphan units (non-entry-point units with no incoming edges).
+    Identifies orphan units: *callable* units (functions / methods /
+    classes) that are completely isolated — no incoming AND no outgoing
+    edges — and are not entry points.
+
+    ``is_callable`` is a per-language predicate (``backend.is_callable_unit``).
+    When supplied, type-like units (struct / enum / interface / ...) are
+    excluded from orphan candidacy: a data structure legitimately has no
+    incoming *invocation* edge, so flagging it is a false positive.
+    When ``None`` (legacy callers / tests) every unit is treated as
+    callable, preserving the previous behaviour.
+
+    ``is_test_file`` is a per-language predicate (``backend.is_test_file``).
+    When supplied, units in test files are excluded from orphan candidacy
+    — together with the language-agnostic test/build feature-category
+    check — because a test or build unit is driven by an external runner,
+    not by repository code, so its lack of an incoming edge is not dead
+    code. ``None`` disables the file-level check (the category check still
+    applies), preserving legacy behaviour.
+
+    Requiring "no outgoing" as well mirrors
+    :meth:`InterfacesStore.find_orphan_units` so the convergence gate and
+    the pruning detector share one definition of "orphan".
 
     Returns:
         Dict with keys: orphan_units, total_units, entry_point_count
     """
     outgoing, incoming, unit_to_file = build_call_graph(interfaces_data, enhanced_data_flow)
+    feature_index = _build_unit_feature_index(interfaces_data)
 
     all_units = set(unit_to_file.keys())
 
-    # Build entry point key set
-    entry_point_keys = set()
-    for ep in entry_points:
-        ep_file = ep.get("file_path", "")
-        ep_unit = ep.get("unit_name", "")
-        ep_key = f"{ep_file}::{ep_unit}"
-        if ep_key in all_units:
-            entry_point_keys.add(ep_key)
-        else:
-            # Try fuzzy match
-            for uk in all_units:
-                if uk.endswith(f"::{ep_unit}"):
-                    entry_point_keys.add(uk)
-                    break
+    entry_point_keys = _build_entry_point_keys(entry_points, unit_to_file)
 
-    non_entry_units = all_units - entry_point_keys
-
-    # Units with no incoming edges (excluding entry points)
+    # Orphan = callable + completely isolated (no incoming, no outgoing).
     orphan_units = []
-    for unit_key in non_entry_units:
-        if unit_key not in incoming or len(incoming[unit_key]) == 0:
+    for unit_key in all_units:
+        unit_name = unit_key.split("::", 1)[1] if "::" in unit_key else unit_key
+        features, subtree = feature_index.get(unit_key, ([], ""))
+        if _is_isolated_orphan(
+            unit_key, unit_name, unit_to_file.get(unit_key, ""),
+            features, subtree, incoming, outgoing, entry_point_keys,
+            is_callable, is_test_file,
+        ):
             orphan_units.append({
                 "unit_key": unit_key,
                 "file_path": unit_to_file.get(unit_key, ""),
@@ -355,26 +550,32 @@ def check_call_graph_connectivity(
 def check_feature_dependency_coverage(
     interfaces_data: Dict[str, Any],
     enhanced_data_flow: Dict[str, Any],
-    entry_points: List[Dict[str, Any]]
+    entry_points: List[Dict[str, Any]],
+    is_callable: Optional[Callable[[str], bool]] = None,
+    is_test_file: Optional[Callable[[str], bool]] = None,
 ) -> List[Dict[str, Any]]:
-    """Check that every feature-bearing unit is either an entry point or has at least one incoming dependency edge.
-    
-    Returns: list of orphan features (feature paths without incoming edges
-             and not in entry points)
+    """Check that feature-bearing units are not isolated from the graph.
+
+    ``is_callable`` is a per-language predicate (``backend.is_callable_unit``).
+    When supplied, type-like feature-bearing units (struct / enum / ...)
+    are excluded: a data structure that carries a feature is "used" by
+    being referenced, not invoked, so a missing incoming *invocation*
+    edge is not a coverage gap. When ``None`` every unit is checked
+    (legacy behaviour).
+
+    ``is_test_file`` is a per-language predicate (``backend.is_test_file``).
+    When supplied, units in test files are excluded — together with the
+    language-agnostic test/build feature-category check — because a test
+    or build unit is invoked by an external runner (test framework /
+    ``make``), not by repository code, so a missing incoming edge is not a
+    coverage gap. ``None`` disables the file-level check (the category
+    check still applies), preserving legacy behaviour.
+
+    Returns: list of orphan features attached to isolated units.
     """
-    _, incoming, unit_to_file = build_call_graph(interfaces_data, enhanced_data_flow)
+    outgoing, incoming, unit_to_file = build_call_graph(interfaces_data, enhanced_data_flow)
     
-    # Build entry point key set
-    entry_point_keys = set()
-    for ep in entry_points:
-        ep_file = ep.get("file_path", "")
-        ep_unit = ep.get("unit_name", "")
-        ep_key = f"{ep_file}::{ep_unit}"
-        entry_point_keys.add(ep_key)
-        # Also add bare match
-        for uk in unit_to_file:
-            if uk.endswith(f"::{ep_unit}"):
-                entry_point_keys.add(uk)
+    entry_point_keys = _build_entry_point_keys(entry_points, unit_to_file)
     
     orphan_features = []
     subtrees = interfaces_data.get("subtrees", {})
@@ -385,13 +586,11 @@ def check_feature_dependency_coverage(
             units_to_features = file_data.get("units_to_features", {})
             for unit_name, features in units_to_features.items():
                 unit_key = f"{file_path}::{unit_name}"
-                
-                # Skip entry points
-                if unit_key in entry_point_keys:
-                    continue
-                
-                # Check if has any incoming edge
-                if unit_key not in incoming or len(incoming[unit_key]) == 0:
+                if _is_isolated_orphan(
+                    unit_key, unit_name, file_path, features, subtree_name,
+                    incoming, outgoing, entry_point_keys,
+                    is_callable, is_test_file,
+                ):
                     orphan_features.append({
                         "file_path": file_path,
                         "unit_name": unit_name,
@@ -417,7 +616,11 @@ _SIGNATURE_RE = __import__("re").compile(r"^(def |class )[A-Za-z_]\w*\s*\(.*\)\s
 
 
 def _insert_unit_into_file_code(file_code: str, stub: str) -> str:
-    """Insert ``stub`` into ``file_code`` at a safe location.
+    """Insert a Python ``stub`` into ``file_code`` at a safe location.
+
+    Only reached for Python projects: ``_apply_fixes`` skips the
+    ``add_interface`` action (the sole caller) for non-Python backends,
+    because stub synthesis emits Python ``def``/``class`` syntax.
 
     Preferred insertion point is **immediately before** any top-level
     ``if __name__ == "__main__":`` block, so handler-added units do not
@@ -434,27 +637,18 @@ def _insert_unit_into_file_code(file_code: str, stub: str) -> str:
     if not file_code.strip():
         return stub
 
-    try:
-        tree = ast.parse(file_code)
-    except SyntaxError:
-        return file_code.rstrip() + "\n\n\n" + stub
+    # Locate the module's main guard via the Python backend so a handler-
+    # added unit is spliced before it. A missing guard (or a parse error)
+    # falls through to the append branch below.
+    backend = get_backend("python")
+    find_main = getattr(backend, "find_main_block_lineno", None)
+    main_lineno = find_main(file_code) if find_main is not None else None
 
-    main_node: Optional[ast.If] = None
-    for node in tree.body:
-        if (
-            isinstance(node, ast.If)
-            and isinstance(node.test, ast.Compare)
-            and isinstance(node.test.left, ast.Name)
-            and node.test.left.id == "__name__"
-        ):
-            main_node = node
-            break
-
-    if main_node is None:
+    if main_lineno is None:
         return file_code.rstrip() + "\n\n\n" + stub
 
     lines = file_code.splitlines()
-    insert_at = max(main_node.lineno - 1, 0)  # ast.lineno is 1-based
+    insert_at = max(main_lineno - 1, 0)  # ast.lineno is 1-based
     prefix = lines[:insert_at]
     suffix = lines[insert_at:]
     # Ensure separation: one blank line before stub, two blank lines after.
@@ -479,11 +673,17 @@ class InterfaceReviewer:
         llm_client: Optional[LLMClient] = None,
         trajectory: Optional[Any] = None,
         step_id: Optional[int] = None,
+        target_language: Optional[str] = None,
     ):
         if llm_client is None:
             self.llm = LLMClient(trajectory=trajectory, step_id=step_id)
         else:
             self.llm = llm_client
+        # Target-language backend. Structural checks and dependency-edge
+        # fixes are language-agnostic; only interface-stub synthesis
+        # (``add_interface``) is Python-specific and is skipped for other
+        # languages. Defaults to Python so standalone callers are unaffected.
+        self.backend = get_backend(target_language or "python")
         self.logger = logging.getLogger(__name__)
     
     def review_and_fix(
@@ -560,10 +760,14 @@ class InterfaceReviewer:
             
             # Step 2: Code-based structural checks
             connectivity = check_call_graph_connectivity(
-                interfaces_data, enhanced_data_flow, entry_points
+                interfaces_data, enhanced_data_flow, entry_points,
+                is_callable=self.backend.is_callable_unit,
+                is_test_file=self.backend.is_test_file,
             )
             feature_orphans = check_feature_dependency_coverage(
-                interfaces_data, enhanced_data_flow, entry_points
+                interfaces_data, enhanced_data_flow, entry_points,
+                is_callable=self.backend.is_callable_unit,
+                is_test_file=self.backend.is_test_file,
             )
 
             self.logger.info(
@@ -634,10 +838,14 @@ class InterfaceReviewer:
         final_feature_orphans: List[Any] = []
         if review_history:
             final_connectivity = check_call_graph_connectivity(
-                interfaces_data, enhanced_data_flow, final_entry_points
+                interfaces_data, enhanced_data_flow, final_entry_points,
+                is_callable=self.backend.is_callable_unit,
+                is_test_file=self.backend.is_test_file,
             )
             final_feature_orphans = check_feature_dependency_coverage(
-                interfaces_data, enhanced_data_flow, final_entry_points
+                interfaces_data, enhanced_data_flow, final_entry_points,
+                is_callable=self.backend.is_callable_unit,
+                is_test_file=self.backend.is_test_file,
             )
             final_orphan_units = final_connectivity["orphan_units"]
             self.logger.info(
@@ -646,15 +854,24 @@ class InterfaceReviewer:
                 f"{len(final_feature_orphans)} orphan feature(s)"
             )
 
-        # Collect unapplied fixes from every iteration (modify_interface /
-        # add_interface requests that have no auto-handler). These block
-        # passed=true because they represent acknowledged-but-unresolved
-        # architectural issues.
+        # Collect unapplied fixes from every iteration and classify them:
+        #   * advisory  — manual follow-up that does NOT gate the verdict
+        #     (``modify_interface`` and unsupported non-Python ``add_interface``).
+        #   * blocking  — an automatic repair that the pipeline attempted but
+        #     could not install, such as unresolved ``add_dependency`` or a
+        #     rejected Python ``add_interface``. These gate ``passed``.
         unapplied_fixes: List[Dict[str, Any]] = []
         for entry in review_history:
             stats = entry.get("fix_stats") or {}
             for u in stats.get("unapplied", []):
                 unapplied_fixes.append({**u, "iteration": entry.get("iteration")})
+
+        advisory_fixes = [
+            u for u in unapplied_fixes if _is_advisory_unapplied_fix(u)
+        ]
+        blocking_unapplied_fixes = [
+            u for u in unapplied_fixes if not _is_advisory_unapplied_fix(u)
+        ]
 
         last_llm_pass = (
             review_history[-1]["llm_review"].get("pass", False)
@@ -663,7 +880,7 @@ class InterfaceReviewer:
         code_passed = (
             len(final_orphan_units) == 0
             and len(final_feature_orphans) == 0
-            and len(unapplied_fixes) == 0
+            and len(blocking_unapplied_fixes) == 0
         )
 
         final_result = {
@@ -672,6 +889,8 @@ class InterfaceReviewer:
             "final_feature_orphans": final_feature_orphans,
             "final_orphan_units": final_orphan_units,
             "unapplied_fixes": unapplied_fixes,
+            "advisory_fixes": advisory_fixes,
+            "blocking_unapplied_fixes": blocking_unapplied_fixes,
             "iterations_run": len(review_history),
             # ``last_llm_pass`` is a snapshot taken BEFORE the LLM's own
             # iteration-N fixes are applied, so it can read FAIL even when
@@ -788,7 +1007,26 @@ accept that aspect of the design as-is.
 Please perform the review tasks and return the JSON result.
 """.strip()
         
-        combined_prompt = f"{GLOBAL_INTERFACE_REVIEW_PROMPT}\n\n{user_prompt}"
+        # Non-Python projects cannot use the add_interface auto-handler
+        # (stub synthesis is Python-only). Steer the LLM toward the
+        # language-agnostic actions so it does not waste a fix slot on a
+        # request that will be skipped.
+        language_note = ""
+        if self.backend.name != "python":
+            hints = self.backend.prompt_hints()
+            language_note = (
+                f"\n\n## Target Language: {hints.display_name}\n"
+                f"This is a {hints.display_name} project, NOT Python. When "
+                "recommending fixes, use `add_dependency` (wire an existing "
+                "callee) or `modify_interface` (describe a manual change). "
+                "Do NOT use `add_interface`: automatic interface-stub "
+                "synthesis is only available for Python and will be skipped."
+            )
+
+        combined_prompt = (
+            with_language_directive(GLOBAL_INTERFACE_REVIEW_PROMPT, self.backend)
+            + f"{language_note}\n\n{user_prompt}"
+        )
         
         try:
             response = self.llm.generate(
@@ -834,16 +1072,18 @@ Please perform the review tasks and return the JSON result.
 
         Supported actions:
         - add_dependency:    Add a call dependency edge (auto-applied)
-        - add_interface:     Materialise a new unit (auto-applied via
+        - add_interface:     Materialise a new Python unit (auto-applied via
                              ``_apply_add_interface``; requires
-                             ``skeleton_features`` + ``rpg_features``)
-        - modify_interface:  Logged + recorded as unapplied (manual)
+                             ``skeleton_features`` + ``rpg_features``).
+                             Non-Python requests are recorded as advisory
+                             manual follow-up.
+        - modify_interface:  Logged + recorded as advisory manual follow-up
 
         Returns:
             Stats dict with keys ``requested_fixes`` (top-level fix count),
             ``applied_fixes`` (fixes that produced >=1 edge or unit),
             ``applied_edges`` (total dependency edges added), and
-            ``unapplied`` (list of fixes with no auto-handler).
+            ``unapplied`` (list of fixes that were not auto-applied).
         """
         applied_edges = 0
         applied_fixes = 0
@@ -941,6 +1181,32 @@ Please perform the review tasks and return the JSON result.
                 # else: empty calls_to_add — silently ignore (LLM bug, not actionable)
 
             elif action == "add_interface":
+                # Interface-stub synthesis is Python-only: it emits a
+                # ``def/class`` body with a docstring + ``pass``. For other
+                # languages we cannot materialise a syntactically valid stub,
+                # so surface the request as advisory manual follow-up instead
+                # of silently dropping it or blocking structural convergence.
+                if self.backend.name != "python":
+                    self.logger.info(
+                        "[InterfaceReviewer] Recording add_interface as "
+                        "advisory for %s project (stub synthesis is "
+                        "Python-only): %s::%s",
+                        self.backend.name, file_path, unit_name,
+                    )
+                    unapplied.append({
+                        "action": action,
+                        "file_path": file_path,
+                        "unit_name": unit_name,
+                        "description": description[:200],
+                        "reason": (
+                            "add_interface auto-handler is Python-only; "
+                            f"manual follow-up required for {self.backend.name}"
+                        ),
+                        "advisory": True,
+                        "manual_follow_up": True,
+                        "unsupported_for_language": self.backend.name,
+                    })
+                    continue
                 ok, reason, edges_added = self._apply_add_interface(
                     fix=fix,
                     interfaces_data=interfaces_data,
@@ -1239,7 +1505,7 @@ Please perform the review tasks and return the JSON result.
                         code_preview = "\n".join(code_lines[:25]) + "\n    # ... (truncated)"
                     else:
                         code_preview = file_code
-                    parts.append(f"  ```python\n{code_preview}\n  ```")
+                    parts.append(f"  ```{self.backend.markdown_fence}\n{code_preview}\n  ```")
         
         return "\n".join(parts) if parts else "No interfaces designed."
     
@@ -1321,7 +1587,12 @@ def prune_orphan_interfaces(
     enhanced_data_flow: Dict[str, Any],
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
-    """Remove orphan interfaces from interfaces_data after global review.
+    """Outdated legacy helper for removing orphan interfaces from raw dicts.
+
+    This function is retained for backward compatibility with older callers.
+    The active design_interfaces flow uses ``InterfacesStore.find_orphan_units()``
+    followed by ``InterfacesStore.prune_units()`` after LLM orphan review. Do
+    not extend this helper for new pruning behavior.
 
     An interface unit is considered a **true orphan** when it has **no incoming
     edges AND no outgoing edges** in the call graph and is not an entry point.
@@ -1596,6 +1867,7 @@ def review_orphan_units(
     repo_info: str,
     subtree_interfaces: Optional[Dict[str, Any]] = None,
     llm_client: Optional[LLMClient] = None,
+    target_language: Optional[str] = None,
 ) -> OrphanReviewResult:
     """Review orphan units using LLM to determine which should be retained or pruned.
 
@@ -1606,6 +1878,8 @@ def review_orphan_units(
         repo_info: Repository description for context
         subtree_interfaces: Optional dict mapping subtree -> interfaces data for context
         llm_client: LLM client to use (creates new one if not provided)
+        target_language: Optional target language used for prompt code fences.
+            Defaults to Python for backward compatibility.
 
     Returns:
         OrphanReviewResult with decisions and completed edges
@@ -1615,6 +1889,7 @@ def review_orphan_units(
         return OrphanReviewResult()
 
     llm = llm_client or LLMClient()
+    backend = get_backend(target_language or "python")
     result = OrphanReviewResult()
 
     # Group orphans by subtree
@@ -1631,7 +1906,8 @@ def review_orphan_units(
             subtree_context = subtree_interfaces[subtree]
 
         batch_result = _review_orphan_batch(
-            subtree_orphans, repo_info, subtree, subtree_context, llm
+            subtree_orphans, repo_info, subtree, subtree_context, llm,
+            markdown_fence=backend.markdown_fence,
         )
         result.decisions.update(batch_result.decisions)
         result.completed_edges.update(batch_result.completed_edges)
@@ -1653,6 +1929,7 @@ def _review_orphan_batch(
     subtree_name: str,
     subtree_context: Optional[Dict[str, Any]],
     llm: LLMClient,
+    markdown_fence: str = "python",
 ) -> OrphanReviewResult:
     """Review orphan units from a single subtree."""
     # Build user prompt with orphan details
@@ -1664,7 +1941,7 @@ def _review_orphan_batch(
 - Features: {', '.join(detail['features']) if detail['features'] else '(none)'}
 
 Code:
-```python
+```{markdown_fence}
 {detail['code']}
 ```
 """

@@ -226,7 +226,7 @@ def test_parse_line_excluding_irrelevant_files():
 
 def test_parse_line_total_files():
     s = _fresh_state()
-    cmind_cli._parse_encoder_line("RPGParser - INFO - Total valid Python files to parse: 42", s)
+    cmind_cli._parse_encoder_line("RPGParser - INFO - Total valid source files to parse: 42", s)
     assert s["total_files"] == 42
     assert "42 files" in s["phase"]
 
@@ -311,7 +311,7 @@ def test_run_initial_encode_success_writes_log(tmp_path):
         stderr_lines=[
             "RPGParser - INFO - Generating repo info (max_iters=3)",
             "RPGParser - INFO - LLM call for repo info, iter=1",
-            "RPGParser - INFO - Total valid Python files to parse: 5",
+            "RPGParser - INFO - Total valid source files to parse: 5",
             "RPGParser - INFO - [GLOBAL] kind=class, groups=1, batches=2, foo=bar",
             "RPGParser - INFO - [GLOBAL] process_class_batch: classes=['A'], units=1",
             "RPGParser - INFO - [GLOBAL] process_class_batch: classes=['B'], units=1",
@@ -321,7 +321,7 @@ def test_run_initial_encode_success_writes_log(tmp_path):
         stdout_text='{"status": "success"}\n',
     )
     assert cmind_cli._run_initial_encode(tmp_path) is True
-    log = tmp_path / ".cmind" / "logs" / "encode.log"
+    log = cmind_cli._storage.workspace_logs_dir(tmp_path) / "encode.log"
     assert log.is_file()
     contents = log.read_text()
     assert "Generating repo info" in contents
@@ -337,6 +337,6 @@ def test_run_initial_encode_failure_returns_false(tmp_path):
         stdout_text='{"status": "failed", "error": "boom"}\n',
     )
     assert cmind_cli._run_initial_encode(tmp_path) is False
-    log = tmp_path / ".cmind" / "logs" / "encode.log"
+    log = cmind_cli._storage.workspace_logs_dir(tmp_path) / "encode.log"
     assert log.is_file()
     assert "boom" in log.read_text()

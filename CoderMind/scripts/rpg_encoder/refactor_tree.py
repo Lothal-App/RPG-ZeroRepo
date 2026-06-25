@@ -83,6 +83,8 @@ class RefactorTree:
         skeleton_info: str = "",
         logger: Optional[logging.Logger] = None,
         llm_client: Optional[Any] = None,
+        language: Optional[str] = None,
+        language_map: Optional[Dict[str, str]] = None,
         **kwargs,
     ):
         self.repo_name = repo_name
@@ -90,6 +92,21 @@ class RefactorTree:
         self.repo_info = repo_info
         self.repo_skeleton = repo_skeleton
         self.skeleton_info = skeleton_info
+
+        # Language metadata propagated into every NodeMetaData this
+        # encoder mints. ``language`` is the repo-wide default; pass
+        # ``None`` (or omit) to leave ``meta.language`` unset rather
+        # than guessing. ``language_map`` (path-prefix -> language)
+        # lets multi-language repos override per-subtree.
+        # ``_resolve_language(path)`` returns the best match (longest
+        # matching prefix) or falls back to ``language``. Keys are
+        # normalised so callers can pass ``"cmd/"`` or ``"cmd"`` and
+        # either form matches.
+        self.language: Optional[str] = language
+        self._language_map: Dict[str, str] = {
+            self._normalise_lang_prefix(k): v
+            for k, v in (language_map or {}).items()
+        }
 
         self.rpg = RPG(repo_name=self.repo_name)
 
@@ -116,6 +133,33 @@ class RefactorTree:
     def _uuid8() -> str:
         """Short uuid (8-char hex) for node ID generation."""
         return uuid.uuid4().hex[:8]
+
+    @staticmethod
+    def _normalise_lang_prefix(prefix: str) -> str:
+        """Strip trailing ``/`` from a ``language_map`` key for matching."""
+        return prefix.rstrip("/")
+
+    def _resolve_language(self, path: Optional[str]) -> Optional[str]:
+        """Return the language for ``path``.
+
+        Looks up the longest path-prefix match in ``language_map``;
+        falls back to the repo-wide ``self.language`` (which may itself
+        be ``None`` if the caller never supplied one). ``None`` /
+        empty paths return the default.
+        """
+        if not path or not self._language_map:
+            return self.language
+        normalised_path = str(path).lstrip("/")
+        best: Optional[str] = None
+        best_len = -1
+        for prefix, lang in self._language_map.items():
+            if not prefix:
+                continue
+            if normalised_path == prefix or normalised_path.startswith(prefix + "/"):
+                if len(prefix) > best_len:
+                    best = lang
+                    best_len = len(prefix)
+        return best if best is not None else self.language
 
     def step(self, memory: Memory):
         """Single LLM step: generate, parse solution JSON.
@@ -614,6 +658,7 @@ class RefactorTree:
                     path=file_node_path(file_path),
                     description=f_features.get("_file_summary_", ""),
                     generator="rpg_encoder",
+                    language=self._resolve_language(file_path),
                 ),
             )
             file2node[file_path] = file_node
@@ -650,6 +695,7 @@ class RefactorTree:
                                     "",
                                 ),
                                 generator="rpg_encoder",
+                                language=self._resolve_language(file_path),
                             ),
                             unit=func_unit.key(),
                         )
@@ -675,6 +721,7 @@ class RefactorTree:
                                         "",
                                     ),
                                     generator="rpg_encoder",
+                                    language=self._resolve_language(file_path),
                                 ),
                                 unit=cls_unit.key(),
                             )
@@ -706,6 +753,7 @@ class RefactorTree:
                                             "",
                                         ),
                                         generator="rpg_encoder",
+                                        language=self._resolve_language(file_path),
                                     ),
                                     unit=mtd_unit.key(),
                                 )
@@ -916,6 +964,17 @@ class RefactorTree:
 
         logger.info("Starting incremental refactor on new files...")
 
+        # Pick up the repo's dominant language from the parsed_tree keys
+        # so every NodeMetaData this incremental pass mints carries the
+        # correct ``meta.language``. Without this, files added through
+        # the post-merge hook would silently land with ``meta.language=None``
+        # while the initial-encode path (which goes through RPGParser)
+        # gets it right via :func:`lang_parser.dominant_language`.
+        from lang_parser import dominant_language as _dominant_language
+        new_files_lang = _dominant_language(parsed_tree.keys())
+        if new_files_lang:
+            logger.info("Incremental refactor dominant language: %s", new_files_lang)
+
         instance = cls(
             repo_dir=repo_dir,
             repo_info=repo_info,
@@ -923,6 +982,7 @@ class RefactorTree:
             skeleton_info=skeleton_info,
             repo_name=repo_name,
             logger=logger,
+            language=new_files_lang,
         )
 
         instance.rpg = existing_rpg
@@ -998,6 +1058,7 @@ class RefactorTree:
                     path=file_node_path(file_path),
                     description=current_summary,
                     generator="rpg_encoder",
+                    language=instance._resolve_language(file_path),
                 ),
             )
             instance.rpg.add_node(file_node)
@@ -1033,6 +1094,7 @@ class RefactorTree:
                                     desc_key_function(func_name, feature), ""
                                 ),
                                 generator="rpg_encoder",
+                                language=instance._resolve_language(file_path),
                             ),
                             unit=func_unit.key(),
                         )
@@ -1058,6 +1120,7 @@ class RefactorTree:
                                         desc_key_class(class_name, feat), ""
                                     ),
                                     generator="rpg_encoder",
+                                    language=instance._resolve_language(file_path),
                                 ),
                                 unit=cls_unit.key(),
                             )
@@ -1086,6 +1149,7 @@ class RefactorTree:
                                             "",
                                         ),
                                         generator="rpg_encoder",
+                                        language=instance._resolve_language(file_path),
                                     ),
                                     unit=mtd_unit.key(),
                                 )
@@ -1478,6 +1542,17 @@ class RefactorTree:
 
         logger.info("Starting refactor for modified files...")
 
+        # Same language-detection as :meth:`refactor_new_files` — keep
+        # ``meta.language`` correct for files revisited by the
+        # incremental modified-files path.
+        from lang_parser import dominant_language as _dominant_language
+        modified_files_lang = _dominant_language(parsed_tree.keys())
+        if modified_files_lang:
+            logger.info(
+                "Incremental modified-files dominant language: %s",
+                modified_files_lang,
+            )
+
         instance = cls(
             repo_dir=repo_dir,
             repo_info=repo_info,
@@ -1485,6 +1560,7 @@ class RefactorTree:
             skeleton_info=skeleton_info,
             repo_name=repo_name,
             logger=logger,
+            language=modified_files_lang,
         )
         instance.rpg = existing_rpg
 

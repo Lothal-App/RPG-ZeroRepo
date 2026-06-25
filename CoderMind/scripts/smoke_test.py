@@ -38,6 +38,40 @@ from common.paths import DEV_VENV_DIR, REPO_DIR, get_scripts_dir, cmd_for
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_backend(repo_path: Path):
+    """Resolve the target-language backend for ``repo_path``.
+
+    Reads explicit language metadata from the repo's ``.cmind/data``
+    artefacts (feature_spec / rpg, written by the encoder / decoder) and
+    falls back to scanning the real source files on disk, so the smoke
+    test detects the right language even when that metadata is missing or
+    unreadable. Degrades to Python only for a genuinely empty / unknown
+    repo. Never raises.
+    """
+    try:
+        from decoder_lang import resolve_repo_backend
+    except Exception:  # noqa: BLE001
+        return None
+
+    def _load(rel: str):
+        try:
+            artefact = repo_path / ".cmind" / "data" / rel
+            if artefact.is_file():
+                return json.loads(artefact.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    try:
+        return resolve_repo_backend(
+            repo_path,
+            feature_spec=_load("feature_spec.json"),
+            rpg_obj=_load("rpg.json"),
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
 # ============================================================================
 # Data Classes
 # ============================================================================
@@ -216,21 +250,99 @@ def check_imports(repo_path: Path, result: SmokeResult) -> Dict[str, Any]:
 # Layer 2: Entry Point Validation
 # ============================================================================
 
-def check_entry_point(repo_path: Path, result: SmokeResult) -> Dict[str, Any]:
-    """Verify main.py can start and --help works."""
-    logger.info("Layer 2: Entry point check")
-    main_py = repo_path / "main.py"
-    python_exe = _get_python_exe(repo_path)
+def _locate_existing_entry(repo_path: Path, backend: Any) -> Optional[str]:
+    """Return an existing entry file matching the backend's accepted shapes.
 
-    if not main_py.exists():
-        logger.info("  No main.py found, skipping")
-        return {"skipped": True, "reason": "no main.py"}
+    ``entry_point_candidates`` may contain ``*`` globs (Go's
+    ``cmd/*/main.go``). The canonical ``entry_point_path`` slug often differs
+    from the one the skeleton chose, so probing the accepted shapes locates a
+    real entry the canonical path would miss. Returns the first existing
+    repo-relative POSIX match, or None when no candidate resolves to a file.
+    """
+    try:
+        candidates = backend.entry_point_candidates()
+    except Exception:  # noqa: BLE001
+        return None
+    for pattern in candidates:
+        if any(ch in pattern for ch in "*?["):
+            for match in sorted(repo_path.glob(pattern)):
+                if match.is_file():
+                    return match.relative_to(repo_path).as_posix()
+        elif (repo_path / pattern).is_file():
+            return pattern
+    return None
+
+
+def check_entry_point(repo_path: Path, result: SmokeResult) -> Dict[str, Any]:
+    """Verify the project's entry point starts and ``--help`` works.
+
+    Language-aware: the entry path and run command come from the target
+    backend (``main.py`` for Python, ``go run ./cmd/...`` for Go, etc.).
+    The command runs in a *clean* checkout — no ``PYTHONPATH`` / path
+    bridging is injected — so a project that imports its own package but
+    ships no install metadata (the src/-layout ``ModuleNotFoundError``
+    case) is caught here rather than passing silently.
+    """
+    logger.info("Layer 2: Entry point check")
+    backend = _resolve_backend(repo_path)
+
+    # Resolve entry path + run command from the backend. Fall back to the
+    # historical Python ``main.py --help`` when no backend is available.
+    entry_rel = None
+    run_cmd = None
+    if backend is not None:
+        try:
+            entry_rel = backend.entry_point_path("")
+            run_cmd = backend.entry_run_command(repo_path, entry_rel)
+        except Exception:  # noqa: BLE001
+            entry_rel, run_cmd = None, None
+
+    if run_cmd is None and backend is not None and backend.name != "python":
+        # The canonical entry slug often differs from the one the skeleton
+        # actually chose (Go: canonical ``cmd/app/main.go`` vs generated
+        # ``cmd/todoapp/main.go``), so ``entry_run_command`` returns None for a
+        # repo that does ship a runnable entry. Probe the backend's accepted
+        # entry shapes (globs allowed) to locate the real entry before giving
+        # up, so it is actually validated instead of silently skipped.
+        located = _locate_existing_entry(repo_path, backend)
+        if located is not None:
+            entry_rel = located
+            try:
+                run_cmd = backend.entry_run_command(repo_path, located)
+            except Exception:  # noqa: BLE001
+                run_cmd = None
+
+    if run_cmd is None and backend is not None and backend.name != "python":
+        # Compiled CLIs (C/C++) and toolchain-less hosts expose no run
+        # probe; treat as a non-fatal skip rather than a failure.
+        logger.info("  No run probe for %s project, skipping", backend.name)
+        return {"skipped": True, "reason": f"no run probe for {backend.name}"}
+
+    if run_cmd is None:
+        main_py = repo_path / "main.py"
+        if not main_py.exists():
+            logger.info("  No main.py found, skipping")
+            return {"skipped": True, "reason": "no main.py"}
+        python_exe = _get_python_exe(repo_path)
+        run_cmd = [python_exe, "main.py", "--help"]
+        entry_rel = "main.py"
 
     layer = {"exists": True, "help_works": False, "help_length": 0, "startup_error": None}
 
-    # Try --help (safe, exits immediately)
+    # Run the entry probe in a CLEAN subprocess: do NOT inject PYTHONPATH,
+    # so missing install metadata surfaces as a real startup failure.
+    def _run_clean(cmd: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env.pop("PYTHONPATH", None)
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            cwd=str(repo_path), env=env,
+        )
+
+    label = entry_rel or "entry point"
     try:
-        proc = _run_in_repo(repo_path, [python_exe, "main.py", "--help"], timeout=15)
+        proc = _run_clean(run_cmd, timeout=30)
         if proc.returncode == 0:
             layer["help_works"] = True
             layer["help_length"] = len(proc.stdout)
@@ -238,22 +350,22 @@ def check_entry_point(repo_path: Path, result: SmokeResult) -> Dict[str, Any]:
                 result.add_finding(SmokeFinding(
                     layer="entry_point", severity="warning",
                     check="help_too_short",
-                    message=f"main.py --help output is only {len(proc.stdout)} chars (possible stub)",
+                    message=f"{label} --help output is only {len(proc.stdout)} chars (possible stub)",
                 ))
         else:
             layer["startup_error"] = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "nonzero exit"
             result.add_finding(SmokeFinding(
                 layer="entry_point", severity="error",
                 check="help_fails",
-                message=f"main.py --help failed: {layer['startup_error']}",
+                message=f"{label} entry probe failed: {layer['startup_error']}",
                 details=proc.stderr[-1000:] if proc.stderr else "",
             ))
     except subprocess.TimeoutExpired:
-        layer["startup_error"] = "timed out (15s)"
+        layer["startup_error"] = "timed out (30s)"
         result.add_finding(SmokeFinding(
             layer="entry_point", severity="error",
             check="help_timeout",
-            message="main.py --help timed out (15s) — may hang on startup",
+            message=f"{label} entry probe timed out (30s) — may hang on startup",
         ))
 
     layer["passed"] = layer["help_works"]
@@ -330,9 +442,20 @@ def run_smoke_test(
 
     result = SmokeResult()
 
+    # The import and stub layers parse Python with the stdlib ``ast`` and
+    # only glob ``*.py``; they are meaningless for other languages. Skip
+    # them for non-Python projects (the entry layer is language-aware via
+    # the backend and still runs). Default to Python when undetermined.
+    backend = _resolve_backend(repo_path)
+    result.project_type = backend.name if backend is not None else "python"
+    is_python = backend is None or backend.name == "python"
+
     # Layer 1: Import completeness
     if "imports" in run_layers:
-        result.layers["imports"] = check_imports(repo_path, result)
+        if is_python:
+            result.layers["imports"] = check_imports(repo_path, result)
+        else:
+            result.layers["imports"] = {"skipped": True, "reason": f"{backend.name} (python-only layer)"}
 
     # Layer 2: Entry point
     if "entry" in run_layers:
@@ -340,7 +463,10 @@ def run_smoke_test(
 
     # Layer 3: Stub/placeholder detection
     if "stubs" in run_layers:
-        result.layers["stubs"] = check_stubs(repo_path, result)
+        if is_python:
+            result.layers["stubs"] = check_stubs(repo_path, result)
+        else:
+            result.layers["stubs"] = {"skipped": True, "reason": f"{backend.name} (python-only layer)"}
 
     result.duration = time.time() - start
     return result

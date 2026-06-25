@@ -28,17 +28,18 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from common.rpg_io import atomic_write_rpg
 from common.utils import (
+    is_skip_dir,
     exclude_files,
     filter_excluded_files,
-    is_test_file,
     normalize_path,
 )
+from lang_parser import is_supported_source, is_test_file as is_supported_test_file
 from rpg.code_unit import CodeSnippetBuilder, CodeUnit, ParsedFile
 from rpg import NodeType, RPG
 
 from .refactor_tree import RefactorTree
-from .rpg_encoding import RPGParser
 from .semantic_parsing import ParseFeatures
 
 logger = logging.getLogger(__name__)
@@ -50,13 +51,15 @@ logger = logging.getLogger(__name__)
 
 
 def _filter_non_test_py_files(path: str) -> bool:
-    """Return True if *path* is a non-test ``.py`` file.
+    """Return True if *path* is a parseable, non-test source file.
 
     Used as a filter predicate when walking the repository directory.
+    The function keeps its public name for API stability, but the
+    predicate accepts any language supported by ``lang_parser``.
     """
-    if not path.endswith(".py"):
+    if not is_supported_source(path):
         return False
-    return not is_test_file(path)
+    return not is_supported_test_file(path)
 
 
 def _load_skeleton_from_repo(
@@ -84,14 +87,7 @@ def _load_skeleton_from_repo(
     valid_files: List[str] = []
 
     for root, dirs, files in os.walk(repo_dir):
-        dirs[:] = [
-            d for d in dirs
-            if not d.startswith(".")
-            and d not in {
-                "__pycache__", "node_modules", ".git",
-                ".venv", "venv", "env",
-            }
-        ]
+        dirs[:] = [d for d in dirs if not is_skip_dir(d)]
         dirs.sort()
 
         rel_root = os.path.relpath(root, repo_dir)
@@ -330,24 +326,19 @@ class RPGEvolution:
     ) -> None:
         """Update the dependency graph and rebuild RPG node index.
 
-        Routes through :class:`rpg.service.RPGService` so the dep_graph
-        is **persisted to disk** (``save_path``) and stays in sync with
-        ``self.rpg.dep_graph``.  The previous implementation called
-        :meth:`RPG.parse_dep_graph` directly, which only mutated the
-        in-memory ``rpg.dep_graph`` — leaving ``dep_graph.json`` stale
-        whenever the encoder wrote ``rpg.json`` separately afterwards.
-        That drift caused MCP-server / ``update_graphs.py status`` reads
-        to return inconsistent data after ``/cmind.update_rpg``.
+        Routes through :class:`rpg.service.RPGService` so the in-memory
+        dep_graph, dep-to-RPG mappings, and cross maps are refreshed
+        together. When ``save_path`` is provided, a standalone dep_graph
+        snapshot is also written for compatibility tooling.
 
         Args:
             rpg: The RPG to attach the rebuilt dep_graph to.
             repo_dir: Workspace root (which is also the project repo root
                 after the workspace=repo unification).
             logger: Logger for status output.
-            save_path: Path where ``dep_graph.json`` should be written.
-                If ``None``, dep_graph stays in-memory only (legacy
-                behaviour; preserved for callers that haven't been
-                migrated yet, but flagged with a warning).
+            save_path: Optional legacy path where a standalone
+                ``dep_graph.json`` should be written. If ``None``, the
+                caller persists the refreshed graph by saving ``rpg.json``.
         """
         logger.info("Updating dependency graph and RPG node index...")
         try:
@@ -382,10 +373,13 @@ class RPGEvolution:
                     dep_count, map_count, save_path,
                 )
             else:
-                logger.warning(
-                    "Dependency graph updated in-memory only (%d nodes, "
-                    "%d mappings) — caller did not provide save_path so "
-                    "dep_graph.json on disk may be stale.",
+                # The new default: dep_graph rides inside rpg.json (single
+                # source of truth).  No standalone dep_graph.json is
+                # written from this call; the caller's ``svc.save(rpg)``
+                # embeds the in-memory graph via ``RPG.to_dict``.
+                logger.info(
+                    "Dependency graph updated in-memory (%d nodes, "
+                    "%d mappings); caller embeds into rpg.json on save.",
                     dep_count, map_count,
                 )
         except Exception as e:
@@ -424,7 +418,7 @@ class RPGEvolution:
         # Build code map for new files only
         file_code_map: Dict[str, str] = {}
         for fpath in new_files:
-            if not fpath.endswith(".py"):
+            if not is_supported_source(fpath) or is_supported_test_file(fpath):
                 continue
             if fpath in file_code_map_all:
                 file_code_map[fpath] = file_code_map_all[fpath]
@@ -666,7 +660,7 @@ class RPGEvolution:
                 behaviour and will log a warning.
 
         Pipeline:
-        1. Exclude irrelevant files
+        1. Carry forward deterministic exclusions (no per-commit LLM vote)
         2. Compute detailed diff (``generate_detailed_diff``)
         3. Process additions / deletions / modifications
         4. Update dependency graph index
@@ -705,21 +699,22 @@ class RPGEvolution:
 
         last_excluded_files = last_rpg.excluded_files if last_rpg else []
 
-        # Exclude irrelevant files in current repo
-        rpg_parser = RPGParser(
-            repo_dir=cur_repo_dir,
-            repo_name=repo_name,
-            logger=logger,
+        # Incremental updates run on every commit (post-commit hook). Exclusion
+        # is fully deterministic here — no per-commit LLM vote (it cost ~30
+        # round-trips per generation and only re-derived paths the rules below
+        # already cover). ``generate_detailed_diff`` loads both snapshots via
+        # ``_load_skeleton_from_repo`` (which prunes skip-dirs and keeps only
+        # supported, non-test source) and re-applies the ``exclude_files``
+        # prefix rules itself, so the only thing to carry forward is the
+        # encode-time exclusion list — which may include LLM-identified
+        # vendored / third-party paths the prefix rules can't infer.
+        all_exclude_files = sorted(set(last_excluded_files))
+        logger.info(
+            "Carrying forward %d excluded path(s) from the encode baseline.",
+            len(all_exclude_files),
         )
 
-        cur_exclude_files = rpg_parser.exclude_irrelevant_files(
-            repo_info=repo_info,
-            max_votes=max_exclude_votes,
-        )
-        all_exclude_files = sorted(set(last_excluded_files + cur_exclude_files))
-        logger.info("Excluded files for current repo: %d", len(all_exclude_files))
-
-        # Compute detailed diff
+        # Compute detailed diff (re-applies deterministic exclusion internally)
         all_diff = generate_detailed_diff(
             last_repo_dir=last_repo_dir,
             cur_repo_dir=cur_repo_dir,
@@ -734,12 +729,15 @@ class RPGEvolution:
             "last_rpg": last_rpg,
         }
 
-        # Filter to .py files
+        # Filter to supported source files (any language registered with lang_parser),
+        # excluding tests so the encoder doesn't index test code as features.
         add_files = [
-            f for f in all_diff.get("added", {}).keys() if f.endswith(".py")
+            f for f in all_diff.get("added", {}).keys()
+            if is_supported_source(f) and not is_supported_test_file(f)
         ]
         deleted_files = [
-            f for f in all_diff.get("deleted", {}).keys() if f.endswith(".py")
+            f for f in all_diff.get("deleted", {}).keys()
+            if is_supported_source(f) and not is_supported_test_file(f)
         ]
         modified_result = {
             f: d
@@ -747,7 +745,8 @@ class RPGEvolution:
             if (
                 isinstance(d, dict)
                 and any(d.get(k) for k in ("changed", "added", "deleted"))
-                and f.endswith(".py")
+                and is_supported_source(f)
+                and not is_supported_test_file(f)
             )
         }
 
@@ -813,8 +812,11 @@ class RPGEvolution:
         }
 
         if save_path:
-            with open(save_path, "w", encoding="utf-8") as f:
-                json.dump(result, f, indent=4)
+            # Atomic write: ``result`` embeds ``rpg.to_dict()``; a killed
+            # diff job used to leave a half-truncated artefact that
+            # downstream consumers (``cmind diff``, debug tools) would
+            # fail to parse on the next read.
+            atomic_write_rpg(save_path, result, indent=4)
 
         total_time = time.time() - global_start
         logger.info(

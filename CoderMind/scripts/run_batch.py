@@ -78,6 +78,7 @@ from code_gen.prompts import (
 from code_gen.test_runner import (
     ensure_dev_venv,
     ensure_deps_installed,
+    resolve_test_backend,
 )
 from code_gen.rpg_updater import run_rpg_update
 
@@ -150,6 +151,22 @@ MAX_BATCH_ATTEMPTS = 2               # initial + 1 auto-retry
 # only needs the sub-agent timeout directly for its argparse default.
 
 
+def _setup_codegen_environment(repo_path: Path) -> None:
+    """Prepare the language-specific codegen environment."""
+    backend = resolve_test_backend(repo_path=repo_path)
+    if backend.name != "python":
+        logger.info("Skipping Python venv setup for %s codegen", backend.display_name)
+        return
+
+    try:
+        created_new, venv_path = ensure_dev_venv(repo_path)
+        if created_new:
+            logger.info("Created dev venv at %s", venv_path)
+        ensure_deps_installed(repo_path)
+    except Exception as exc:
+        logger.warning("Venv setup issue (non-fatal): %s", exc)
+
+
 
 # ============================================================================
 # Module 1: Prompt Builder
@@ -192,8 +209,8 @@ def _prepare_batch_context(
 ) -> Tuple[BatchExecutionState, Optional[Dict[str, Any]]]:
     """Build BatchExecutionState and dependency context for a task.
 
-    This mirrors the historical ``prepare_batch`` logic but returns data structures
-    instead of printing JSON.
+    Returns structured state rather than printing JSON, so the batch
+    runner can reuse the prepared dependency context directly.
 
     Returns:
         (batch_state, dependency_context)
@@ -322,9 +339,11 @@ def run_single_attempt(
     if not agent_passed:
         result["failure_reason"] = agent_reason
         logger.info("Sub-agent self-reported FAIL: %s", agent_reason)
-    elif agent_summary is None:
-        # PASS without the required PYTEST_SUMMARY line is suspicious;
-        # log it so post_verify_failure analysis is easier.
+    elif agent_summary is None and not is_project_docs_batch(task):
+        # PASS without the required PYTEST_SUMMARY line is suspicious for a
+        # test-bearing task; log it so post_verify_failure analysis is easier.
+        # Docs/entry batches (README, requirements) run no tests and are
+        # post-verified by skip, so a missing summary is expected there.
         logger.warning(
             "Sub-agent reported PASS but did not provide PYTEST_SUMMARY line"
         )
@@ -427,7 +446,6 @@ def _refresh_dep_graph_safe(
         from rpg.service import RPGService
 
         rpg_path = REPO_RPG_FILE
-        dep_graph_path = DEP_GRAPH_FILE
         if not rpg_path.exists():
             return
 
@@ -435,20 +453,26 @@ def _refresh_dep_graph_safe(
 
         # ── Incremental path: codegen knows exactly which file changed ──
         if changed_files:
-            # Filter to .py only — sync_from_file_list assumes Python.
-            py_files = [f for f in changed_files if f.endswith(".py")]
-            if not py_files:
-                # No .py touched (e.g. only docs/config edits) — skip.
-                logger.info("dep_graph: no .py files in batch, skipping refresh")
+            # Keep only files lang_parser can build dep edges for. This spans
+            # every supported language (py/go/rs/ts/js/c/cpp), so non-Python
+            # projects keep an up-to-date dep_graph across batches too.
+            from lang_parser import is_supported_source
+
+            source_files = [f for f in changed_files if is_supported_source(f)]
+            if not source_files:
+                # No analysable source touched (e.g. only docs/config edits).
+                logger.info("dep_graph: no supported source files in batch, skipping refresh")
                 svc.save(str(rpg_path))
                 return
 
+            # ``save_path=None``: dep_graph rides inside rpg.json. The
+            # subsequent ``svc.save(rpg_path)`` embeds it.
             result = svc.sync_from_file_list(
-                file_paths=py_files,
+                file_paths=source_files,
                 code_dir=str(repo_path),
                 workspace_root=str(WORKSPACE_ROOT),
-                save_path=str(dep_graph_path),
             )
+            svc.rpg._dep_graph_file = None
             svc.save(str(rpg_path))
             logger.info(
                 "dep_graph refreshed (mode=%s reason=%s): %d nodes, %d dep→rpg mappings",
@@ -462,8 +486,8 @@ def _refresh_dep_graph_safe(
         svc.refresh_dep_graph(
             str(repo_path),
             workspace_root=str(WORKSPACE_ROOT),
-            save_path=str(dep_graph_path),
         )
+        svc.rpg._dep_graph_file = None
         svc.save(str(rpg_path))
         logger.info("dep_graph refreshed (full): %d nodes, %d dep→rpg mappings",
                     len(svc.rpg.dep_graph.G.nodes()),
@@ -607,15 +631,9 @@ def run_batch(
 
     logger.info("Branch: %s (initial_commit=%s)", branch_name, initial_commit[:8] if initial_commit else "none")
 
-    # ── Step 4: Setup venv ───────────────────────────────────────────
+    # ── Step 4: Setup language environment ──────────────────────────
 
-    try:
-        created_new, venv_path = ensure_dev_venv(repo_path)
-        if created_new:
-            logger.info("Created dev venv at %s", venv_path)
-        ensure_deps_installed(repo_path)
-    except Exception as exc:
-        logger.warning("Venv setup issue (non-fatal): %s", exc)
+    _setup_codegen_environment(repo_path)
 
     # ── Step 5: Build prompts ────────────────────────────────────────
 
@@ -974,6 +992,8 @@ def main() -> int:
                         help="Max units per merged batch (0 = no limit)")
     parser.add_argument("--agent-timeout", type=int, default=DEFAULT_AGENT_TIMEOUT,
                         help=f"Sub-agent timeout in seconds (default: {DEFAULT_AGENT_TIMEOUT})")
+    parser.add_argument("--max-batches", type=int, default=0,
+                        help="Stop --loop after this many batches (0 = no limit)")
     parser.add_argument("--review-iterations", type=int, default=10,
                         help="Max iterations for global review (default: 10)")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
@@ -1088,11 +1108,20 @@ def _run_loop(args) -> int:
     total_passed = 0
     total_failed = 0
     start_time = time.time()
+    max_batches = max(0, int(args.max_batches or 0))
 
     print("\n  [START] Starting batch loop (Ctrl+C to stop after current batch)\n")
 
     try:
         while True:
+            if max_batches and batch_num >= max_batches:
+                elapsed = time.time() - start_time
+                print(f"\n  [STOP] Reached max-batches={max_batches} "
+                      f"({total_passed} passed, {total_failed} failed, "
+                      f"{elapsed/60:.1f} min)")
+                logger.info("Loop stopped after max-batches=%d", max_batches)
+                return 0 if total_failed == 0 else 1
+
             batch_num += 1
 
             result = run_batch(

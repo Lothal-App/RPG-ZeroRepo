@@ -22,7 +22,7 @@ import json
 import logging
 import argparse
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Callable, Dict, Any, List, Optional, Set
 
 # Import trajectory module
 from common.trajectory import Trajectory, load_or_create_trajectory
@@ -34,6 +34,8 @@ from func_design.interface_agent import InterfaceOrchestrator, DependencyCollect
 # Import Global Interface Reviewer
 from func_design.interface_review import (
     InterfaceReviewer,
+    check_call_graph_connectivity,
+    check_feature_dependency_coverage,
     print_review_summary,
 )
 
@@ -52,8 +54,10 @@ from common.paths import (
     REPO_RPG_FILE,
 )
 from common import print_unicode_table, get_repo_info_from_files
-import ast
+import re
 from common import get_project_background_context
+from common.language_meta import extract_language_metadata, metadata_with_languages
+from decoder_lang import get_backend
 from func_design.interface_review import review_orphan_units
 
 
@@ -102,6 +106,157 @@ def collect_skeleton_features(skeleton: Dict[str, Any]) -> set:
     return features
 
 
+def _collect_skeleton_feature_to_file(skeleton: Dict[str, Any]) -> Dict[str, str]:
+    """Map each skeleton feature path to the file node that declares it.
+
+    Used by deterministic feature backfill to find which file an
+    un-attributed feature belongs to (the file whose ``feature_paths``
+    list contains it).
+    """
+    mapping: Dict[str, str] = {}
+
+    def traverse(node):
+        if node.get("type") == "file":
+            file_path = node.get("path") or node.get("name", "")
+            for fp in node.get("feature_paths", []):
+                mapping.setdefault(fp, file_path)
+        elif node.get("type") == "directory":
+            for child in node.get("children", []):
+                traverse(child)
+
+    traverse(skeleton.get("root", skeleton))
+    return mapping
+
+
+def _collect_interface_features(interfaces_data: Dict[str, Any]) -> set:
+    """Return the set of feature paths attributed to some interface unit.
+
+    Mirrors the bench-side consistency check
+    (``_collect_interface_features`` in ``cmbench/lib/invoker.py``): a
+    feature is "covered" when it appears in any unit's
+    ``units_to_features`` list under any subtree.
+    """
+    features: set = set()
+    subtrees = interfaces_data.get("subtrees", interfaces_data.get("components", {}))
+    if not isinstance(subtrees, dict):
+        return features
+    for subtree_data in subtrees.values():
+        if not isinstance(subtree_data, dict):
+            continue
+        file_container = subtree_data.get("interfaces", subtree_data.get("files", {}))
+        if not isinstance(file_container, dict):
+            continue
+        for file_data in file_container.values():
+            if not isinstance(file_data, dict):
+                continue
+            u2f = file_data.get("units_to_features", {})
+            if not isinstance(u2f, dict):
+                continue
+            for feats in u2f.values():
+                for fp in feats or []:
+                    if isinstance(fp, str) and fp.strip():
+                        features.add(fp)
+    return features
+
+
+def _select_backfill_unit(units_to_features: Dict[str, Any], feature_path: str) -> Optional[str]:
+    """Pick the most appropriate unit in a file to receive an orphan feature.
+
+    Deterministic selection (no LLM): the feature is attributed to the
+    unit whose name tokens overlap most with the feature's leaf segment;
+    ties (and the zero-overlap case) break toward the unit that already
+    carries the most features, then lexicographically. Returns ``None``
+    when the file has no units to attach to.
+    """
+    if not isinstance(units_to_features, dict) or not units_to_features:
+        return None
+
+    leaf = feature_path.rsplit("/", 1)[-1].lower()
+    leaf_tokens = set(leaf.replace("_", " ").replace("-", " ").split())
+
+    def unit_tokens(unit_name: str) -> set:
+        bare = unit_name.split(" ", 1)[1] if " " in unit_name else unit_name
+        # Split camelCase / snake_case into comparable tokens.
+        spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", bare)
+        spaced = spaced.replace("_", " ").replace("-", " ").lower()
+        return set(spaced.split())
+
+    def score(unit_name: str) -> tuple:
+        overlap = len(leaf_tokens & unit_tokens(unit_name))
+        feature_count = len(units_to_features.get(unit_name) or [])
+        # Higher overlap first, then more existing features, then stable name.
+        return (overlap, feature_count, unit_name)
+
+    return max(units_to_features.keys(), key=score)
+
+
+def backfill_uncovered_features(
+    skeleton: Dict[str, Any],
+    interfaces_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Deterministically attribute skeleton features missing from interfaces.
+
+    The interface designer (LLM) sometimes implements a fine-grained
+    skeleton feature in code but forgets to list it in any unit's
+    ``units_to_features``. The bench consistency gate then fails the whole
+    stage even though the feature is present. This closes that gap WITHOUT
+    an LLM round-trip: every skeleton feature not attributed to any
+    interface unit is mapped to its declaring file (via skeleton
+    ``feature_paths``) and appended to the most appropriate existing unit's
+    ``units_to_features`` there.
+
+    Only metadata is touched — no units are invented, no code is changed.
+    Features whose file is absent from interfaces, or whose file has no
+    units, are reported as ``unbackfilled`` for a downstream WARN.
+
+    Returns an audit dict: ``{"backfilled": [...], "unbackfilled": [...]}``.
+    """
+    skeleton_features = collect_skeleton_features(skeleton)
+    interface_features = _collect_interface_features(interfaces_data)
+    uncovered = skeleton_features - interface_features
+
+    audit: Dict[str, Any] = {"backfilled": [], "unbackfilled": []}
+    if not uncovered:
+        return audit
+
+    feature_to_file = _collect_skeleton_feature_to_file(skeleton)
+    subtrees = interfaces_data.get("subtrees", interfaces_data.get("components", {}))
+
+    # Index interface file blocks by file_path for O(1) lookup.
+    file_blocks: Dict[str, Dict[str, Any]] = {}
+    if isinstance(subtrees, dict):
+        for subtree_data in subtrees.values():
+            if not isinstance(subtree_data, dict):
+                continue
+            container = subtree_data.get("interfaces", subtree_data.get("files", {}))
+            if isinstance(container, dict):
+                for fp, fdata in container.items():
+                    if isinstance(fdata, dict):
+                        file_blocks[fp] = fdata
+
+    for feature in sorted(uncovered):
+        target_file = feature_to_file.get(feature)
+        block = file_blocks.get(target_file) if target_file else None
+        if block is None:
+            audit["unbackfilled"].append({"feature": feature, "reason": "file not in interfaces"})
+            continue
+        u2f = block.setdefault("units_to_features", {})
+        unit = _select_backfill_unit(u2f, feature)
+        if unit is None:
+            audit["unbackfilled"].append({"feature": feature, "reason": "file has no units"})
+            continue
+        u2f.setdefault(unit, [])
+        if feature not in u2f[unit]:
+            u2f[unit].append(feature)
+        audit["backfilled"].append({
+            "feature": feature,
+            "file_path": target_file,
+            "unit": unit,
+        })
+
+    return audit
+
+
 def collect_rpg_feature_paths(rpg_path: Path) -> set:
     """Return the set of feature paths present in the current repo_rpg.json.
 
@@ -129,59 +284,162 @@ def collect_rpg_feature_paths(rpg_path: Path) -> set:
     return paths
 
 
-def extract_known_classes_and_types(base_classes: Dict[str, Any]) -> tuple:
+def _finalize_global_review_verdict(
+    global_review: dict,
+    interfaces_data: dict,
+    enhanced_data_flow: dict,
+    entry_points: list[dict],
+    is_callable: Callable[[str], bool],
+    retained_keys: set[str],
+    is_test_file: Optional[Callable[[str], bool]] = None,
+) -> None:
+    """Recompute the published convergence verdict from the FINAL graph.
+
+    ``review_and_fix`` records ``orphan_units_count`` /
+    ``feature_orphans_count`` / ``passed`` *before* the orphan-review
+    step adds completion edges and prunes units, so those numbers can be
+    stale — a since-resolved orphan would otherwise surface as a spurious
+    WARN downstream. This recomputes them from the post-pruning
+    ``interfaces_data`` + ``enhanced_data_flow`` using the same type-aware
+    predicate the gate uses, so the structural gate and the published
+    numbers always agree (the two previously used different graph
+    builders and could diverge).
+
+    Units the orphan review explicitly RETAINED (``retained_keys``) are
+    treated as resolved: a reviewer deemed them necessary (e.g. a public
+    entry the design keeps), so their lack of an incoming edge must not
+    fail the verdict.
+    """
+    conn = check_call_graph_connectivity(
+        interfaces_data, enhanced_data_flow, entry_points,
+        is_callable=is_callable,
+        is_test_file=is_test_file,
+    )
+    feats = check_feature_dependency_coverage(
+        interfaces_data, enhanced_data_flow, entry_points,
+        is_callable=is_callable,
+        is_test_file=is_test_file,
+    )
+    orphan_keys = [
+        u["unit_key"] for u in conn["orphan_units"]
+        if u["unit_key"] not in retained_keys
+    ]
+    feat_orphans = [
+        f for f in feats
+        if f"{f.get('file_path', '')}::{f.get('unit_name', '')}" not in retained_keys
+    ]
+    # Advisory ``modify_interface`` requests never gate the verdict; only
+    # genuinely-unapplied wiring (``blocking_unapplied_fixes_count``) does.
+    blocking_unapplied = global_review.get(
+        "blocking_unapplied_fixes_count",
+        global_review.get("unapplied_fixes_count", 0),
+    )
+    global_review["orphan_units_count"] = len(orphan_keys)
+    global_review["feature_orphans_count"] = len(feat_orphans)
+    global_review["unresolved_orphan_units"] = orphan_keys
+    global_review["unresolved_orphan_features"] = feat_orphans
+    global_review["passed"] = (
+        len(orphan_keys) == 0
+        and len(feat_orphans) == 0
+        and blocking_unapplied == 0
+    )
+
+
+_INHERITANCE_CAPABLE_UNIT_TYPES = {"class", "struct", "interface", "trait"}
+_TYPE_LIKE_UNIT_TYPES = {
+    "class", "struct", "interface", "trait", "type", "enum", "union", "typedef", "record",
+}
+
+
+def _extract_backend_declarations(
+    code: str,
+    backend: Any,
+    path: str = "<string>",
+) -> List[Any]:
+    """Return top-level declarations from the target-language backend."""
+    if not code or backend is None:
+        return []
+    try:
+        units = backend.list_code_units(code, path)
+    except Exception:  # noqa: BLE001 - extraction is best-effort metadata only
+        return []
+    return [unit for unit in units if getattr(unit, "parent", None) is None]
+
+
+def _declaration_names_by_type(
+    code: str,
+    backend: Any,
+    path: str = "<string>",
+) -> Dict[str, Set[str]]:
+    """Extract target-language declaration names grouped by unit_type."""
+    names_by_type: Dict[str, Set[str]] = {}
+    for unit in _extract_backend_declarations(code, backend, path):
+        name = str(getattr(unit, "name", "") or "").strip()
+        unit_type = str(getattr(unit, "unit_type", "") or "").strip().lower()
+        if name and unit_type:
+            names_by_type.setdefault(unit_type, set()).add(name)
+    return names_by_type
+
+
+def extract_known_classes_and_types(
+    base_classes: Dict[str, Any],
+    backend: Optional[Any] = None,
+) -> tuple:
     """Extract known base class names and type names from base_classes.json.
-    
+
     Returns:
         Tuple of (known_base_classes: Set[str], known_types: Set[str])
     """
-    known_base_classes = set()
-    known_types = set()
-    
+    known_base_classes: Set[str] = set()
+    known_types: Set[str] = set()
+    backend = backend or get_backend("python")
+
     base_classes_list = base_classes.get("base_classes", [])
-    
+
     for bc in base_classes_list:
         code = bc.get("code", "")
         if not code:
             continue
-        
-        try:
-            tree = ast.parse(code)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ClassDef):
-                    known_base_classes.add(node.name)
-                    # Classes can also be used as types
-                    known_types.add(node.name)
-        except SyntaxError:
-            continue
-    
+
+        names_by_type = _declaration_names_by_type(
+            code,
+            backend,
+            bc.get("file_path", "<base_class>"),
+        )
+        for unit_type, names in names_by_type.items():
+            if unit_type in _INHERITANCE_CAPABLE_UNIT_TYPES:
+                known_base_classes.update(names)
+            if unit_type in _TYPE_LIKE_UNIT_TYPES:
+                known_types.update(names)
+
     # Also add class_names if provided
     for name in base_classes.get("class_names", []):
         known_base_classes.add(name)
         known_types.add(name)
-    
+
     # Also process data_structures - these are known types (not base classes)
     data_structures_list = base_classes.get("data_structures", [])
-    
+
     for ds in data_structures_list:
         code = ds.get("code", "")
         if code:
-            try:
-                tree = ast.parse(code)
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.ClassDef):
-                        known_types.add(node.name)
-            except SyntaxError:
-                continue
-        
+            names_by_type = _declaration_names_by_type(
+                code,
+                backend,
+                ds.get("file_path", "<data_structure>"),
+            )
+            for unit_type, names in names_by_type.items():
+                if unit_type in _TYPE_LIKE_UNIT_TYPES:
+                    known_types.update(names)
+
         # Also add data_flow_types names as known types
         for dt_name in ds.get("data_flow_types", []):
             known_types.add(dt_name)
-    
+
     # Add data_structure_names if provided
     for name in base_classes.get("data_structure_names", []):
         known_types.add(name)
-    
+
     return known_base_classes, known_types
 
 
@@ -758,14 +1016,28 @@ class InterfaceDesigner:
         # Get base classes list
         base_classes_list = base_classes.get("base_classes", [])
         data_structures_list = base_classes.get("data_structures", [])
+        primary_language, _ = extract_language_metadata(skeleton)
+        if not primary_language:
+            primary_language = extract_language_metadata(data_flow)[0]
+        if not primary_language:
+            primary_language = extract_language_metadata(base_classes)[0]
+        metadata_source = skeleton
+        if not extract_language_metadata(metadata_source)[0]:
+            metadata_source = data_flow if extract_language_metadata(data_flow)[0] else base_classes
         
+        language_backend = get_backend(primary_language)
+
         # Extract known classes and types for dependency analysis
-        known_base_classes, known_types = extract_known_classes_and_types(base_classes)
-        
+        known_base_classes, known_types = extract_known_classes_and_types(
+            base_classes,
+            backend=language_backend,
+        )
+
         # Initialize dependency collector
         dependency_collector = DependencyCollector(
             known_base_classes=known_base_classes,
-            known_types=known_types
+            known_types=known_types,
+            target_language=primary_language,
         )
         
         # Store original data flow edges
@@ -778,7 +1050,8 @@ class InterfaceDesigner:
             logger=self.logger,
             trajectory=self.trajectory,
             step_id=self._current_step_id,
-            output_path=self.output_path
+            output_path=self.output_path,
+            target_language=primary_language,
         )
         
         result = orchestrator.design_all_interfaces(
@@ -789,9 +1062,10 @@ class InterfaceDesigner:
             dependency_collector=dependency_collector,
             data_structures=data_structures_list
         )
+        result["meta"] = metadata_with_languages(metadata_source)
         
         # =====================================================================
-        # Phase 1.5: Post-process invocation edges (normalise + resolve)
+        # Post-process invocation edges (normalise + resolve)
         # =====================================================================
         global_registry = result.get("_global_registry")
         if global_registry:
@@ -808,12 +1082,21 @@ class InterfaceDesigner:
         self.logger.info(f"Collected dependencies: {dep_summary}")
         
         # =====================================================================
-        # Phase 2: Global Interface Review (entry points + wiring + auto-fix)
+        # Global Interface Review (entry points + wiring + auto-fix)
         # =====================================================================
         global_registry = result.pop("_global_registry", None)
         import_warnings = result.pop("_import_warnings", [])
         
-        if global_registry and result.get("success"):
+        review_language = primary_language or "python"
+        # The global interface review runs for every language. Its structural
+        # checks (call-graph connectivity, feature coverage), dependency-edge
+        # fixes (add_dependency), and orphan pruning are language-agnostic.
+        # The only Python-specific capability — automatic interface-stub
+        # synthesis (add_interface) — is skipped inside the reviewer for
+        # non-Python backends, so non-Python projects still get full
+        # diagnostics and dependency wiring without invalid stub injection.
+        review_enabled = bool(global_registry) and result.get("success")
+        if review_enabled:
             self.logger.info("Starting global interface review phase...")
             print("\n" + "=" * 70)
             print("GLOBAL INTERFACE REVIEW")
@@ -822,6 +1105,7 @@ class InterfaceDesigner:
             reviewer = InterfaceReviewer(
                 trajectory=self.trajectory,
                 step_id=self._current_step_id,
+                target_language=review_language,
             )
             
             review_result = reviewer.review_and_fix(
@@ -831,7 +1115,11 @@ class InterfaceDesigner:
                 import_warnings=import_warnings,
                 data_flow_edges=data_flow.get("data_flow", []),
                 dependency_collector=dependency_collector,
-                max_fix_iterations=2,
+                # Three review-fix cycles give coverage gaps (LLM under-listing
+                # a unit's ``features``) an extra chance to converge before the
+                # gate reports a feature-orphan WARN; two was often too few for
+                # web projects with many fine-grained presentation features.
+                max_fix_iterations=3,
                 skeleton_features=collect_skeleton_features(skeleton),
                 rpg_features=collect_rpg_feature_paths(REPO_RPG_FILE),
             )
@@ -845,6 +1133,8 @@ class InterfaceDesigner:
                 "feature_orphans_count": len(review_result.get("final_feature_orphans", [])),
                 "orphan_units_count": len(review_result.get("final_orphan_units", [])),
                 "unapplied_fixes_count": len(review_result.get("unapplied_fixes", [])),
+                "advisory_fixes_count": len(review_result.get("advisory_fixes", [])),
+                "blocking_unapplied_fixes_count": len(review_result.get("blocking_unapplied_fixes", [])),
                 "unapplied_fixes": review_result.get("unapplied_fixes", []),
                 "iterations_run": review_result.get("iterations_run", 0),
                 "passed": review_result.get("passed", False),
@@ -858,7 +1148,7 @@ class InterfaceDesigner:
             print_review_summary(review_result)
 
             # =================================================================
-            # Phase 3: Create InterfacesStore and prune orphans
+            # Create InterfacesStore and prune orphans
             # =================================================================
             # Create unified store from current result
             store = InterfacesStore.from_legacy_format(
@@ -870,14 +1160,18 @@ class InterfaceDesigner:
             )
 
             # =================================================================
-            # Phase 3b: Review and prune orphan units
+            # Review and prune orphan units
             # =================================================================
             # First, find orphan units
             orphan_keys = store.find_orphan_units()
-            prune_summary = None  # Initialize to None
+            orphan_review_result = None
+            prune_summary = None
 
             if orphan_keys:
-                print(f"\nFound {len(orphan_keys)} orphan interface units (no call edges)")
+                print(
+                    f"\nFound {len(orphan_keys)} orphan interface units "
+                    "(no incoming and no outgoing call edges)"
+                )
 
                 # Get details for review
                 orphan_details = store.get_orphan_unit_details(orphan_keys)
@@ -890,6 +1184,7 @@ class InterfaceDesigner:
                     repo_info=repo_info,
                     subtree_interfaces=result.get("subtrees", {}),
                     llm_client=self.llm,
+                    target_language=review_language,
                 )
 
                 # Apply completed edges first (before pruning, so retained units get connected)
@@ -933,7 +1228,7 @@ class InterfaceDesigner:
                     result["global_review"]["retained_orphans_count"] = len(orphan_review_result.keys_to_retain)
 
             # =================================================================
-            # Phase 4: Update result from store and update RPG
+            # Update result from store and update RPG
             # =================================================================
             # Update result with store's current state (reflects pruning)
             store_export = store.to_interfaces_json()
@@ -941,11 +1236,37 @@ class InterfaceDesigner:
             result["enhanced_data_flow"] = store_export["enhanced_data_flow"]
             result["implemented_subtrees"] = store_export["implemented_subtrees"]
 
-            # Store surviving feature paths for potential later use
-            if prune_summary:
-                result["_surviving_feature_paths"] = prune_summary.surviving_feature_paths
+            # Deterministically attribute any skeleton feature the designer
+            # implemented but forgot to list in a unit's units_to_features.
+            # Runs before the RPG update and verdict recompute so both the
+            # persisted graph and published coverage reflect the backfill.
+            # Metadata-only: no units invented, no code touched.
+            backfill_audit = backfill_uncovered_features(skeleton, result)
+            if backfill_audit["backfilled"]:
+                synced_backfills = store.apply_backfill(backfill_audit["backfilled"])
+                self.logger.info("Feature backfill synced to store: %d", synced_backfills)
+                # Re-export after syncing so result is derived from the store,
+                # not from incidental aliasing in to_interfaces_json().
+                store_export = store.to_interfaces_json()
+                result["subtrees"] = store_export["subtrees"]
+                result["enhanced_data_flow"] = store_export["enhanced_data_flow"]
+                result["implemented_subtrees"] = store_export["implemented_subtrees"]
+            if backfill_audit["backfilled"] or backfill_audit["unbackfilled"]:
+                result["global_review"]["backfilled_features"] = backfill_audit["backfilled"]
+                result["global_review"]["unbackfilled_features"] = backfill_audit["unbackfilled"]
+                self.logger.info(
+                    "Feature backfill: %d attributed, %d unbackfillable",
+                    len(backfill_audit["backfilled"]),
+                    len(backfill_audit["unbackfilled"]),
+                )
 
-            # Update RPG using the store
+            # Store surviving feature paths for potential later use. Use the
+            # store after backfill sync so the snapshot cannot lag the RPG
+            # pruning input.
+            if prune_summary or backfill_audit["backfilled"]:
+                result["_surviving_feature_paths"] = store.surviving_feature_paths
+
+            # Update RPG using the post-backfill store
             rpg_summary = store.update_rpg(REPO_RPG_FILE)
 
             # Record RPG pruning in global_review
@@ -954,12 +1275,43 @@ class InterfaceDesigner:
                     rpg_summary.pruned_feature_nodes + rpg_summary.pruned_parent_nodes
                 )
 
+            # Refresh the published verdict from the FINAL graph (after
+            # orphan-review completion edges + pruning), honouring units
+            # the review explicitly retained. Runs unconditionally so the
+            # numbers never lag review_and_fix's pre-edge snapshot.
+            _retained_keys = (
+                set(orphan_review_result.keys_to_retain)
+                if orphan_review_result is not None else set()
+            )
+            _finalize_global_review_verdict(
+                global_review=result["global_review"],
+                interfaces_data=result,
+                enhanced_data_flow=result["enhanced_data_flow"],
+                entry_points=review_result.get("final_entry_points", []),
+                is_callable=get_backend(review_language).is_callable_unit,
+                retained_keys=_retained_keys,
+                is_test_file=get_backend(review_language).is_test_file,
+            )
+
             # Update dependency summary
             dep_summary = store.get_stats()
             self.logger.info(f"Final store stats: {dep_summary}")
         else:
             if not global_registry:
                 self.logger.info("GlobalInterfaceRegistry not available, skipping global review")
+            elif result.get("success") and review_language != "python":
+                self.logger.info(
+                    "Skipping global interface review for target language: %s",
+                    review_language,
+                )
+                result["global_review"] = {
+                    "passed": True,
+                    "skipped": True,
+                    "reason": (
+                        "Global interface review was not enabled for this "
+                        "run; automatic stub synthesis is Python-specific."
+                    ),
+                }
         
         # Update trajectory
         if self.trajectory and self._current_step_id:
@@ -1089,12 +1441,29 @@ class InterfaceDesigner:
         # Stage 2: Coverage
         # ------------------------------------------------------------------
         print("\n[Stage 2] Coverage — is every skeleton feature mapped to some unit?")
-        # NOTE: We can compute the skeleton-feature universe from
-        # interfaces.json alone (every unit declares its features); for a
-        # canonical count we'd need skeleton.json again. The cross-validate
-        # path already runs `check_interfaces.py` for that; here we just
-        # report what the produced data carries.
-        print(f"  Distinct features mapped to a unit: {len(all_unit_features)}")
+        coverage = result.get("coverage", {}) or {}
+        if coverage:
+            expected_features = coverage.get("expected_features", 0)
+            covered_features = coverage.get("covered_features", 0)
+            expected_files = coverage.get("expected_files", 0)
+            successful_files = coverage.get("successful_files", 0)
+            print(f"  Files fully covered: {successful_files}/{expected_files}")
+            print(f"  Features covered: {covered_features}/{expected_features}")
+            issues = coverage.get("issues", []) or []
+            if issues:
+                print(f"  [WARNING] {len(issues)} coverage issue(s):")
+                for issue in issues[:10]:
+                    file_path = issue.get("file_path") or "(subtree)"
+                    missing = issue.get("missing_features", []) or []
+                    print(f"    - {file_path}: {issue.get('reason', 'incomplete')}")
+                    for feature in missing[:3]:
+                        print(f"      * {feature}")
+                    if len(missing) > 3:
+                        print(f"      ... and {len(missing) - 3} more")
+                if len(issues) > 10:
+                    print(f"    ... and {len(issues) - 10} more")
+        else:
+            print(f"  Distinct features mapped to a unit: {len(all_unit_features)}")
         if not all_unit_features:
             print("  [WARNING] no feature mappings at all — likely Stage 1 failed")
 
@@ -1110,9 +1479,16 @@ class InterfaceDesigner:
             orphan_units = global_review.get("orphan_units_count", 0)
             orphan_features = global_review.get("feature_orphans_count", 0)
             unapplied_count = global_review.get("unapplied_fixes_count", 0)
-            print(f"  Orphan units (no incoming edges): {orphan_units}")
-            print(f"  Orphan features (no unit reachable from entry): {orphan_features}")
-            print(f"  Unapplied fix requests: {unapplied_count}")
+            advisory_count = global_review.get("advisory_fixes_count", 0)
+            blocking_count = global_review.get(
+                "blocking_unapplied_fixes_count", unapplied_count
+            )
+            print(f"  Orphan units (isolated: no incoming or outgoing call edges): {orphan_units}")
+            print(f"  Orphan features attached to isolated units: {orphan_features}")
+            print(
+                f"  Unapplied fix requests: {unapplied_count} "
+                f"({blocking_count} blocking, {advisory_count} advisory)"
+            )
             for u in global_review.get("unapplied_fixes", [])[:3]:
                 print(f"    - [{u.get('action','?')}] "
                       f"{u.get('file_path','?')}::{u.get('unit_name','?')}"
@@ -1158,8 +1534,14 @@ class InterfaceDesigner:
         # ------------------------------------------------------------------
         # Verdict — mirrors Stage 3's `passed`.
         # ------------------------------------------------------------------
-        passed = bool(global_review.get("passed"))
-        verdict = "✓ PASS" if passed else "✗ FAIL — see Stage 3 above"
+        generation_passed = result.get("success", True)
+        passed = generation_passed and bool(global_review.get("passed"))
+        if passed:
+            verdict = "✓ PASS"
+        elif not generation_passed:
+            verdict = "✗ FAIL — interface coverage incomplete"
+        else:
+            verdict = "✗ FAIL — see Stage 3 above"
         print(f"\nOverall: {verdict}")
         print("(Stage 3 is the strictest; PASS requires Stages 1+2 also clean.)")
         print("=" * 60)
@@ -1308,16 +1690,17 @@ def main():
 
         # RPG update is now handled inside InterfaceDesigner.build() via InterfacesStore
 
-        if not result.get("success", True) and "error" in result:
+        if not result.get("success", True):
+            error = result.get("error", "Interface coverage incomplete")
             if trajectory:
-                trajectory.fail(result["error"])
+                trajectory.fail(error)
             return 1
         
         # Mark trajectory as complete
         if trajectory:
             subtrees = result.get("subtrees", {})
             total_files = sum(
-                len(st.get("files", {}))
+                len(st.get("interfaces", st.get("files", {})))
                 for st in subtrees.values()
             )
             # Include dependency summary in metadata

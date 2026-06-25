@@ -33,6 +33,7 @@ from common.paths import (
     REPO_RPG_FILE,
 )
 from common import print_unicode_table
+from common.language_meta import extract_language_metadata, metadata_with_languages
 from pathlib import Path as PPath
 from rpg import NodeMetaData
 from skeleton.skeleton_prompts import extract_features_from_subtree
@@ -74,6 +75,12 @@ def convert_skeleton_to_cmind_format(skeleton: RepoSkeleton, rpg: RPG) -> Dict[s
     output = {
         "repository_name": rpg.repo_name,
         "repository_purpose": rpg.repo_info,
+        "meta": metadata_with_languages({
+            "meta": {
+                "primary_language": getattr(rpg.repo_node.meta, "language", None)
+                if rpg.repo_node and rpg.repo_node.meta else None
+            }
+        }),
         "root": convert_node(skeleton.root),
         "statistics": {
             "total_components": len([n for n in rpg.nodes.values() if n.level == 1]),
@@ -100,6 +107,7 @@ class SkeletonBuilder:
 
         # Build state
         self.repo_name = ""
+        self.target_language = None
         self.repo_data = {}
         self.rpg = None
         self.skeleton = None
@@ -121,6 +129,7 @@ class SkeletonBuilder:
         """Execute complete skeleton building workflow."""
         self.repo_data = input_data
         self.repo_name = input_data.get("repository_name", "project")
+        self.target_language = extract_language_metadata(input_data)[0]
         components = input_data.get("components", [])
 
         if not components:
@@ -242,7 +251,8 @@ class SkeletonBuilder:
                 rpg=self.rpg,
                 max_iterations=self.max_iterations,
                 trajectory=self.trajectory,
-                step_id=self._current_step_id
+                step_id=self._current_step_id,
+                target_language=self.target_language,
             )
 
             # Run file design process
@@ -281,6 +291,12 @@ class SkeletonBuilder:
         """Build the final result dictionary in CoderMind format."""
         # Convert to CoderMind compatible format
         result = convert_skeleton_to_cmind_format(self.skeleton, self.rpg)
+        result["meta"] = metadata_with_languages({
+            "meta": {
+                "primary_language": self.target_language,
+                "target_languages": [self.target_language] if self.target_language else [],
+            }
+        })
 
         # Add statistics
         result["statistics"].update({
@@ -553,7 +569,7 @@ def patch_missing(input_data: Dict[str, Any]) -> Dict[str, Any]:
         json.dump(result, f, indent=2, ensure_ascii=False)
     rpg.save_json(str(REPO_RPG_FILE), indent=2)
 
-    print(f"\n[OK] Patch complete:")
+    print("\n[OK] Patch complete:")
     print(f"  - Missing features patched: {total_missing}")
     print(f"  - New files created: {new_file_count}")
     print(f"  - Features merged into existing files: {merged_count}")
