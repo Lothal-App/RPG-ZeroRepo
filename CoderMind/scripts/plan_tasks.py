@@ -22,6 +22,7 @@ from collections import Counter, defaultdict, deque
 
 from common.trajectory import Trajectory, load_or_create_trajectory
 from common import LLMClient
+from common.code_dedup import dedup_file_code
 from common.language_meta import extract_language_metadata, metadata_with_languages
 from decoder_lang import FileDependencyEdge, ProjectTaskContext, get_backend, infer_language_from_path
 from rpg import uuid8
@@ -30,6 +31,7 @@ from rpg import uuid8
 from common.paths import (
     DATA_FLOW_FILE,
     INTERFACES_FILE,
+    SKELETON_FILE,
     REPO_RPG_FILE as RPG_FILE,
     REPO_INFO_FILE,
     TASKS_FILE as OUTPUT_FILE,
@@ -496,6 +498,28 @@ def validate_tasks(
     return True, f"Planned {len(tasks)} tasks covering all {total_units} units across {len(file_unit_keys)} files.", tasks
 
 
+def _dedup_interface_source(fdata: Dict[str, Any]) -> str:
+    """Return a file's interface source with per-unit duplication collapsed.
+
+    ``interfaces.json`` stores ``file_code`` as ``"\n\n".join(unit codes)``.
+    For non-Python units the ``count_lines`` call in interface synthesis
+    raises (``LPCodeUnit`` has no such method), and the fallback stores the
+    whole interface block as *every* unit's code, so a file with N units
+    embeds the entire file N times — an O(units x file_size) blow-up that
+    pushes the planner prompt past the 128 KB single-argument limit on large
+    modules.
+
+    Collapsing identical blocks reconstructs the original single file: because
+    each duplicate copy carries the module header and imports, keeping exactly
+    one copy yields a valid, complete file rather than a header-less
+    concatenation of bodies. Genuinely distinct per-unit slices are preserved
+    unchanged. This is a consumer-side safety net; freshly serialized
+    ``interfaces.json`` is already deduplicated at the source.
+    """
+    unit_codes = fdata.get("units_to_code", {}).values()
+    return dedup_file_code(unit_codes, fallback=fdata.get("file_code", ""))
+
+
 # ============================================================================
 # Task Planner Agent (per subtree)
 # ============================================================================
@@ -551,7 +575,7 @@ class TaskPlannerAgent:
             files_context_parts.append(
                 f"### File {i + 1}: {fp}\n"
                 f"Units ({len(unit_keys)}): {json.dumps(unit_keys)}\n\n"
-                f"Source code (interfaces only):\n{fdata.get('file_code', '')}\n"
+                f"Source code (interfaces only):\n{_dedup_interface_source(fdata)}\n"
             )
         files_context = "\n---\n".join(files_context_parts)
         
@@ -1602,6 +1626,65 @@ def load_repo_info() -> tuple[str, str]:
     return repo_name, repo_info
 
 
+def _collect_skeleton_features(skeleton: Dict[str, Any]) -> Set[str]:
+    features: Set[str] = set()
+
+    def visit(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        node_features = node.get("feature_paths") or []
+        if isinstance(node_features, list):
+            features.update(str(feature) for feature in node_features if feature)
+        for child in node.get("children") or []:
+            visit(child)
+
+    visit(skeleton.get("root"))
+    return features
+
+
+def _collect_interface_features(interfaces: Dict[str, Any]) -> Set[str]:
+    features: Set[str] = set()
+    subtrees = interfaces.get("subtrees") or interfaces.get("components") or {}
+    if not isinstance(subtrees, dict):
+        return features
+    for subtree_data in subtrees.values():
+        if not isinstance(subtree_data, dict):
+            continue
+        files = subtree_data.get("interfaces") or subtree_data.get("files") or {}
+        if not isinstance(files, dict):
+            continue
+        for file_data in files.values():
+            if not isinstance(file_data, dict):
+                continue
+            units_to_features = file_data.get("units_to_features") or {}
+            if not isinstance(units_to_features, dict):
+                continue
+            for unit_features in units_to_features.values():
+                if isinstance(unit_features, list):
+                    features.update(str(feature) for feature in unit_features if feature)
+    return features
+
+
+def _validate_interfaces_cover_skeleton_features(
+    interfaces: Dict[str, Any],
+    skeleton_path: Path = SKELETON_FILE,
+) -> None:
+    if not skeleton_path.exists():
+        return
+    with open(skeleton_path, "r", encoding="utf-8") as f:
+        skeleton = json.load(f)
+    missing = sorted(
+        _collect_skeleton_features(skeleton) - _collect_interface_features(interfaces)
+    )
+    if missing:
+        preview = ", ".join(repr(feature) for feature in missing[:5])
+        raise ValueError(
+            "interfaces.json is incomplete for skeleton.json: "
+            f"{len(missing)} feature(s) missing from interfaces.json: "
+            f"[{preview}]. Re-run design_interfaces before plan_tasks."
+        )
+
+
 # ============================================================================
 # Main Entry Point
 # ============================================================================
@@ -1668,6 +1751,7 @@ def main():
     
     with open(args.interfaces, 'r', encoding='utf-8') as f:
         interfaces = json.load(f)
+    _validate_interfaces_cover_skeleton_features(interfaces)
     
     with open(args.data_flow, 'r', encoding='utf-8') as f:
         data_flow = json.load(f)

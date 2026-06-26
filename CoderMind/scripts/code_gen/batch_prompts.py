@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from common.execution_state import BatchExecutionState, load_code_gen_state
+from common.generated_artifacts import generated_artifact_prompt_rule
 from common.import_normalizer import build_import_convention_snippet
 from common.paths import (
     CODE_GEN_STATE_FILE as STATE_FILE,
@@ -212,6 +213,7 @@ value must be the *literal* one-line summary printed by the test command,
 for example `5 passed in 0.42s`, `ok ./...`, or `test result: ok`. Copy it
 verbatim from the run you just performed; do NOT invent it. This lets the
 runner cross-check your claim against an independent re-run.
+{summary_fallback_rule}
 
 ## ── Capabilities ─────────────────────────────────────────
 
@@ -413,6 +415,49 @@ def _fallback_test_command(backend: LanguageBackend) -> List[str]:
     return list(_FALLBACK_TEST_COMMANDS.get(backend.name, [backend.prompt_hints().test_framework_name]))
 
 
+def _dynamic_c_family_syntax_command(
+    backend: LanguageBackend,
+    command: List[str],
+) -> str:
+    compiler = shlex.quote(str(command[0]))
+    include_flags: List[str] = []
+    for index, part in enumerate(command):
+        if part == "-I" and index + 1 < len(command):
+            include_flags.append('-I "$PWD"')
+    standard = "-std=c++17" if backend.name == "cpp" else "-std=c99"
+    patterns = (
+        r'\( -name "*.cpp" -o -name "*.cc" -o -name "*.cxx" \)'
+        if backend.name == "cpp"
+        else r'-name "*.c"'
+    )
+    include_text = " ".join(include_flags)
+    return (
+        "bash -lc "
+        + shlex.quote(
+            "mapfile -d '' sources < <(find . "
+            r"\( -path './.git' -o -path './.cmind' -o -path './build' "
+            r"-o -path './node_modules' -o -path './target' "
+            r"-o -path './dist' -o -path './coverage' -o -path './.venv' "
+            r"-o -path './venv' -o -path './CMakeFiles' \) -prune "
+            f"-o -type f {patterns} -print0); "
+            f"if (( ${{#sources[@]}} == 0 )); then echo 'No {backend.prompt_hints().display_name} source files found' >&2; exit 1; fi; "
+            f"{compiler} {standard} {include_text} -Wall -Wextra -fsyntax-only \"${{sources[@]}}\""
+        )
+    )
+
+
+def _cmake_c_family_test_command(command: List[str]) -> str:
+    ctest = shlex.quote(str(command[0]))
+    return (
+        "bash -lc "
+        + shlex.quote(
+            "cmake -S . -B build && "
+            "cmake --build build && "
+            f"{ctest} --test-dir build --output-on-failure"
+        )
+    )
+
+
 def _build_backend_test_cmd(
     backend: LanguageBackend,
     repo_path: Path,
@@ -425,7 +470,12 @@ def _build_backend_test_cmd(
 
     env = backend.detect_env(repo_path) or EnvHandle(project_root=repo_path.resolve())
     try:
-        return _shell_join(backend.test_command(env))
+        command = backend.test_command(env)
+        if backend.name in {"c", "cpp"} and command and "ctest" in Path(str(command[0])).name:
+            return _cmake_c_family_test_command(command)
+        if backend.name in {"c", "cpp"} and "-fsyntax-only" in command:
+            return _dynamic_c_family_syntax_command(backend, command)
+        return _shell_join(command)
     except (ToolchainUnavailable, NotImplementedError, OSError):
         return _shell_join(_fallback_test_command(backend))
 
@@ -513,6 +563,16 @@ def _test_timeout_rule(backend: LanguageBackend) -> str:
     return "- Run long-lived servers, watchers, or interactive commands instead of the exact test command"
 
 
+def _summary_fallback_rule(backend: LanguageBackend, test_command: str) -> str:
+    if backend.name in {"c", "cpp"} and "-fsyntax-only" in test_command:
+        return (
+            "\nFor C/C++ syntax-only commands: if the exact command exits 0 "
+            "and prints no summary line, use exactly "
+            "`PYTEST_SUMMARY: syntax check passed`.\n"
+        )
+    return ""
+
+
 def _build_language_context(backend: LanguageBackend, test_command: str) -> str:
     """Build the target-language prompt section."""
     hints = backend.prompt_hints()
@@ -526,6 +586,13 @@ def _build_language_context(backend: LanguageBackend, test_command: str) -> str:
         f"- Module naming: {hints.module_naming_rule}\n"
         f"- Style: {hints.style_directive}\n"
     )
+    artifact_extra = ""
+    if backend.name in {"c", "cpp"}:
+        artifact_extra = (
+            "If CTest needs arguments or target wiring, change source files "
+            "such as `CMakeLists.txt` or the test source instead."
+        )
+    context += generated_artifact_prompt_rule(artifact_extra)
     if backend.name != "python":
         # The decoder's defaults are Python-centric; without an explicit
         # prohibition the sub-agent tends to add Python helpers (a main.py
@@ -542,6 +609,13 @@ def _build_language_context(backend: LanguageBackend, test_command: str) -> str:
             f"- Run tests ONLY with `{test_command}` ({hints.test_framework_name}). Do NOT wrap, "
             "re-implement, or drive the test suite through pytest or any Python script.\n"
         )
+        if backend.name in {"c", "cpp"}:
+            context += (
+                "- C/C++ tests and examples must be valid standalone translation units. "
+                "If a test or example calls a helper implemented in another `.c`/`.cpp` file, "
+                "create or update a matching header and include that header; do NOT rely on "
+                "transitive `.cpp` inclusion or undeclared functions.\n"
+            )
     else:
         context += (
             "- Do NOT introduce Python-specific files, packages, or pytest conventions unless this is a Python project.\n"
@@ -886,6 +960,7 @@ def build_tdd_prompt(
         dependency_install_capability=_dependency_install_capability(backend, repo_path),
         dependency_management=_dependency_management_text(backend, repo_path),
         test_timeout_rule=_test_timeout_rule(backend),
+        summary_fallback_rule=_summary_fallback_rule(backend, pytest_cmd),
         import_convention=import_convention,
         language_context=_build_language_context(backend, pytest_cmd),
         dependency_context=dep_ctx_str,
@@ -938,7 +1013,7 @@ def build_resume_prompt(
         post_verify_section = (
             "\n\n## ⚠ False-positive PASS detected\n"
             "Your previous attempt ended with `BATCH_RESULT: PASS` and the\n"
-            "PYTEST_SUMMARY line {agent_summary_repr}, but the runner's\n"
+            f"PYTEST_SUMMARY line {agent_summary_repr}, but the runner's\n"
             "independent test-command re-run reported the failure shown below.\n"
             "Possible causes you must investigate:\n"
             "* You did not actually run the exact test command before declaring PASS.\n"

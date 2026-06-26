@@ -14,7 +14,7 @@ import json
 import logging
 import ast
 import re
-from typing import Dict, List, Optional, Tuple, Any, Set
+from typing import Dict, List, Optional, Tuple, Any, Set, Iterator
 from collections import defaultdict, deque
 from pydantic import BaseModel, Field, model_validator
 
@@ -302,7 +302,55 @@ class DependencyCollector:
         # Type references from annotations — Python-specific rich
         # extraction. Other languages cover this via LLM ``uses_types``.
         if self.backend.name == "python":
+            self._analyze_python_invocations(code, file_path)
             self._analyze_python_type_references(code, file_path, base_class_files)
+
+    def _analyze_python_invocations(self, code: str, file_path: str) -> None:
+        """Add same-file Python invocation edges from function bodies."""
+        units = self.backend.list_code_units(code, file_path)
+        local_callables: Dict[str, List[str]] = defaultdict(list)
+        caller_nodes: List[Tuple[str, ast.AST, Optional[str]]] = []
+
+        for unit in units:
+            if unit.unit_type not in ("function", "method", "class"):
+                continue
+            if unit.unit_type == "method":
+                prefix = "method"
+            elif unit.unit_type == "class":
+                prefix = "class"
+            else:
+                prefix = "function"
+            unit_name = f"{prefix} {unit.name}"
+            local_callables[unit.name].append(unit_name)
+            node = (unit.extra or {}).get("ast_node")
+            if node is not None and unit.unit_type in ("function", "method"):
+                owner_class = None
+                if unit.unit_type == "method" and unit.name == "__init__":
+                    parent = getattr(unit, "parent", None)
+                    if parent:
+                        owner_class = f"class {parent}"
+                caller_nodes.append((unit_name, node, owner_class))
+
+        local_calls: Dict[str, Set[str]] = defaultdict(set)
+        for caller, node, owner_class in caller_nodes:
+            for child in _iter_calls_in_own_scope(node):
+                callee_name = _python_call_name(child.func)
+                if not callee_name:
+                    continue
+                candidates = local_callables.get(callee_name, [])
+                if len(candidates) != 1:
+                    continue
+                callee = candidates[0]
+                local_calls[caller].add(callee)
+                if owner_class and callee.startswith("class "):
+                    local_calls[owner_class].add(callee)
+
+        for caller, callees in local_calls.items():
+            for callee in callees:
+                self.add_invocation(caller, callee, file_path, file_path)
+                if _is_private_python_unit(callee):
+                    for target in _public_targets_reached_via_private(callee, local_calls):
+                        self.add_invocation(caller, target, file_path, file_path)
 
     def _analyze_python_type_references(
         self,
@@ -521,6 +569,59 @@ def _extract_name_from_node(node: ast.expr) -> Optional[str]:
     elif isinstance(node, ast.Attribute):
         return node.attr
     return None
+
+
+def _iter_calls_in_own_scope(scope_node: ast.AST) -> "Iterator[ast.Call]":
+    """Yield ``Call`` nodes inside ``scope_node`` without descending into
+    nested ``def``/``class`` scopes, whose calls are attributed to their own
+    unit. Lambdas are not separate units, so their calls remain attributed to
+    the enclosing scope."""
+    for child in ast.iter_child_nodes(scope_node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(child, ast.Call):
+            yield child
+        yield from _iter_calls_in_own_scope(child)
+
+
+def _python_call_name(node: ast.expr) -> Optional[str]:
+    """Return a local callee name for safe same-file call edges."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute) and _attribute_root_is_self(node):
+        return node.attr
+    return None
+
+
+def _attribute_root_is_self(node: ast.Attribute) -> bool:
+    value = node.value
+    while isinstance(value, ast.Attribute):
+        value = value.value
+    return isinstance(value, ast.Name) and value.id == "self"
+
+
+def _is_private_python_unit(unit_name: str) -> bool:
+    bare_name = unit_name.split(" ", 1)[-1]
+    return bare_name.startswith("_")
+
+
+def _public_targets_reached_via_private(
+    start: str,
+    local_calls: Dict[str, Set[str]],
+) -> Set[str]:
+    targets: Set[str] = set()
+    seen: Set[str] = set()
+    stack = list(local_calls.get(start, set()))
+    while stack:
+        unit_name = stack.pop()
+        if unit_name in seen:
+            continue
+        seen.add(unit_name)
+        if _is_private_python_unit(unit_name):
+            stack.extend(local_calls.get(unit_name, set()))
+        else:
+            targets.add(unit_name)
+    return targets
 
 
 def _extract_type_names(node: ast.expr) -> List[str]:
@@ -2275,14 +2376,16 @@ class InterfaceOrchestrator:
             }
             implemented_subtrees[subtree_name] = subtree_implemented
             
-            # Save after each subtree
+            # Save resume data after each subtree without publishing a partial
+            # interfaces.json as the final artifact.
             self._save_interfaces(
                 self._build_result(
                     all_interfaces,
                     subtree_order,
                     implemented_subtrees,
                     coverage_status,
-                )
+                ),
+                partial=True,
             )
             self._print_coverage_progress(
                 coverage_status,
@@ -2419,7 +2522,12 @@ class InterfaceOrchestrator:
             "missing_features": missing_features,
         })
     
-    def _save_interfaces(self, result: Dict[str, Any]) -> None:
+    def _partial_output_path(self) -> Optional[Path]:
+        if not self.output_path:
+            return None
+        return Path(f"{self.output_path}.partial")
+
+    def _save_interfaces(self, result: Dict[str, Any], partial: bool = False) -> None:
         """Save current interfaces result to output_path (if configured).
         
         Strips internal keys (prefixed with '_') that contain non-serializable
@@ -2428,7 +2536,9 @@ class InterfaceOrchestrator:
         if not self.output_path:
             return
         try:
-            output = Path(self.output_path)
+            output = self._partial_output_path() if partial else Path(self.output_path)
+            if output is None:
+                return
             output.parent.mkdir(parents=True, exist_ok=True)
             # Filter out non-serializable internal keys
             serializable = {
@@ -2438,6 +2548,10 @@ class InterfaceOrchestrator:
             with open(output, "w", encoding="utf-8") as f:
                 json.dump(serializable, f, indent=2, ensure_ascii=False)
             self.logger.info(f"[InterfaceOrchestrator] Saved interfaces to {output}")
+            if not partial:
+                partial_path = self._partial_output_path()
+                if partial_path and partial_path.exists():
+                    partial_path.unlink()
         except Exception as e:
             self.logger.warning(f"[InterfaceOrchestrator] Failed to save interfaces: {e}")
 
@@ -2470,8 +2584,13 @@ class InterfaceOrchestrator:
         """Load an existing interfaces file for subtree-level resume."""
         if not self.output_path:
             return None
-        path = Path(self.output_path)
-        if not path.exists():
+        candidates = []
+        partial_path = self._partial_output_path()
+        if partial_path is not None:
+            candidates.append(partial_path)
+        candidates.append(Path(self.output_path))
+        path = next((candidate for candidate in candidates if candidate.exists()), None)
+        if path is None:
             return None
         try:
             with path.open("r", encoding="utf-8") as handle:
